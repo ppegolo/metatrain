@@ -14,4 +14,5 @@ class DistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
 
     def __init__(self, module: torch.nn.Module, *args, **kwargs):
         super(DistributedDataParallel, self).__init__(module, *args, **kwargs)
+        self.dataset_info = module.dataset_info
         self.outputs = module.outputs

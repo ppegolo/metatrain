@@ -7,6 +7,7 @@
 #SBATCH --exclusive
 #SBATCH --time=1:00:00
 
-# load modules and/or virtual environments and/or containers here
+module load gcc python
+source /home/bigi/virtualenv-i/bin/activate
 
-srun mtt train options-distributed.yaml
+srun mtt --debug train options-distributed.yaml

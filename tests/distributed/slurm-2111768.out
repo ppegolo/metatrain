@@ -1,0 +1,108 @@
+[2024-06-17 08:31:33][INFO]:logging.py:setup_logging:237 - This log is also available at '/home/bigi/metatrain/tests/distributed/outputs/2024-06-17/08-31-33/train.log'.
+[2024-06-17 08:31:34][INFO]:train.py:train_model:176 - Random seed of this run is 42
+[2024-06-17 08:31:34][INFO]:train.py:train_model:189 - Setting up training set
+[2024-06-17 08:31:34][INFO]:readers.py:read_targets:213 - Forces found in section 'energy'. Forces are taken for training!
+[2024-06-17 08:31:34][WARNING]:readers.py:read_targets:236 - No Stress found in section 'energy'. Continue without stress!
+[2024-06-17 08:31:34][INFO]:train.py:train_model:214 - Setting up test set
+[2024-06-17 08:31:34][INFO]:train.py:train_model:268 - Setting up validation set
+[2024-06-17 08:31:34][INFO]:train.py:train_model:338 - Training dataset:
+    Dataset of size 80
+    Mean and standard deviation of targets:
+    - energy: 
+      - mean -9.708e+04 eV
+      - std  32 eV
+    - forces: 
+      - mean -3.643e-09 eV/Å
+      - std  28.31 eV/Å
+[2024-06-17 08:31:34][INFO]:train.py:train_model:347 - Validation dataset:
+    Dataset of size 10
+    Mean and standard deviation of targets:
+    - energy: 
+      - mean -9.708e+04 eV
+      - std  nan eV
+    - forces: 
+      - mean 1.13e-07 eV/Å
+      - std  26.27 eV/Å
+[2024-06-17 08:31:34][INFO]:train.py:train_model:356 - Test dataset:
+    Dataset of size 10
+    Mean and standard deviation of targets:
+    - energy: 
+      - mean -9.708e+04 eV
+      - std  32 eV
+    - forces: 
+      - mean 6.358e-08 eV/Å
+      - std  25.4 eV/Å
+[2024-06-17 08:31:34][INFO]:train.py:train_model:370 - Setting up model
+[2024-06-17 08:31:34][INFO]:train.py:train_model:385 - Start training
+[2024-06-17 08:31:35][INFO]:trainer.py:train:50 - Checking datasets for consistency
+/home/bigi/virtualenv-i/lib/python3.10/site-packages/torch/autograd/__init__.py:266: UserWarning: Grad strides do not match bucket view strides. This may indicate grad was not created according to the gradient layout contract, or that the param's strides changed since DDP was constructed.  This is not an error, but may impair performance.
+grad.sizes() = [1, 128], strides() = [1, 1]
+bucket_view.sizes() = [1, 128], strides() = [128, 1] (Triggered internally at ../torch/csrc/distributed/c10d/reducer.cpp:322.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/home/bigi/virtualenv-i/lib/python3.10/site-packages/torch/autograd/__init__.py:266: UserWarning: Grad strides do not match bucket view strides. This may indicate grad was not created according to the gradient layout contract, or that the param's strides changed since DDP was constructed.  This is not an error, but may impair performance.
+grad.sizes() = [1, 128], strides() = [1, 1]
+bucket_view.sizes() = [1, 128], strides() = [128, 1] (Triggered internally at ../torch/csrc/distributed/c10d/reducer.cpp:322.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Non-main-process 1
+DIST True
+Hello1 1
+Hello2 1
+Hello3 1
+Hello4 1
+Hello5 1
+Hello6 1
+Hello7 1
+Hello from 1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+7
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+batch 1 cuda:1 cuda:1
+Hello6 1
+Hello7 1
+Hello from 1
+7
+batch 1 cuda:1 cuda:0
+batch 1 cuda:1 cuda:0
+[2024-06-17 08:31:37][ERROR]:__main__.py:main:104 - If the error message below is unclear, please help us improve it by opening an issue at https://github.com/lab-cosmo/metatrain/issues. When opening the issue, please include the full traceback log from '/home/bigi/metatrain/tests/distributed/outputs/2024-06-17/08-31-33/error.log'. Thank you!
+
+Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cuda:1! (when checking argument for argument index in method wrapper_CUDA__index_select)
+
+The error above most likely originates from an architecture.
+
+If you think this is a bug, please contact its maintainer (see the architecture's documentation) and include the full traceback error.log.
+srun: error: i63: task 1: Exited with exit code 1
+srun: Terminating StepId=2111768.0
+slurmstepd: error: *** STEP 2111768.0 ON i63 CANCELLED AT 2024-06-17T08:31:38 ***
+srun: error: i63: task 0: Terminated
+srun: Force Terminated StepId=2111768.0
