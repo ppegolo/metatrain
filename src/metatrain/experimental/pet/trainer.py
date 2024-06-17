@@ -31,10 +31,6 @@ class Trainer:
         val_datasets: List[Union[Dataset, torch.utils.data.Subset]],
         checkpoint_dir: str,
     ):
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
 
         if self.hypers["FITTING_SCHEME"]["DISTRIBUTED"]:
             distr_env = DistributedEnvironment(self.hypers["FITTING_SCHEME"]["DISTRIBUTED_PORT"])
@@ -44,47 +40,19 @@ class Trainer:
         else:
             device = devices[0]  # only one device, as we don't support multi-gpu for now
 
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
-
         if len(train_datasets) != 1:
             raise ValueError("PET only supports a single training dataset")
         if len(val_datasets) != 1:
             raise ValueError("PET only supports a single validation dataset")
 
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
-
         if model.checkpoint_path is not None:
             self.hypers["FITTING_SCHEME"]["MODEL_TO_START_WITH"] = model.checkpoint_path
-
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
-
-        if not is_slurm_main_process():
-            return
 
         logger.info("Checking datasets for consistency")
         check_datasets(train_datasets, val_datasets)
 
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
-
         train_dataset = train_datasets[0]
         val_dataset = val_datasets[0]
-
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
 
         # dummy dataloaders due to https://github.com/lab-cosmo/metatensor/issues/521
         train_dataloader = DataLoader(
@@ -99,11 +67,6 @@ class Trainer:
             shuffle=False,
             collate_fn=collate_fn,
         )
-
-        if is_slurm_main_process():
-            print("main")
-        else:
-            print("Non-main-process")
 
         # are we fitting on only energies or energies and forces?
         target_name = model.target_name
@@ -166,11 +129,6 @@ class Trainer:
                     .numpy()
                 )
             ase_val_dataset.append(ase_atoms)
-
-        if is_slurm_main_process():
-            print("main", torch.distributed.get_rank())
-        else:
-            print("Non-main-process", torch.distributed.get_rank())
 
         fit_pet(
             ase_train_dataset,

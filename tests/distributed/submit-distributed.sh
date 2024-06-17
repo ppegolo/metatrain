@@ -10,4 +10,4 @@
 module load gcc python
 source /home/bigi/virtualenv-i/bin/activate
 
-srun mtt --debug train options-distributed.yaml
+PYTHONUNBUFFERED=1 srun mtt train options-distributed.yaml
