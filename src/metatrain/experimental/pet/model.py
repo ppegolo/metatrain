@@ -94,6 +94,8 @@ class PET(torch.nn.Module):
         samples = Labels(names=["system", "atom"], values=samples_values)
 
         for output_name in outputs:
+            if output_name == "mtt::aux::last_layer_features":
+                continue
             energy_labels = Labels(
                 names=["energy"], values=torch.tensor([[0]], device=predictions.device)
             )
@@ -111,12 +113,12 @@ class PET(torch.nn.Module):
             if not outputs[output_name].per_atom:
                 output_tmap = metatensor.torch.sum_over_samples(output_tmap, "atom")
             output_quantities[output_name] = output_tmap
-        if "mtm::aux::last_layer_features" in outputs:
+        if "mtt::aux::last_layer_features" in outputs:
             if selected_atoms is not None:
                 raise NotImplementedError(
                     "Selected atoms not supported for last-layer features in PET"
                 )
-            output_quantities["mtm::aux::last_layer_features"] = TensorMap(
+            ll_feat_tmap = TensorMap(
                 keys=empty_labels,
                 blocks=[
                     TensorBlock(
@@ -130,6 +132,9 @@ class PET(torch.nn.Module):
                     )
                 ],
             )
+            if not outputs["mtt::aux::last_layer_features"].per_atom:
+                ll_feat_tmap = metatensor.torch.sum_over_samples(ll_feat_tmap, "atom")
+            output_quantities["mtt::aux::last_layer_features"] = ll_feat_tmap
         return output_quantities
 
     def save_checkpoint(self, path: Union[str, Path]):
