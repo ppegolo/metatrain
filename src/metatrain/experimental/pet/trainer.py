@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 class Trainer:
     def __init__(self, train_hypers):
+        print(train_hypers)
         self.hypers = {"FITTING_SCHEME": train_hypers}
 
     def train(
@@ -37,8 +38,10 @@ class Trainer:
             torch.distributed.init_process_group(backend="nccl")
             device_number = distr_env.local_rank % torch.cuda.device_count()
             device = torch.device("cuda", device_number)
+            rank = torch.distributed.get_rank()
         else:
             device = devices[0]  # only one device, as we don't support multi-gpu for now
+            rank = 0
 
         if len(train_datasets) != 1:
             raise ValueError("PET only supports a single training dataset")
@@ -139,7 +142,7 @@ class Trainer:
             checkpoint_dir,
         )
 
-        if torch.distributed.get_rank() != 0: return
+        if rank != 0: return
 
         if do_forces:
             load_path = (

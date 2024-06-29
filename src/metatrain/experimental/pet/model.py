@@ -78,22 +78,25 @@ class PET(torch.nn.Module):
             systems, options, self.atomic_types, selected_atoms
         )
 
-        predictions = self.pet(batch)  # type: ignore
+        pet_output = self.pet(batch)  # type: ignore
+        predictions = pet_output["prediction"]
         output_quantities: Dict[str, TensorMap] = {}
+
+        empty_labels = Labels(
+            names=["_"], values=torch.tensor([[0]], device=predictions.device)
+        )
+        structure_index = batch["batch"]
+        _, counts = torch.unique(batch["batch"], return_counts=True)
+        atom_index = torch.cat(
+            [torch.arange(count, device=predictions.device) for count in counts]
+        )
+        samples_values = torch.stack([structure_index, atom_index], dim=1)
+        samples = Labels(names=["system", "atom"], values=samples_values)
+
         for output_name in outputs:
             energy_labels = Labels(
                 names=["energy"], values=torch.tensor([[0]], device=predictions.device)
             )
-            empty_labels = Labels(
-                names=["_"], values=torch.tensor([[0]], device=predictions.device)
-            )
-            structure_index = batch["batch"]
-            _, counts = torch.unique(batch["batch"], return_counts=True)
-            atom_index = torch.cat(
-                [torch.arange(count, device=predictions.device) for count in counts]
-            )
-            samples_values = torch.stack([structure_index, atom_index], dim=1)
-            samples = Labels(names=["system", "atom"], values=samples_values)
             block = TensorBlock(
                 samples=samples,
                 components=[],
@@ -108,6 +111,25 @@ class PET(torch.nn.Module):
             if not outputs[output_name].per_atom:
                 output_tmap = metatensor.torch.sum_over_samples(output_tmap, "atom")
             output_quantities[output_name] = output_tmap
+        if "mtm::aux::last_layer_features" in outputs:
+            if selected_atoms is not None:
+                raise NotImplementedError(
+                    "Selected atoms not supported for last-layer features in PET"
+                )
+            output_quantities["mtm::aux::last_layer_features"] = TensorMap(
+                keys=empty_labels,
+                blocks=[
+                    TensorBlock(
+                        values=pet_output["last_layer_features"],
+                        samples=samples,
+                        components=[],
+                        properties=Labels(
+                            names=["property"],
+                            values=torch.arange(pet_output["last_layer_features"].shape[1], device=predictions.device).reshape(-1, 1),
+                        ) 
+                    )
+                ],
+            )
         return output_quantities
 
     def save_checkpoint(self, path: Union[str, Path]):
@@ -143,6 +165,10 @@ class PET(torch.nn.Module):
 
         capabilities = ModelCapabilities(
             outputs={
+                "mtt::aux::last_layer_features": ModelOutput(
+                    unit="unitless",
+                    per_atom=False,
+                ),
                 self.target_name: ModelOutput(
                     quantity=self.dataset_info.targets[self.target_name].quantity,
                     unit=self.dataset_info.targets[self.target_name].unit,
