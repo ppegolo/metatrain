@@ -259,6 +259,7 @@ def _get_model_outputs(
         )
 
 
+@torch.jit.script
 def _prepare_system(system: System, positions_grad: bool, strain_grad: bool):
     """
     Prepares a system for gradient calculation.
@@ -266,10 +267,10 @@ def _prepare_system(system: System, positions_grad: bool, strain_grad: bool):
     if strain_grad:
         strain = torch.eye(
             3,
-            requires_grad=True,
             dtype=system.cell.dtype,
             device=system.cell.device,
         )
+        strain.requires_grad_(True)
         new_system = System(
             positions=system.positions @ strain,
             cell=system.cell @ strain,

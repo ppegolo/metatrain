@@ -173,41 +173,41 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 one_over_pr, self.uncertainty_multipliers[name]
             )
 
-        # now deal with potential ensembles (see generate_ensemble method)
-        requested_ensembles: List[str] = []
-        for name in outputs.keys():
-            if name.endswith("_ensemble"):
-                requested_ensembles.append(name)
+        # # now deal with potential ensembles (see generate_ensemble method)
+        # requested_ensembles: List[str] = []
+        # for name in outputs.keys():
+        #     if name.endswith("_ensemble"):
+        #         requested_ensembles.append(name)
 
-        for name in requested_ensembles:
-            ensemble_weights = getattr(self, name + "_weights")
-            ensemble_values = torch.einsum(
-                "ij, jk -> ik",
-                ll_features.block().values,
-                ensemble_weights,
-            )
-            ensemble = TensorMap(
-                keys=Labels(
-                    names=["_"],
-                    values=torch.tensor(
-                        [[0]], device=ll_features.block().values.device
-                    ),
-                ),
-                blocks=[
-                    TensorBlock(
-                        values=ensemble_values,
-                        samples=ll_features.block().samples,
-                        components=ll_features.block().components,
-                        properties=Labels(
-                            names=["ensemble_member"],
-                            values=torch.arange(
-                                ensemble_values.shape[1], device=ensemble_values.device
-                            ).unsqueeze(1),
-                        ),
-                    )
-                ],
-            )
-            return_dict[name] = ensemble
+        # for name in requested_ensembles:
+        #     ensemble_weights = getattr(self, name + "_weights")
+        #     ensemble_values = torch.einsum(
+        #         "ij, jk -> ik",
+        #         ll_features.block().values,
+        #         ensemble_weights,
+        #     )
+        #     ensemble = TensorMap(
+        #         keys=Labels(
+        #             names=["_"],
+        #             values=torch.tensor(
+        #                 [[0]], device=ll_features.block().values.device
+        #             ),
+        #         ),
+        #         blocks=[
+        #             TensorBlock(
+        #                 values=ensemble_values,
+        #                 samples=ll_features.block().samples,
+        #                 components=ll_features.block().components,
+        #                 properties=Labels(
+        #                     names=["ensemble_member"],
+        #                     values=torch.arange(
+        #                         ensemble_values.shape[1], device=ensemble_values.device
+        #                     ).unsqueeze(1),
+        #                 ),
+        #             )
+        #         ],
+        #     )
+        #     return_dict[name] = ensemble
 
         # remove the last-layer features from return_dict if they were not requested
         if "mtt::aux::last_layer_features" not in outputs:

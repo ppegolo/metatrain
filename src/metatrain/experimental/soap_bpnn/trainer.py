@@ -231,6 +231,7 @@ class Trainer:
         )
         if self.optimizer_state_dict is not None:
             optimizer.load_state_dict(self.optimizer_state_dict)
+        self.optimizer_state_dict = optimizer.state_dict()
 
         # Create a scheduler:
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -241,6 +242,7 @@ class Trainer:
         )
         if self.scheduler_state_dict is not None:
             lr_scheduler.load_state_dict(self.scheduler_state_dict)
+        self.scheduler_state_dict = lr_scheduler.state_dict()
 
         # counters for early stopping:
         best_val_loss = float("inf")
@@ -254,6 +256,7 @@ class Trainer:
         # Train the model:
         logger.info("Starting training")
         for epoch in range(start_epoch, start_epoch + self.hypers["num_epochs"]):
+            self.epoch = epoch
             if is_distributed:
                 sampler.set_epoch(epoch)
 
@@ -360,9 +363,9 @@ class Trainer:
             if epoch % self.hypers["checkpoint_interval"] == 0:
                 if is_distributed:
                     torch.distributed.barrier()
-                self.optimizer_state_dict = optimizer.state_dict()
-                self.scheduler_state_dict = lr_scheduler.state_dict()
-                self.epoch = epoch
+                # no need to update state dicts of optimizer and scheduler and register
+                # them in the training class, as they are references; the epoch is also
+                # updated at the beginning of the loop
                 self.save_checkpoint(
                     (model.module if is_distributed else model),
                     Path(checkpoint_dir) / f"model_{epoch}.ckpt",

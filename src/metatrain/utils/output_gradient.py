@@ -3,6 +3,7 @@ from typing import List, Optional
 import torch
 
 
+@torch.jit.script
 def compute_gradient(
     target: torch.Tensor, inputs: List[torch.Tensor], is_training: bool
 ) -> List[torch.Tensor]:
@@ -21,11 +22,14 @@ def compute_gradient(
         retain_graph=is_training,
         create_graph=is_training,
     )
-    if gradient is None:
-        raise ValueError(
-            "Unexpected None value for computed gradient. "
-            "One or more operations inside the model might "
-            "not have a gradient implementation."
-        )
-    else:
-        return gradient
+    non_none_gradient = []
+    for g in gradient:
+        if g is None:
+            raise ValueError(
+                "Unexpected None value for computed gradient. "
+                "One or more operations inside the model might "
+                "not have a gradient implementation."
+            )
+        else:
+            non_none_gradient.append(g)
+    return non_none_gradient
