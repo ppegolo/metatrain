@@ -246,10 +246,11 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 systems, options, check_consistency=True
             )  # TODO: True or False here?
             ll_feat_tmap = output["mtt::aux::last_layer_features"]
-            ll_feats = ll_feat_tmap.block().values / n_atoms.unsqueeze(1)
+            ll_feats = ll_feat_tmap.block().values.detach() / n_atoms.unsqueeze(1)
             self.covariance += ll_feats.T @ ll_feats
         self.covariance_computed = True
 
+    @torch.jit.export
     def compute_inverse_covariance(self, regularizer: Optional[float] = None):
         """A function to compute the inverse covariance matrix.
 
@@ -269,9 +270,6 @@ class LLPRUncertaintyModel(torch.nn.Module):
         else:
             # Try with an increasingly high regularization parameter until
             # the matrix is invertible
-            def is_psd(x):
-                return torch.all(torch.linalg.eigvalsh(x) >= 0.0)
-
             for log10_sigma_squared in torch.linspace(-20.0, 16.0, 33):
                 if not is_psd(
                     self.covariance
@@ -282,7 +280,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 else:
                     inverse = torch.inverse(
                         self.covariance
-                        + 10 ** (log10_sigma_squared + 0.0)
+                        + 10 ** (log10_sigma_squared + 2.0)  # make sure
                         * torch.eye(self.ll_feat_size, device=self.covariance.device)
                     )
                     self.inv_covariance = (inverse + inverse.T) / 2.0
@@ -437,3 +435,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
             supported_devices=self.capabilities.supported_devices,
             dtype=self.capabilities.dtype,
         )
+
+
+def is_psd(x):
+    return torch.all(torch.linalg.eigvalsh(x) >= 0.0)
