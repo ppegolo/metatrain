@@ -26,6 +26,7 @@ from ...utils.loss import TensorMapDictLoss
 from ...utils.metrics import RMSEAccumulator
 from ...utils.per_atom import average_by_num_atoms
 from .model import SoapBpnn
+import copy
 
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,9 @@ class Trainer:
             # early stopping criterion:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_model_state_dict = copy.deepcopy(model.state_dict())
+                best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
+                best_scheduler_state_dict = copy.deepcopy(lr_scheduler.state_dict())
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
@@ -384,6 +388,10 @@ class Trainer:
                         "without improvement."
                     )
                     break
+
+        model.load_state_dict(best_model_state_dict)
+        self.optimizer_state_dict = best_optimizer_state_dict
+        self.scheduler_state_dict = best_scheduler_state_dict
 
     def save_checkpoint(self, model, path: Union[str, Path]):
         checkpoint = {
