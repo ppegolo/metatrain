@@ -99,7 +99,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 outputs=outputs,
                 selected_atoms=selected_atoms,
             )
-            return self.model(systems, options, check_consistency=True)
+            return self.model(systems, options, check_consistency=False)
 
         per_atom_all_targets = [output.per_atom for output in outputs.values()]
         # impose either all per atom or all not per atom
@@ -130,9 +130,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
             outputs=outputs_for_model,
             selected_atoms=selected_atoms,
         )
-        return_dict = self.model(
-            systems, options, check_consistency=True
-        )  # TODO: True or False here?
+        return_dict = self.model(systems, options, check_consistency=False)
 
         ll_features = return_dict["mtt::aux::last_layer_features"]
 
@@ -173,41 +171,47 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 one_over_pr, self.uncertainty_multipliers[name]
             )
 
-        # # now deal with potential ensembles (see generate_ensemble method)
-        # requested_ensembles: List[str] = []
-        # for name in outputs.keys():
-        #     if name.endswith("_ensemble"):
-        #         requested_ensembles.append(name)
+        # now deal with potential ensembles (see generate_ensemble method)
+        requested_ensembles: List[str] = []
+        for name in outputs.keys():
+            if name.endswith("_ensemble"):
+                requested_ensembles.append(name)
 
-        # for name in requested_ensembles:
-        #     ensemble_weights = getattr(self, name + "_weights")
-        #     ensemble_values = torch.einsum(
-        #         "ij, jk -> ik",
-        #         ll_features.block().values,
-        #         ensemble_weights,
-        #     )
-        #     ensemble = TensorMap(
-        #         keys=Labels(
-        #             names=["_"],
-        #             values=torch.tensor(
-        #                 [[0]], device=ll_features.block().values.device
-        #             ),
-        #         ),
-        #         blocks=[
-        #             TensorBlock(
-        #                 values=ensemble_values,
-        #                 samples=ll_features.block().samples,
-        #                 components=ll_features.block().components,
-        #                 properties=Labels(
-        #                     names=["ensemble_member"],
-        #                     values=torch.arange(
-        #                         ensemble_values.shape[1], device=ensemble_values.device
-        #                     ).unsqueeze(1),
-        #                 ),
-        #             )
-        #         ],
-        #     )
-        #     return_dict[name] = ensemble
+        for name in requested_ensembles:
+            # get the ensemble weights (getattr not supported by torchscript)
+            ensemble_weights = torch.tensor(0.0)
+            for buffer_name, buffer in self.named_buffers():
+                if buffer_name == name + "_weights":
+                    ensemble_weights = buffer
+            # the ensemble weights should always be found (checks are performed
+            # in the generate_ensemble method and in the metatensor wrapper)
+            ensemble_values = torch.einsum(
+                "ij, jk -> ik",
+                ll_features.block().values,
+                ensemble_weights,
+            )
+            ensemble = TensorMap(
+                keys=Labels(
+                    names=["_"],
+                    values=torch.tensor(
+                        [[0]], device=ll_features.block().values.device
+                    ),
+                ),
+                blocks=[
+                    TensorBlock(
+                        values=ensemble_values,
+                        samples=ll_features.block().samples,
+                        components=ll_features.block().components,
+                        properties=Labels(
+                            names=["ensemble_member"],
+                            values=torch.arange(
+                                ensemble_values.shape[1], device=ensemble_values.device
+                            ).unsqueeze(1),
+                        ),
+                    )
+                ],
+            )
+            return_dict[name] = ensemble
 
         # remove the last-layer features from return_dict if they were not requested
         if "mtt::aux::last_layer_features" not in outputs:
@@ -242,9 +246,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 length_unit="",
                 outputs=outputs,
             )
-            output = self.model(
-                systems, options, check_consistency=True
-            )  # TODO: True or False here?
+            output = self.model(systems, options, check_consistency=False)
             ll_feat_tmap = output["mtt::aux::last_layer_features"]
             ll_feats = ll_feat_tmap.block().values.detach() / n_atoms.unsqueeze(1)
             self.covariance += ll_feats.T @ ll_feats
