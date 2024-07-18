@@ -247,6 +247,7 @@ class Trainer:
 
         # counters for early stopping:
         best_val_loss = float("inf")
+        best_energy_rmse = float("inf")
         epochs_without_improvement = 0
 
         # per-atom targets:
@@ -372,12 +373,16 @@ class Trainer:
                     Path(checkpoint_dir) / f"model_{epoch}.ckpt",
                 )
 
-            # early stopping criterion:
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            energy_rmse = finalized_val_info["energy RMSE (per atom)"]
+            if energy_rmse < best_energy_rmse:
+                best_energy_rmse = energy_rmse
                 best_model_state_dict = copy.deepcopy(model.state_dict())
                 best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
                 best_scheduler_state_dict = copy.deepcopy(lr_scheduler.state_dict())
+
+            # early stopping criterion:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
