@@ -36,16 +36,6 @@ class NanoPET(torch.nn.Module):
         self.new_outputs = list(dataset_info.targets.keys())
         self.atomic_types = dataset_info.atomic_types
 
-        self.register_buffer(
-            "species_to_species_index",
-            torch.full(
-                (max(self.atomic_types) + 1,),
-                -1,
-            ),
-        )
-        for i, species in enumerate(self.atomic_types):
-            self.species_to_species_index[species] = i
-
         self.outputs = {
             key: ModelOutput(
                 quantity=value.quantity,
@@ -117,6 +107,16 @@ class NanoPET(torch.nn.Module):
             }
         )
 
+        self.register_buffer(
+            "species_to_species_index",
+            torch.full(
+                (max(self.atomic_types) + 1,),
+                -1,
+            ),
+        )
+        for i, species in enumerate(self.atomic_types):
+            self.species_to_species_index[species] = i
+
     def restart(self, dataset_info: DatasetInfo) -> "NanoPET":
         # merge old and new dataset info
         merged_info = self.dataset_info.union(dataset_info)
@@ -157,10 +157,21 @@ class NanoPET(torch.nn.Module):
         # Checks on systems (species) and outputs are done in the
         # MetatensorAtomisticModel wrapper
 
-        positions, centers, neighbors, species, segment_indices, edge_vectors = (
-            concatenate_structures(systems)
-        )
-        max_edges_per_node = int(torch.max(torch.bincount(centers)))
+        (
+            positions,
+            centers,
+            neighbors,
+            species,
+            segment_indices,
+            edge_vectors,
+            cell_shifts,
+        ) = concatenate_structures(systems)
+
+        bincount = torch.bincount(centers)
+        if bincount.numel() == 0:  # no edges
+            max_edges_per_node = 0
+        else:
+            max_edges_per_node = int(torch.max(bincount))
 
         # Convert to NEF:
         nef_indices, nef_to_edges_neighbor, nef_mask = get_nef_indices(
@@ -203,7 +214,10 @@ class NanoPET(torch.nn.Module):
         # GNN
         if self.num_mp_layers > 0:
             corresponding_edges = get_corresponding_edges(
-                torch.stack([centers, neighbors], dim=-1)
+                torch.concatenate(
+                    [centers.unsqueeze(-1), neighbors.unsqueeze(-1), cell_shifts],
+                    dim=-1,
+                )
             )
             for contraction, transformer in zip(
                 self.gnn_contractions, self.gnn_transformers
@@ -220,34 +234,23 @@ class NanoPET(torch.nn.Module):
                 new_features = transformer(new_features, radial_mask)
                 features = features + new_features
 
-        # Readout
-        edge_energies = {
-            output_name: last_layer(features)
-            for output_name, last_layer in self.last_layers.items()
-        }
-        # Apply radial weights
-        edge_energies = {
-            output_name: ee * radial_mask[:, :, None]
-            for output_name, ee in edge_energies.items()
-        }
+        edge_features = features * radial_mask[:, :, None]
+        node_features = torch.sum(edge_features, dim=1)
 
-        # Sum over edges
-        atomic_energies_dict = {
-            output_name: torch.sum(ee, dim=(1, 2))
-            for output_name, ee in edge_energies.items()
-        }
+        return_dict: Dict[str, TensorMap] = {}
 
-        atomic_energies_tmap = {
-            output_name: TensorMap(
+        # output the hidden features, if requested:
+        if "mtt::aux::last_layer_features" in outputs:
+            last_layer_feature_tmap = TensorMap(
                 keys=Labels(
                     names=["_"],
-                    values=torch.tensor([[0]], device=atomic_energies.device),
+                    values=torch.tensor([[0]], device=node_features.device),
                 ),
                 blocks=[
                     TensorBlock(
-                        values=atomic_energies.unsqueeze(1),
+                        values=node_features,
                         samples=Labels(
-                            names=["system", "atom", "center_type"],
+                            names=["system", "atom"],
                             values=torch.stack(
                                 [
                                     segment_indices,
@@ -255,40 +258,89 @@ class NanoPET(torch.nn.Module):
                                         [
                                             torch.arange(
                                                 len(system),
-                                                device=atomic_energies.device,
+                                                device=node_features.device,
                                             )
                                             for system in systems
                                         ],
                                     ),
-                                    species,
                                 ],
                                 dim=1,
                             ),
                         ),
                         components=[],
                         properties=Labels(
-                            names=["energy"],
-                            values=torch.tensor([[0]], device=atomic_energies.device),
+                            names=["property"],
+                            values=torch.arange(
+                                node_features.shape[-1], device=node_features.device
+                            ).reshape(-1, 1),
                         ),
                     )
                 ],
             )
-            for output_name, atomic_energies in atomic_energies_dict.items()
-        }
+            last_layer_features_options = outputs["mtt::aux::last_layer_features"]
+            if last_layer_features_options.per_atom:
+                return_dict["mtt::aux::last_layer_features"] = last_layer_feature_tmap
+            else:
+                return_dict["mtt::aux::last_layer_features"] = (
+                    metatensor.torch.sum_over_samples(last_layer_feature_tmap, ["atom"])
+                )
 
-        return_dict: Dict[str, TensorMap] = {}
-        for output_name, tmap in atomic_energies_tmap.items():
-            return_dict[output_name] = apply_composition_contribution_samples(
-                tmap, self.composition_weights[self.output_to_index[output_name]]
+        atomic_energies_tmap_dict: Dict[str, TensorMap] = {}
+        for output_name, last_layer in self.last_layers.items():
+            if output_name in outputs:
+                atomic_energies = last_layer(node_features)
+                atomic_energies_tmap_dict[output_name] = TensorMap(
+                    keys=Labels(
+                        names=["_"],
+                        values=torch.tensor([[0]], device=node_features.device),
+                    ),
+                    blocks=[
+                        TensorBlock(
+                            values=atomic_energies,
+                            samples=Labels(
+                                names=["system", "atom", "center_type"],
+                                values=torch.stack(
+                                    [
+                                        segment_indices,
+                                        torch.concatenate(
+                                            [
+                                                torch.arange(
+                                                    len(system),
+                                                    device=atomic_energies.device,
+                                                )
+                                                for system in systems
+                                            ],
+                                        ),
+                                        species,
+                                    ],
+                                    dim=1,
+                                ),
+                            ),
+                            components=[],
+                            properties=Labels(
+                                names=["energy"],
+                                values=torch.tensor(
+                                    [[0]], device=atomic_energies.device
+                                ),
+                            ),
+                        )
+                    ],
+                )
+
+        for output_name, tmap in atomic_energies_tmap_dict.items():
+            atomic_energies_tmap_dict[output_name] = (
+                apply_composition_contribution_samples(
+                    tmap, self.composition_weights[self.output_to_index[output_name]]
+                )
             )
 
         if selected_atoms is not None:
-            for output_name, tmap in atomic_energies_tmap.items():
-                return_dict[output_name] = metatensor.torch.slice(
+            for output_name, tmap in atomic_energies_tmap_dict.items():
+                atomic_energies_tmap_dict[output_name] = metatensor.torch.slice(
                     tmap, axis="samples", labels=selected_atoms
                 )
 
-        for output_name, atomic_energy in return_dict.items():
+        for output_name, atomic_energy in atomic_energies_tmap_dict.items():
             if outputs[output_name].per_atom:
                 # this operation should just remove the center_type label
                 return_dict[output_name] = metatensor.torch.remove_dimension(

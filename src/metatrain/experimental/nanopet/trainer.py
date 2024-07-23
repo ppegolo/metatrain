@@ -90,7 +90,9 @@ class Trainer:
             logger.info(f"Training on device {device} with dtype {dtype}")
         model.to(device=device, dtype=dtype)
         if is_distributed:
-            model = DistributedDataParallel(model, device_ids=[device])
+            model = DistributedDataParallel(
+                model, device_ids=[device], find_unused_parameters=False
+            )
 
         # Calculate and set the composition weights for all targets:
         logger.info("Calculating composition weights")
@@ -105,15 +107,17 @@ class Trainer:
                     "user-supplied composition weights"
                 )
                 cur_weight_dict = self.hypers["fixed_composition_weights"][target_name]
-                atomic_types = set()
+                atomic_types = []
                 num_species = len(cur_weight_dict)
                 fixed_weights = torch.zeros(num_species, dtype=dtype, device=device)
 
                 for ii, (key, weight) in enumerate(cur_weight_dict.items()):
-                    atomic_types.add(key)
+                    atomic_types.append(key)
                     fixed_weights[ii] = weight
 
-                if not set(atomic_types) == model.atomic_types:
+                print(set(atomic_types))
+                print(set((model.module if is_distributed else model).atomic_types))
+                if not set(atomic_types) == set((model.module if is_distributed else model).atomic_types):
                     raise ValueError(
                         "Supplied atomic types are not present in the dataset."
                     )
@@ -140,7 +144,9 @@ class Trainer:
 
         # Calculating the neighbor lists for the training and validation datasets:
         logger.info("Calculating neighbor lists for the datasets")
-        requested_neighbor_lists = model.requested_neighbor_lists()
+        requested_neighbor_lists = (
+            model.module if is_distributed else model
+        ).requested_neighbor_lists()
         for dataset in train_datasets + val_datasets:
             for i in range(len(dataset)):
                 system = dataset[i]["system"]
@@ -362,7 +368,9 @@ class Trainer:
             if epoch == start_epoch:
                 metric_logger = MetricLogger(
                     log_obj=logger,
-                    dataset_info=model.dataset_info,
+                    dataset_info=(
+                        model.module if is_distributed else model
+                    ).dataset_info,
                     initial_metrics=[finalized_train_info, finalized_val_info],
                     names=["training", "validation"],
                 )
