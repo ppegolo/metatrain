@@ -15,6 +15,7 @@ from ...utils.data import (
     collate_fn,
     get_all_targets,
 )
+import copy
 from ...utils.data.extract_targets import get_targets_dict
 from ...utils.distributed.distributed_data_parallel import DistributedDataParallel
 from ...utils.distributed.slurm import DistributedEnvironment
@@ -263,6 +264,7 @@ class Trainer:
 
         # counters for early stopping:
         best_val_loss = float("inf")
+        best_valid_metric = float("inf")
         epochs_without_improvement = 0
 
         # per-atom targets:
@@ -392,6 +394,15 @@ class Trainer:
                     Path(checkpoint_dir) / f"model_{epoch}.ckpt",
                 )
 
+            energy_rmse = finalized_val_info["energy RMSE (per atom)"]
+            forces_rmse = finalized_val_info["energy_positions_gradients RMSE"]
+            valid_metic = energy_rmse * forces_rmse
+            if valid_metric < best_valid_metric:
+                best_valid_metric = valid_metric
+                best_model_state_dict = copy.deepcopy(model.state_dict())
+                best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
+                best_scheduler_state_dict = copy.deepcopy(lr_scheduler.state_dict())
+
             # early stopping criterion:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -405,6 +416,10 @@ class Trainer:
                         "without improvement."
                     )
                     break
+
+        model.load_state_dict(best_model_state_dict)
+        self.optimizer_state_dict = best_optimizer_state_dict
+        self.scheduler_state_dict = best_scheduler_state_dict
 
     def save_checkpoint(self, model, path: Union[str, Path]):
         checkpoint = {

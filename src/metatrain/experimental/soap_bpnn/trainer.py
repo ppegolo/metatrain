@@ -251,7 +251,7 @@ class Trainer:
 
         # counters for early stopping:
         best_val_loss = float("inf")
-        best_energy_rmse = float("inf")
+        best_valid_metric = float("inf")
         epochs_without_improvement = 0
 
         # per-atom targets:
@@ -380,8 +380,10 @@ class Trainer:
                 )
 
             energy_rmse = finalized_val_info["energy RMSE (per atom)"]
-            if energy_rmse < best_energy_rmse:
-                best_energy_rmse = energy_rmse
+            forces_rmse = finalized_val_info["energy_positions_gradients RMSE"]
+            valid_metic = energy_rmse * forces_rmse
+            if valid_metric < best_valid_metric:
+                best_valid_metric = valid_metric
                 best_model_state_dict = copy.deepcopy(model.state_dict())
                 best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
                 best_scheduler_state_dict = copy.deepcopy(lr_scheduler.state_dict())
