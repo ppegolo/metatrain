@@ -396,7 +396,7 @@ class Trainer:
 
             energy_rmse = finalized_val_info["energy RMSE (per atom)"]
             forces_rmse = finalized_val_info["energy_positions_gradients RMSE"]
-            valid_metic = energy_rmse * forces_rmse
+            valid_metric = energy_rmse * forces_rmse
             if valid_metric < best_valid_metric:
                 best_valid_metric = valid_metric
                 best_model_state_dict = copy.deepcopy(model.state_dict())
