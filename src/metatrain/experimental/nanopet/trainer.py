@@ -27,6 +27,7 @@ from ...utils.metrics import RMSEAccumulator
 from ...utils.neighbor_lists import get_system_with_neighbor_lists
 from ...utils.per_atom import average_by_num_atoms
 from ...utils.data.dataset import DiskDataset
+from ...utils.schedulers import WarmupLRSchedulerWrapper
 from .model import NanoPET
 from .modules.augmentation import apply_random_augmentations
 
@@ -262,6 +263,17 @@ class Trainer:
             factor=self.hypers["scheduler_factor"],
             patience=self.hypers["scheduler_patience"],
         )
+        if self.hypers["warmup_steps"] > 0:
+            lr_scheduler = WarmupLRSchedulerWrapper(
+                lr_scheduler,
+                initial_lr=self.hypers["warmup_initial_lr"],
+                warmup_steps=self.hypers["warmup_steps"],
+            )
+            logging.info(
+                f"LR Warmup will be activated for {self.hypers['warmup_steps']} steps"
+            )
+        current_lr = lr_scheduler.get_last_lr()
+
         if self.scheduler_state_dict is not None:
             lr_scheduler.load_state_dict(self.scheduler_state_dict)
 
@@ -361,6 +373,10 @@ class Trainer:
             )
 
             lr_scheduler.step(val_loss)
+            last_lr = lr_scheduler.get_last_lr()
+            if last_lr != current_lr:
+                logger.info(f"Learning rate changed from {current_lr} to {last_lr}")
+                current_lr = last_lr
 
             # Now we log the information:
             finalized_train_info = {"loss": train_loss, **finalized_train_info}

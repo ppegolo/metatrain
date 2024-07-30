@@ -19,6 +19,8 @@ training:
   early_stopping_patience: 1000
   scheduler_patience: 100
   scheduler_factor: 0.8
+  warmup_steps: 0
+  initial_warmup_lr: 1e-8
   log_interval: 10
   checkpoint_interval: 100
   fixed_composition_weights: {}

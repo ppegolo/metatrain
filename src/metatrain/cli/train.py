@@ -110,8 +110,6 @@ def train_model(
     :param continue_from: File to continue training from.
     """
 
-    print(torch.cuda.is_available())
-
     ###########################
     # VALIDATE BASE OPTIONS ###
     ###########################
