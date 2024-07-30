@@ -26,6 +26,7 @@ from ...utils.loss import TensorMapDictLoss
 from ...utils.metrics import RMSEAccumulator
 from ...utils.neighbor_lists import get_system_with_neighbor_lists
 from ...utils.per_atom import average_by_num_atoms
+from ...utils.data.dataset import DiskDataset
 from .model import NanoPET
 from .modules.augmentation import apply_random_augmentations
 
@@ -117,7 +118,9 @@ class Trainer:
 
                 print(set(atomic_types))
                 print(set((model.module if is_distributed else model).atomic_types))
-                if not set(atomic_types) == set((model.module if is_distributed else model).atomic_types):
+                if not set(atomic_types) == set(
+                    (model.module if is_distributed else model).atomic_types
+                ):
                     raise ValueError(
                         "Supplied atomic types are not present in the dataset."
                     )
@@ -142,18 +145,18 @@ class Trainer:
                     target_name, composition_weights, composition_types
                 )
 
-        # if not isinstance(DiskDataset) 
-        # also make sure that (model.module if is_distributed else model)
-
-        # # Calculating the neighbor lists for the training and validation datasets:
-        # logger.info("Calculating neighbor lists for the datasets")
-        # requested_neighbor_lists = (model.module if is_distributed else model).requested_neighbor_lists()
-        # for dataset in train_datasets + val_datasets:
-        #     for i in range(len(dataset)):
-        #         system = dataset[i]["system"]
-        #         # The following line attaches the neighbors lists to the system,
-        #         # and doesn't require to reassign the system to the dataset:
-        #         _ = get_system_with_neighbor_lists(system, requested_neighbor_lists)
+        # Calculating the neighbor lists for the training and validation datasets:
+        logger.info("Calculating neighbor lists for the datasets")
+        requested_neighbor_lists = (
+            model.module if is_distributed else model
+        ).requested_neighbor_lists()
+        for dataset in train_datasets + val_datasets:
+            if not isinstance(dataset, DiskDataset):
+                for i in range(len(dataset)):
+                    system = dataset[i]["system"]
+                    # The following line attaches the neighbors lists to the system,
+                    # and doesn't require to reassign the system to the dataset:
+                    _ = get_system_with_neighbor_lists(system, requested_neighbor_lists)
 
         logger.info("Setting up data loaders")
 
