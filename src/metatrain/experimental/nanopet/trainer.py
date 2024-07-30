@@ -263,14 +263,14 @@ class Trainer:
             factor=self.hypers["scheduler_factor"],
             patience=self.hypers["scheduler_patience"],
         )
-        if self.hypers["warmup_steps"] > 0:
+        if self.hypers["num_warmup_steps"] > 0:
             lr_scheduler = WarmupLRSchedulerWrapper(
                 lr_scheduler,
                 initial_lr=self.hypers["warmup_initial_lr"],
-                warmup_steps=self.hypers["warmup_steps"],
+                warmup_steps=self.hypers["num_warmup_steps"],
             )
             logging.info(
-                f"LR Warmup will be activated for {self.hypers['warmup_steps']} steps"
+                f"LR Warmup will be activated for {self.hypers['num_warmup_steps']} steps"
             )
         current_lr = lr_scheduler.get_last_lr()
 

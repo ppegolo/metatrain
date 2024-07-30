@@ -13,14 +13,13 @@ training:
   distributed: False
   distributed_port: 39591
   batch_size: 16
-  num_warmup_steps: 1000
+  num_warmup_steps: 0
+  initial_warmup_lr: 1e-8
   num_epochs: 10000
   learning_rate: 3e-4
   early_stopping_patience: 1000
   scheduler_patience: 100
   scheduler_factor: 0.8
-  warmup_steps: 0
-  initial_warmup_lr: 1e-8
   log_interval: 10
   checkpoint_interval: 100
   fixed_composition_weights: {}

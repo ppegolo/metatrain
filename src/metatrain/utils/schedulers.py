@@ -4,8 +4,13 @@ from torch.optim.lr_scheduler import LRScheduler
 class WarmupLRSchedulerWrapper(LRScheduler):
     """
     Wraps the arbitrary PyTorch LR scheduler with a warmup scheduler.
+    Starts from a very small learning rate (default: 1e-8) and linearly
+    increases it to the value defined in the optimizer.
+
+    After the `warmup_steps` epochs, the wrapped scheduler is used.
 
     :param lr_scheduler: The PyTorch LR scheduler to wrap.
+    :param initial_lr: The initial learning rate for the warmup.
     :param warmup_steps: The number of steps for the warmup.
 
     """
