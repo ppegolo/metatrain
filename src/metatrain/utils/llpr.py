@@ -282,7 +282,7 @@ class LLPRUncertaintyModel(torch.nn.Module):
                 else:
                     inverse = torch.inverse(
                         self.covariance
-                        + 10 ** (log10_sigma_squared + 2.0)  # make sure
+                        + 10 ** log10_sigma_squared
                         * torch.eye(self.ll_feat_size, device=self.covariance.device)
                     )
                     self.inv_covariance = (inverse + inverse.T) / 2.0
