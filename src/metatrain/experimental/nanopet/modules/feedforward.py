@@ -35,12 +35,12 @@ class FeedForwardBlock(torch.nn.Module):
         hidden = torch.nn.functional.gelu(hidden)
 
         # Project back to input size
-        output = self.output(hidden)
+        outputs = self.output(hidden)
 
         # Apply dropout
-        output = self.dropout(output)
+        outputs = self.dropout(outputs)
 
         # Residual connection
-        output += inputs
+        outputs = (outputs + inputs) * 0.5 ** 0.5
 
-        return output
+        return outputs
