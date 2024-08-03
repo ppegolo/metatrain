@@ -379,8 +379,8 @@ class Trainer:
                     Path(checkpoint_dir) / f"model_{epoch}.ckpt",
                 )
 
-            energy_rmse = finalized_val_info["energy RMSE (per atom)"]
-            forces_rmse = finalized_val_info["energy_positions_gradients RMSE"]
+            energy_rmse = finalized_train_info["energy RMSE (per atom)"]
+            forces_rmse = finalized_train_info["energy_positions_gradients RMSE"]
             valid_metric = energy_rmse * forces_rmse
             if valid_metric < best_valid_metric:
                 best_valid_metric = valid_metric
