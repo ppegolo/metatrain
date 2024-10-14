@@ -146,18 +146,18 @@ class Trainer:
                     target_name, composition_weights, composition_types
                 )
 
-        # Calculating the neighbor lists for the training and validation datasets:
-        logger.info("Calculating neighbor lists for the datasets")
-        requested_neighbor_lists = (
-            model.module if is_distributed else model
-        ).requested_neighbor_lists()
-        for dataset in train_datasets + val_datasets:
-            if not isinstance(dataset, DiskDataset):
-                for i in range(len(dataset)):
-                    system = dataset[i]["system"]
-                    # The following line attaches the neighbors lists to the system,
-                    # and doesn't require to reassign the system to the dataset:
-                    _ = get_system_with_neighbor_lists(system, requested_neighbor_lists)
+        # # Calculating the neighbor lists for the training and validation datasets:
+        # logger.info("Calculating neighbor lists for the datasets")
+        # requested_neighbor_lists = (
+        #     model.module if is_distributed else model
+        # ).requested_neighbor_lists()
+        # for dataset in train_datasets + val_datasets:
+        #     if not isinstance(dataset, DiskDataset):
+        #         for i in range(len(dataset)):
+        #             system = dataset[i]["system"]
+        #             # The following line attaches the neighbors lists to the system,
+        #             # and doesn't require to reassign the system to the dataset:
+        #             _ = get_system_with_neighbor_lists(system, requested_neighbor_lists)
 
         logger.info("Setting up data loaders")
 
@@ -201,6 +201,7 @@ class Trainer:
                         sampler is None
                     ),  # the sampler takes care of this (if present)
                     collate_fn=collate_fn,
+                    num_workers=16,
                 )
             )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
@@ -216,6 +217,7 @@ class Trainer:
                     shuffle=False,
                     drop_last=False,
                     collate_fn=collate_fn,
+                    num_workers=16,
                 )
             )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
@@ -272,7 +274,7 @@ class Trainer:
             logging.info(
                 f"LR Warmup will be activated for {self.hypers['num_warmup_steps']} steps"
             )
-        current_lr = lr_scheduler.get_last_lr()
+        current_lr = self.hypers["learning_rate"]
 
         if self.scheduler_state_dict is not None:
             lr_scheduler.load_state_dict(self.scheduler_state_dict)

@@ -398,10 +398,24 @@ def get_atomic_types(datasets: Union[Dataset, List[Dataset]]) -> List[int]:
     if not isinstance(datasets, list):
         datasets = [datasets]
 
+    dataloaders = [
+        torch.utils.data.DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=16
+        )
+        for dataset in datasets
+    ]
+
     types = set()
-    for dataset in datasets:
-        for index in range(len(dataset)):
-            system = dataset[index]["system"]
+    for dataloader in dataloaders:
+        for index, sample in enumerate(dataloader):
+            systems, _ = sample
+            if index % 1000 == 0:
+                print(index)
+            system = systems[0]
             types.update(set(system.types.tolist()))
 
     return sorted(types)

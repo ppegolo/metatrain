@@ -26,6 +26,9 @@ from ..utils.omegaconf import BASE_OPTIONS, check_units, expand_dataset_config
 from .eval import _eval_targets
 from .formatter import CustomHelpFormatter
 
+import multiprocessing
+multiprocessing.set_start_method("spawn", force=True)  # "fork" (default) is not safe with DistributedDataParallel's nccl backend
+
 
 logger = logging.getLogger(__name__)
 
