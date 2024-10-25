@@ -3,6 +3,59 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from metatensor.torch import Labels
 from metatensor.torch.atomistic import NeighborListOptions, System
+from .nef import get_nef_indices, edge_array_to_nef, get_corresponding_edges
+
+
+def concatenate_structures(systems: List[System]):
+
+    positions = []
+    centers = []
+    neighbors = []
+    species = []
+    cell_shifts = []
+    cells = []
+    node_counter = 0
+
+    for system in systems:
+        positions.append(system.positions)
+        species.append(system.types)
+
+        assert len(system.known_neighbor_lists()) == 1
+        neighbor_list = system.get_neighbor_list(system.known_neighbor_lists()[0])
+        nl_values = neighbor_list.samples.values
+
+        centers.append(nl_values[:, 0] + node_counter)
+        neighbors.append(nl_values[:, 1] + node_counter)
+        cell_shifts.append(nl_values[:, 2:])
+
+        cells.append(system.cell)
+
+        node_counter += len(system.positions)
+
+    positions = torch.cat(positions)
+    centers = torch.cat(centers)
+    neighbors = torch.cat(neighbors)
+    species = torch.cat(species)
+    cells = torch.stack(cells)
+    cell_shifts = torch.cat(cell_shifts)
+
+    return (
+        positions,
+        centers,
+        neighbors,
+        species,
+        cells,
+        cell_shifts,
+    )
+
+
+def get_radial_mask(r, r_cut: float, r_transition: float):
+    # All radii are already guaranteed to be smaller than r_cut
+    return torch.where(
+        r < r_transition,
+        torch.ones_like(r),
+        0.5 * (torch.cos(torch.pi * (r - r_transition) / (r_cut - r_transition)) + 1.0),
+    )
 
 
 def collate_graph_dicts(
@@ -326,7 +379,7 @@ def get_system_batch_dict(
     return system_dict
 
 
-def systems_to_batch_dict(
+def systems_to_batch_dict_old(
     systems: List[System],
     options: NeighborListOptions,
     all_species_list: List[int],
@@ -366,3 +419,91 @@ def systems_to_batch_dict(
         )
         batch.append(system_dict)
     return collate_graph_dicts(batch)
+
+
+def systems_to_batch_dict(
+    systems: List[System],
+    options: NeighborListOptions,
+    all_species_list: List[int],
+    selected_atoms: Optional[Labels] = None,
+) -> Dict[str, torch.Tensor]:
+    device = systems[0].device
+    species_to_species_index = torch.full(
+        (max(all_species_list) + 1,),
+        -1,
+    )
+    segment_indices = torch.concatenate(
+        [
+            torch.full(
+                (len(system),),
+                i_system,
+                device=device,
+            )
+            for i_system, system in enumerate(systems)
+        ],
+    )
+
+    (
+        positions,
+        centers,
+        neighbors,
+        species,
+        cells,
+        cell_shifts,
+    ) = concatenate_structures(systems)
+
+    edge_vectors = (
+        positions[neighbors]
+        - positions[centers]
+        + torch.einsum(
+            "ab, abc -> ac",
+            cell_shifts.to(cells.dtype),
+            cells[segment_indices[centers]],
+        )
+    )
+
+    bincount = torch.bincount(centers)
+    if bincount.numel() == 0:  # no edges
+        max_edges_per_node = 0
+    else:
+        max_edges_per_node = int(torch.max(bincount))
+
+    # Convert to NEF:
+    nef_indices, nef_to_edges_neighbor, nef_mask = get_nef_indices(
+        centers, len(positions), max_edges_per_node
+    )
+
+    # Element indices
+    element_indices_nodes = species_to_species_index[species]
+    element_indices_centers = element_indices_nodes[centers]
+    element_indices_neighbors = element_indices_nodes[neighbors]
+
+    # Send everything to NEF:
+    edge_vectors = edge_array_to_nef(edge_vectors, nef_indices)
+    element_indices_centers = edge_array_to_nef(element_indices_centers, nef_indices)
+    element_indices_neighbors = edge_array_to_nef(
+        element_indices_neighbors, nef_indices
+    )
+    neighbors_index = edge_array_to_nef(neighbors, nef_indices)
+    corresponding_edges = get_corresponding_edges(
+        torch.concatenate(
+            [centers.unsqueeze(-1), neighbors.unsqueeze(-1), cell_shifts],
+            dim=-1,
+        )
+    )
+    neighbors_pos = edge_array_to_nef(
+        nef_to_edges_neighbor[corresponding_edges], nef_indices
+    )
+
+    batch_dict = {
+        "central_species": element_indices_nodes,
+        "neighbor_species": element_indices_neighbors,
+        "mask": ~nef_mask,
+        "batch": segment_indices,
+        "nums": bincount,
+        "x": edge_vectors,
+        "neighbors_index": neighbors_index,
+        "neighbors_pos": neighbors_pos,
+    }
+
+    return batch_dict
