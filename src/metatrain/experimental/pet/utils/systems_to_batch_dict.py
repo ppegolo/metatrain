@@ -431,6 +431,7 @@ def systems_to_batch_dict(
     species_to_species_index = torch.full(
         (max(all_species_list) + 1,),
         0,
+        device=device,
     )
     for i, species in enumerate(all_species_list):
         species_to_species_index[species] = i
