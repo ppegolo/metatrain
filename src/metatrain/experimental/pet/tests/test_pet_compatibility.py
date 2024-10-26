@@ -33,6 +33,9 @@ def check_batch_dict_consistency(ref_batch, trial_batch):
     mask = ref_mask is False
 
     for key in ref_batch:
+        print(
+            f"{key}: shape={ref_batch[key].shape}, dtype={ref_batch[key].dtype}, shape_trial={trial_batch[key].shape}, dtype_trial={trial_batch[key].dtype}"
+        )
         if key == "x":
             torch.testing.assert_close(
                 ref_batch["x"].flatten().sort()[0],

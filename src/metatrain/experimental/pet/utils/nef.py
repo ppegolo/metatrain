@@ -39,22 +39,24 @@ def get_corresponding_edges(array):
 
     # create a unique identifier for each edge
     # first, we shift the cell_shifts so that the minimum value is 0
-    min_cell_shift_x = cell_shifts_x.min()
+    min_cell_shift_x = cell_shifts_x.min() if cell_shifts_x.numel() > 0 else 0
     cell_shifts_x = cell_shifts_x - min_cell_shift_x
     negative_cell_shifts_x = negative_cell_shifts_x - min_cell_shift_x
 
-    min_cell_shift_y = cell_shifts_y.min()
+    min_cell_shift_y = cell_shifts_y.min() if cell_shifts_y.numel() > 0 else 0
     cell_shifts_y = cell_shifts_y - min_cell_shift_y
     negative_cell_shifts_y = negative_cell_shifts_y - min_cell_shift_y
 
-    min_cell_shift_z = cell_shifts_z.min()
+    min_cell_shift_z = cell_shifts_z.min() if cell_shifts_z.numel() > 0 else 0
     cell_shifts_z = cell_shifts_z - min_cell_shift_z
     negative_cell_shifts_z = negative_cell_shifts_z - min_cell_shift_z
 
-    max_centers_neigbors = centers.max() + 1  # same as neighbors.max() + 1
-    max_shift_x = cell_shifts_x.max() + 1
-    max_shift_y = cell_shifts_y.max() + 1
-    max_shift_z = cell_shifts_z.max() + 1
+    max_centers_neigbors = (
+        centers.max() + 1 if centers.numel() > 0 else 1
+    )  # same as neighbors.max() + 1
+    max_shift_x = cell_shifts_x.max() + 1 if cell_shifts_x.numel() > 0 else 1
+    max_shift_y = cell_shifts_y.max() + 1 if cell_shifts_y.numel() > 0 else 1
+    max_shift_z = cell_shifts_z.max() + 1 if cell_shifts_z.numel() > 0 else 1
 
     size_1 = max_shift_z
     size_2 = max_shift_y * size_1

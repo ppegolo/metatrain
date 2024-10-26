@@ -430,8 +430,10 @@ def systems_to_batch_dict(
     device = systems[0].device
     species_to_species_index = torch.full(
         (max(all_species_list) + 1,),
-        -1,
+        0,
     )
+    for i, species in enumerate(all_species_list):
+        species_to_species_index[species] = i
     segment_indices = torch.concatenate(
         [
             torch.full(
@@ -465,8 +467,10 @@ def systems_to_batch_dict(
     bincount = torch.bincount(centers)
     if bincount.numel() == 0:  # no edges
         max_edges_per_node = 0
+        nums = torch.zeros_like(segment_indices, dtype=torch.int64)
     else:
         max_edges_per_node = int(torch.max(bincount))
+        nums = bincount
 
     # Convert to NEF:
     nef_indices, nef_to_edges_neighbor, nef_mask = get_nef_indices(
@@ -500,7 +504,7 @@ def systems_to_batch_dict(
         "neighbor_species": element_indices_neighbors,
         "mask": ~nef_mask,
         "batch": segment_indices,
-        "nums": bincount,
+        "nums": nums,
         "x": edge_vectors,
         "neighbors_index": neighbors_index,
         "neighbors_pos": neighbors_pos,
