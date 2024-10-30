@@ -91,10 +91,10 @@ class Trainer:
     ):
         assert dtype in WrappedPET.__supported_dtypes__
 
-        is_distributed = self.hypers["distributed"]
+        is_distributed = self.hypers["DISTRIBUTED"]
 
         if is_distributed:
-            distr_env = DistributedEnvironment(self.hypers["distributed_port"])
+            distr_env = DistributedEnvironment(self.hypers["DISTRIBUTED_PORT"])
             torch.distributed.init_process_group(backend="nccl")
             world_size = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
@@ -142,8 +142,17 @@ class Trainer:
             additive_model.to(dtype=torch.float64)
 
         logger.info("Calculating composition weights")
+        if self.hypers["SELF_CONTRIBUTIONS_PATH"] is not None:
+            composition_weights = torch.tensor(
+                np.load(self.hypers["SELF_CONTRIBUTIONS_PATH"]),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            composition_weights = None
+
         model.additive_models[0].train_model(  # this is the composition model
-            train_datasets, self.hypers["fixed_composition_weights"]
+            train_datasets, composition_weights
         )
 
         if is_distributed:
