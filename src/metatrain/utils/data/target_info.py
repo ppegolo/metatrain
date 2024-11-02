@@ -349,7 +349,7 @@ def _get_spherical_target_info(target: DictConfig) -> TargetInfo:
     if target["per_atom"]:
         sample_names.append("atom")
 
-    irreps = target["type"]["spherical"]
+    irreps = target["type"]["spherical"]["irreps"]
     keys = []
     blocks = []
     for irrep in irreps:
@@ -357,7 +357,7 @@ def _get_spherical_target_info(target: DictConfig) -> TargetInfo:
             Labels(
                 names=["o3_mu"],
                 values=torch.arange(
-                    2 * irrep["o3_lambda"] + 1, dtype=torch.int32
+                    -irrep["o3_lambda"], irrep["o3_lambda"] + 1, dtype=torch.int32
                 ).reshape(-1, 1),
             )
         ]
