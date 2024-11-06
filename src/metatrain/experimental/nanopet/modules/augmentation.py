@@ -140,6 +140,7 @@ def _apply_random_augmentations(
                     )
                 ],
             )
+        # TODO: handle spherical tensors
 
     return new_systems, new_targets
 
