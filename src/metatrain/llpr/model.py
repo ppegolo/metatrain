@@ -273,6 +273,12 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             ],
         )
 
+        # Validate dtype from datasets
+        if len(datasets) == 0 or len(datasets[0]) == 0:
+            raise ValueError(
+                "Cannot create dataloader from empty datasets. "
+                "Please provide non-empty datasets for LLPR calibration."
+            )
         dtype = datasets[0][0]["system"].positions.dtype
         if dtype != torch.float64:
             raise ValueError(
@@ -298,7 +304,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             samplers = [None] * len(datasets)
 
         dataloaders = []
-        for dataset, sampler in zip(datasets, samplers, strict=False):
+        for dataset, sampler in zip(datasets, samplers, strict=True):
             if len(dataset) < batch_size:
                 raise ValueError(
                     f"A training dataset has fewer samples "
@@ -311,7 +317,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                     dataset=dataset,
                     batch_size=batch_size,
                     sampler=sampler,
-                    shuffle=None if sampler else False,
+                    shuffle=False if sampler else False,
                     drop_last=False,
                     collate_fn=collate_fn,
                 )

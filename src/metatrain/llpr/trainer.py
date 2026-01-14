@@ -166,12 +166,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
             logging.info("LLPR calibration complete")
 
         if self.hypers["num_epochs"] is None:
-            if is_distributed:
-                torch.distributed.destroy_process_group()
             logging.info(
                 "num_epochs is None, skipping ensemble weight training and "
                 "proceeding to model export"
             )
+            if is_distributed:
+                torch.distributed.destroy_process_group()
             return
 
         # Continue with ensemble training if num_epochs is not None
