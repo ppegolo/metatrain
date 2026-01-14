@@ -284,6 +284,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 "Cannot create dataloader from empty dataset. "
                 "Please provide non-empty datasets for LLPR calibration."
             )
+        
         dtype = datasets[0][0]["system"].positions.dtype
         if dtype != torch.float64:
             raise ValueError(
@@ -721,11 +722,11 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             torch.distributed.barrier()
             # All-reduce the accumulated statistics across all processes
             world_size = torch.distributed.get_world_size()
-            
+
             for name in all_predictions:
                 # We need to gather all predictions, targets, and uncertainties
                 # across processes. For simplicity, we concatenate them.
-                
+
                 # Prepare lists for gathering
                 gathered_predictions = [
                     torch.zeros_like(all_predictions[name]) for _ in range(world_size)
@@ -738,7 +739,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                     torch.zeros_like(all_uncertainties[uncertainty_name])
                     for _ in range(world_size)
                 ]
-                
+
                 # All-gather the tensors
                 torch.distributed.all_gather(gathered_predictions, all_predictions[name])
                 torch.distributed.all_gather(gathered_targets, all_targets[name])
