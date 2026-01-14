@@ -597,6 +597,9 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                     ll_feats = ll_feat_tmap.block().values.detach() / n_atoms.unsqueeze(
                         1
                     )
+                else:
+                    # For per-atom targets, use the features directly
+                    ll_feats = ll_feat_tmap.block().values.detach()
                 uncertainty_name = _get_uncertainty_name(name)
                 covariance = self._get_covariance(uncertainty_name)
                 covariance += ll_feats.T @ ll_feats
