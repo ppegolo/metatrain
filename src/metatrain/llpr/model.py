@@ -560,9 +560,6 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         :param batch_size: Batch size to use for the dataloader.
         :param is_distributed: Whether to use distributed sampling or not.
         """
-        if not isinstance(datasets, list):
-            datasets = [datasets]
-
         # Create dataloader for the training datasets
         train_loader = self._get_dataloader(
             datasets, batch_size, is_distributed=is_distributed
@@ -674,9 +671,6 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         :param batch_size: Batch size to use for the dataloader.
         :param is_distributed: Whether to use distributed sampling or not.
         """
-        if not isinstance(datasets, list):
-            datasets = [datasets]
-
         # Create dataloader for the validation datasets
         valid_loader = self._get_dataloader(
             datasets, batch_size, is_distributed=is_distributed
@@ -726,10 +720,11 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         if is_distributed:
             torch.distributed.barrier()
             # All-reduce the accumulated statistics across all processes
+            world_size = torch.distributed.get_world_size()
+            
             for name in all_predictions:
                 # We need to gather all predictions, targets, and uncertainties
                 # across processes. For simplicity, we concatenate them.
-                world_size = torch.distributed.get_world_size()
                 
                 # Prepare lists for gathering
                 gathered_predictions = [
