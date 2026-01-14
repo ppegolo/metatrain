@@ -121,6 +121,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # For the initial LLPR calibration, use a single device
         # Distributed training will be initialized after calibration
         # TODO: make multi-GPU calibration available
+
         device = devices[0]
         rank = 0
 
