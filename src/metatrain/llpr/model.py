@@ -712,6 +712,8 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             )
 
         # Compute calibration constants
+        # First, compute local statistics for all outputs
+        local_statistics = {}
         for name in all_predictions:
             # compute the uncertainty multiplier
             residuals = all_predictions[name] - all_targets[name]
@@ -727,11 +729,21 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             uncertainties = all_uncertainties[uncertainty_name]
             ratios = squared_residuals / uncertainties**2  # can be multi-dimensional
 
-            if is_distributed:
-                # In distributed mode, compute the sum and count locally, then
-                # all-reduce them to get the global mean. This avoids the issue
-                # of gathering tensors with different sizes across processes.
-                torch.distributed.barrier()
+            # Store local statistics for later reduction or direct computation
+            local_statistics[name] = {
+                "ratios": ratios,
+                "uncertainty_name": uncertainty_name,
+            }
+
+        if is_distributed:
+            # In distributed mode, compute the sum and count locally, then
+            # all-reduce them to get the global mean. This avoids the issue
+            # of gathering tensors with different sizes across processes.
+            torch.distributed.barrier()
+
+            for name in all_predictions:
+                ratios = local_statistics[name]["ratios"]
+                uncertainty_name = local_statistics[name]["uncertainty_name"]
 
                 # Compute local sum and count
                 local_sum = torch.sum(ratios, dim=0)
@@ -747,8 +759,11 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 global_mean = local_sum / local_count
                 multiplier = self._get_multiplier(uncertainty_name)
                 multiplier[:] = torch.sqrt(global_mean)
-            else:
-                # Non-distributed mode: compute mean directly
+        else:
+            # Non-distributed mode: compute mean directly
+            for name in all_predictions:
+                ratios = local_statistics[name]["ratios"]
+                uncertainty_name = local_statistics[name]["uncertainty_name"]
                 multiplier = self._get_multiplier(uncertainty_name)
                 multiplier[:] = torch.sqrt(
                     torch.mean(ratios, dim=0)
