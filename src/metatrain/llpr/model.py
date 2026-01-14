@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import metatensor.torch as mts
 import numpy as np
@@ -288,8 +288,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         dtype = datasets[0][0]["system"].positions.dtype
         if dtype != torch.float64:
             raise ValueError(
-                "The LLPR calibration only supports float64. "
-                f"Got dtype: {dtype}."
+                f"The LLPR calibration only supports float64. Got dtype: {dtype}."
             )
 
         # Build the dataloaders
@@ -741,12 +740,14 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 ]
 
                 # All-gather the tensors
-                torch.distributed.all_gather(gathered_predictions, all_predictions[name])
+                torch.distributed.all_gather(
+                    gathered_predictions, all_predictions[name]
+                )
                 torch.distributed.all_gather(gathered_targets, all_targets[name])
                 torch.distributed.all_gather(
                     gathered_uncertainties, all_uncertainties[uncertainty_name]
                 )
-                
+
                 # Concatenate gathered tensors
                 all_predictions[name] = torch.cat(gathered_predictions, dim=0)
                 all_targets[name] = torch.cat(gathered_targets, dim=0)
