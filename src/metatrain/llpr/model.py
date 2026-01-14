@@ -274,9 +274,14 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         )
 
         # Validate dtype from datasets
-        if len(datasets) == 0 or len(datasets[0]) == 0:
+        if len(datasets) == 0:
             raise ValueError(
-                "Cannot create dataloader from empty datasets. "
+                "Cannot create dataloader from empty datasets list. "
+                "Please provide non-empty datasets for LLPR calibration."
+            )
+        if len(datasets[0]) == 0:
+            raise ValueError(
+                "Cannot create dataloader from empty dataset. "
                 "Please provide non-empty datasets for LLPR calibration."
             )
         dtype = datasets[0][0]["system"].positions.dtype
@@ -317,7 +322,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                     dataset=dataset,
                     batch_size=batch_size,
                     sampler=sampler,
-                    shuffle=False if sampler else False,
+                    shuffle=False,
                     drop_last=False,
                     collate_fn=collate_fn,
                 )
