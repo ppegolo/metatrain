@@ -285,12 +285,6 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 "Please provide non-empty datasets for LLPR calibration."
             )
 
-        dtype = datasets[0][0]["system"].positions.dtype
-        if dtype != torch.float64:
-            raise ValueError(
-                f"The LLPR calibration only supports float64. Got dtype: {dtype}."
-            )
-
         # Build the dataloaders
         if is_distributed:
             world_size = torch.distributed.get_world_size()
