@@ -711,44 +711,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 all_uncertainties[uncertainty_name], dim=0
             )
 
-        if is_distributed:
-            torch.distributed.barrier()
-            # All-reduce the accumulated statistics across all processes
-            world_size = torch.distributed.get_world_size()
-
-            for name in all_predictions:
-                # We need to gather all predictions, targets, and uncertainties
-                # across processes. For simplicity, we concatenate them.
-
-                # Prepare lists for gathering
-                gathered_predictions = [
-                    torch.zeros_like(all_predictions[name]) for _ in range(world_size)
-                ]
-                gathered_targets = [
-                    torch.zeros_like(all_targets[name]) for _ in range(world_size)
-                ]
-                uncertainty_name = _get_uncertainty_name(name)
-                gathered_uncertainties = [
-                    torch.zeros_like(all_uncertainties[uncertainty_name])
-                    for _ in range(world_size)
-                ]
-
-                # All-gather the tensors
-                torch.distributed.all_gather(
-                    gathered_predictions, all_predictions[name]
-                )
-                torch.distributed.all_gather(gathered_targets, all_targets[name])
-                torch.distributed.all_gather(
-                    gathered_uncertainties, all_uncertainties[uncertainty_name]
-                )
-
-                # Concatenate gathered tensors
-                all_predictions[name] = torch.cat(gathered_predictions, dim=0)
-                all_targets[name] = torch.cat(gathered_targets, dim=0)
-                all_uncertainties[uncertainty_name] = torch.cat(
-                    gathered_uncertainties, dim=0
-                )
-
+        # Compute calibration constants
         for name in all_predictions:
             # compute the uncertainty multiplier
             residuals = all_predictions[name] - all_targets[name]
@@ -763,8 +726,33 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             uncertainty_name = _get_uncertainty_name(name)
             uncertainties = all_uncertainties[uncertainty_name]
             ratios = squared_residuals / uncertainties**2  # can be multi-dimensional
-            multiplier = self._get_multiplier(uncertainty_name)
-            multiplier[:] = torch.sqrt(torch.mean(ratios, dim=0))  # only along samples
+
+            if is_distributed:
+                # In distributed mode, compute the sum and count locally, then
+                # all-reduce them to get the global mean. This avoids the issue
+                # of gathering tensors with different sizes across processes.
+                torch.distributed.barrier()
+
+                # Compute local sum and count
+                local_sum = torch.sum(ratios, dim=0)
+                local_count = torch.tensor(
+                    ratios.shape[0], dtype=local_sum.dtype, device=local_sum.device
+                )
+
+                # All-reduce the sum and count
+                torch.distributed.all_reduce(local_sum)
+                torch.distributed.all_reduce(local_count)
+
+                # Compute the global mean
+                global_mean = local_sum / local_count
+                multiplier = self._get_multiplier(uncertainty_name)
+                multiplier[:] = torch.sqrt(global_mean)
+            else:
+                # Non-distributed mode: compute mean directly
+                multiplier = self._get_multiplier(uncertainty_name)
+                multiplier[:] = torch.sqrt(
+                    torch.mean(ratios, dim=0)
+                )  # only along samples
 
     def generate_ensemble(self) -> None:
         """Generate an ensemble of weights for the model.
