@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Union
 
 import metatensor.torch as mts
 import numpy as np
@@ -286,6 +286,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             )
 
         # Build the dataloaders
+        samplers: List[torch.utils.data.Sampler | None]
         if is_distributed:
             world_size = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
@@ -988,7 +989,7 @@ def _get_uncertainty_name(name: str) -> str:
 class NoPadDistributedSampler(torch.utils.data.Sampler[int]):
     def __init__(
         self,
-        dataset,
+        dataset: torch.utils.data.Dataset,
         num_replicas: int,
         rank: int,
         shuffle: bool = False,
@@ -1004,7 +1005,7 @@ class NoPadDistributedSampler(torch.utils.data.Sampler[int]):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[int]:
         n = len(self.dataset)
         indices = torch.arange(n, dtype=torch.long)
         if self.shuffle:
