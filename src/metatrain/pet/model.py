@@ -32,6 +32,7 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
+from .modules.atomic_basis import LinearReadout
 from .modules.backend import PETBackend
 from .modules.diagnostic import (
     DIAGNOSTIC_PREFIX,
@@ -58,7 +59,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 16
+    __checkpoint_version__ = 17
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -127,6 +128,10 @@ class PET(ModelInterface[ModelHypers]):
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
+        self.is_atomic_basis_target: Dict[str, bool] = {
+            target_name: target_info.is_atomic_basis
+            for target_name, target_info in dataset_info.targets.items()
+        }
         train_dataset_info = self._train_dataset_info(dataset_info)
 
         self.output_shapes: Dict[str, Dict[str, List[int]]] = {}
@@ -229,8 +234,11 @@ class PET(ModelInterface[ModelHypers]):
         train_dataset_info = self._train_dataset_info(dataset_info)
 
         # register new outputs as new last layers
-        for target_name in new_targets:
+        for target_name, raw_target_info in new_targets.items():
             self.target_names.append(target_name)
+            # Like in __init__, the flag must come from the raw (pre-densify)
+            # TargetInfo; _add_output reads it via self.is_atomic_basis_target.
+            self.is_atomic_basis_target[target_name] = raw_target_info.is_atomic_basis
             self._add_output(target_name, train_dataset_info.targets[target_name])
 
         self.dataset_info = merged_info
@@ -1036,19 +1044,32 @@ class PET(ModelInterface[ModelHypers]):
         )
 
         # The learnable heads and last layers live on the pure-PyTorch backend.
-        self.backend.add_output(target_name, self.output_shapes[target_name])
+        self.backend.add_output(
+            target_name,
+            self.output_shapes[target_name],
+            self.is_atomic_basis_target[target_name],
+        )
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).
+        # Only plain LinearReadout weights are registered: LLPR consumes these
+        # names as 2-D ``(n_properties, ll_features)`` linear weights, which the
+        # species-conditioned readouts (3-D per-species weights, MoE routers,
+        # FiLM parameters, ...) do not provide. Targets using such readouts get
+        # an empty list, so LLPR fails loudly instead of sampling garbage.
         self.last_layer_parameter_names[target_name] = []
         for layer_index in range(self.num_readout_layers):
             for key in self.output_shapes[target_name].keys():
-                self.last_layer_parameter_names[target_name].append(
-                    f"backend.node_last_layers.{target_name}.{layer_index}.{key}.weight"
-                )
-                self.last_layer_parameter_names[target_name].append(
-                    f"backend.edge_last_layers.{target_name}.{layer_index}.{key}.weight"
-                )
+                for prefix, last_layers in (
+                    ("node", self.backend.node_last_layers),
+                    ("edge", self.backend.edge_last_layers),
+                ):
+                    module = last_layers[target_name][layer_index][key]
+                    if isinstance(module, LinearReadout):
+                        self.last_layer_parameter_names[target_name].append(
+                            f"backend.{prefix}_last_layers.{target_name}."
+                            f"{layer_index}.{key}.weight"
+                        )
 
         ll_features_name = get_last_layer_features_name(target_name)
         self.outputs[ll_features_name] = ModelOutput(
