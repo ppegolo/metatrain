@@ -126,6 +126,10 @@ class PET(ModelInterface[ModelHypers]):
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
+        self.is_atomic_basis_target: Dict[str, bool] = {
+            target_name: target_info.is_atomic_basis
+            for target_name, target_info in dataset_info.targets.items()
+        }
         train_dataset_info = self._train_dataset_info(dataset_info)
 
         self.output_shapes: Dict[str, Dict[str, List[int]]] = {}
@@ -1035,7 +1039,11 @@ class PET(ModelInterface[ModelHypers]):
         )
 
         # The learnable heads and last layers live on the pure-PyTorch backend.
-        self.backend.add_output(target_name, self.output_shapes[target_name])
+        self.backend.add_output(
+            target_name,
+            self.output_shapes[target_name],
+            self.is_atomic_basis_target[target_name],
+        )
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).

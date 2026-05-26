@@ -4,6 +4,17 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from ..documentation import ModelHypers
+from .atomic_basis import (
+    IrrepResidualFiLM,
+    IrrepResidualReadout,
+    IrrepResidualZCorrection,
+    IrrepResidualZCorrectionDeep,
+    IrrepResidualZOutput,
+    IrrepThenMoE,
+    IrrepThenZConditioned,
+    MoEReadout,
+    Readout,
+)
 from .conditioning import SystemConditioningEmbedding
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
@@ -56,8 +67,11 @@ class PETBackend(torch.nn.Module):
         self.attention_temperature = hypers["attention_temperature"]
         self.transformer_type = hypers["transformer_type"]
         self.featurizer_type = hypers["featurizer_type"]
+        self.readout_type = hypers["readout_type"]
+        self.geometry_embedding_lmax = hypers["geometry_embedding_lmax"]
 
         num_atomic_species = len(atomic_types)
+        self.n_species = num_atomic_species
 
         # ``species_to_species_index`` is registered first so that it remains the first
         # entry of the ``state_dict`` (an integer buffer), which the checkpoint dtype
@@ -85,6 +99,7 @@ class PETBackend(torch.nn.Module):
                     self.transformer_type,
                     num_atomic_species,
                     layer_index == 0,  # is first layer
+                    self.geometry_embedding_lmax,
                 )
                 for layer_index in range(self.num_gnn_layers)
             ]
@@ -153,7 +168,123 @@ class PETBackend(torch.nn.Module):
         )
         # ===== END DIAGNOSTIC-RELATED ATTRIBUTES
 
-    def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
+    def _make_readout(
+        self,
+        in_features: int,
+        out_features: int,
+        is_atomic_basis: bool,
+    ) -> torch.nn.Module:
+        """
+        Factory: return the readout module for one output block.
+
+        For non-atomic-basis targets (or when ``readout_type`` is ``None``),
+        returns a plain shared linear layer (``Readout`` with
+        ``z_conditioned=False``).
+
+        For atomic basis targets with ``readout_type`` set, dispatches on
+        ``readout_type["name"]``:
+
+        - ``"ZConditioned"``        — :class:`Readout`
+        - ``"MoE"``                 — :class:`MoEReadout`
+        - ``"IrrepThenZConditioned"``— :class:`IrrepThenZConditioned`
+        - ``"IrrepThenMoE"``        — :class:`IrrepThenMoE`
+        - ``"IrrepResidual"``       — :class:`IrrepResidualReadout`
+
+        All returned modules share ``forward(features, species_idx)`` so they
+        are drop-in replaceable in the model's ``ModuleDict`` containers.
+        """
+        n_species = self.n_species
+
+        if not is_atomic_basis or self.readout_type is None:
+            # Vanilla shared linear — same for all species, no Z-conditioning.
+            return Readout(
+                in_features, out_features, n_species, z_conditioned=False
+            )
+
+        name = self.readout_type.get("name", "ZConditioned")
+        args = self.readout_type.get("args", {})
+
+        if name == "ZConditioned":
+            return Readout(
+                in_features,
+                out_features,
+                n_species,
+                z_conditioned=True,
+                hidden_layer_widths=args.get("hidden_layer_widths", None),
+            )
+
+        elif name == "MoE":
+            return MoEReadout(
+                in_features,
+                out_features,
+                n_species,
+                num_experts=args["num_experts"],
+                num_routed_experts=args["num_routed_experts"],
+                num_topk_experts=args["num_topk_experts"],
+                embedding_dim=args.get("embedding_dim", 16),
+            )
+
+        elif name == "IrrepThenZConditioned":
+            return IrrepThenZConditioned(
+                in_features,
+                out_features,
+                n_species,
+                z_conditioned=args.get("z_conditioned", True),
+                hidden_layer_widths=args.get("hidden_layer_widths", None),
+            )
+
+        elif name == "IrrepThenMoE":
+            return IrrepThenMoE(
+                in_features,
+                out_features,
+                n_species,
+                d_irrep=args.get("d_irrep", in_features),
+                num_experts=args["num_experts"],
+                num_routed_experts=args["num_routed_experts"],
+                num_topk_experts=args["num_topk_experts"],
+                embedding_dim=args.get("embedding_dim", 16),
+            )
+
+        elif name == "IrrepResidual":
+            return IrrepResidualReadout(
+                in_features,
+                out_features,
+                n_species,
+                z_conditioned=args.get("z_conditioned", True),
+            )
+
+        elif name == "IrrepResidualZOutput":
+            return IrrepResidualZOutput(in_features, out_features, n_species)
+
+        elif name == "IrrepResidualFiLM":
+            return IrrepResidualFiLM(in_features, out_features, n_species)
+
+        elif name == "IrrepResidualZCorrection":
+            return IrrepResidualZCorrection(
+                in_features, out_features, n_species, args.get("expansion_factor")
+            )
+
+        elif name == "IrrepResidualZCorrectionDeep":
+            return IrrepResidualZCorrectionDeep(
+                in_features,
+                out_features,
+                n_species,
+                num_correction_layers=args.get("num_correction_layers", 2),
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown readout_type name: '{name}'. "
+                "Available: ZConditioned, MoE, IrrepThenZConditioned, "
+                "IrrepThenMoE, IrrepResidual."
+            )
+
+    def add_output(
+        self,
+        target_name: str,
+        output_shapes: Dict[str, List[int]],
+        is_atomic_basis: bool,
+    ) -> None:
         """
         Create the node/edge heads and last layers for a new output target.
 
@@ -166,6 +297,9 @@ class PETBackend(torch.nn.Module):
         :param output_shapes: Mapping from per-block key to the block's shape (the
             component sizes followed by the number of properties), as computed by
             :meth:`metatrain.pet.model.PET._add_output`.
+        :param is_atomic_basis: Whether this target is an atomic-basis target. Only
+            such targets use ``readout_type``-selected readouts; other targets always
+            get a plain shared linear layer.
         """
         self.node_heads[target_name] = torch.nn.ModuleList(
             [
@@ -195,7 +329,9 @@ class PETBackend(torch.nn.Module):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(self.d_head, prod(shape), bias=True)
+                        key: self._make_readout(
+                            self.d_head, prod(shape), is_atomic_basis
+                        )
                         for key, shape in output_shapes.items()
                     }
                 )
@@ -207,7 +343,9 @@ class PETBackend(torch.nn.Module):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(self.d_head, prod(shape), bias=True)
+                        key: self._make_readout(
+                            self.d_head, prod(shape), is_atomic_basis
+                        )
                         for key, shape in output_shapes.items()
                     }
                 )
@@ -428,6 +566,7 @@ class PETBackend(torch.nn.Module):
         """
         padding_mask = batch_data["padding_mask"]
         cutoff_factors = batch_data["cutoff_factors"]
+        element_indices_nodes = batch_data["element_indices_nodes"]
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(
             node_features_list,
@@ -441,6 +580,7 @@ class PETBackend(torch.nn.Module):
                 padding_mask,
                 cutoff_factors,
                 requested_output_names,
+                element_indices_nodes,
             )
         )
 
@@ -672,6 +812,7 @@ class PETBackend(torch.nn.Module):
         padding_mask: torch.Tensor,
         cutoff_factors: torch.Tensor,
         requested_output_names: List[str],
+        element_indices_nodes: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -689,6 +830,7 @@ class PETBackend(torch.nn.Module):
         :param cutoff_factors: Tensor of cutoff factors for edge distances
             [n_atoms, max_num_neighbors].
         :param requested_output_names: Names of the target outputs to compute.
+        :param element_indices_nodes: Tensor of node species indices [n_atoms].
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
@@ -714,7 +856,10 @@ class PETBackend(torch.nn.Module):
                     node_atomic_predictions_by_block: List[torch.Tensor] = []
                     for node_last_layer_by_block in node_last_layer.values():
                         node_atomic_predictions_by_block.append(
-                            node_last_layer_by_block(node_last_layer_features)
+                            node_last_layer_by_block(
+                                node_last_layer_features,
+                                element_indices_nodes,
+                            )
                         )
                     node_atomic_predictions_dict[output_name].append(
                         node_atomic_predictions_by_block
@@ -736,7 +881,8 @@ class PETBackend(torch.nn.Module):
                     edge_atomic_predictions_by_block: List[torch.Tensor] = []
                     for edge_last_layer_by_block in edge_last_layer.values():
                         edge_atomic_predictions = edge_last_layer_by_block(
-                            edge_last_layer_features
+                            edge_last_layer_features,
+                            element_indices_nodes,
                         )
                         expanded_padding_mask = padding_mask[..., None].repeat(
                             1, 1, edge_atomic_predictions.shape[2]
