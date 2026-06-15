@@ -7,14 +7,12 @@ from metatomic.torch import System
 from metatrain.utils.pyscf_loss import (
     _load_auxiliary_basis,
     build_auxiliary_molecule,
-    compute_batched_coulomb_matrices,
-    compute_batched_overlap_matrices,
     compute_coulomb_matrix,
+    compute_metric_matrix,
     compute_overlap_matrix,
+    compute_ragged_metric_matrices,
     metric_matrix_name,
-    pack_two_center_matrices,
     resolve_ri_aux_basis,
-    unpack_two_center_matrices,
 )
 
 
@@ -88,53 +86,31 @@ def test_build_auxiliary_molecule_and_coulomb_matrix():
     assert torch.linalg.eigvalsh(J).min().item() > 0.0
 
 
-def test_pack_unpack_two_center_matrices_round_trip():
-    matrices = [
-        torch.tensor([[1.0, 0.2], [0.2, 2.0]], dtype=torch.float64),
-        torch.tensor([[3.0]], dtype=torch.float64),
-    ]
+def test_compute_ragged_metric_matrices_matches_individual_results():
+    systems = _make_systems()
 
-    packed = pack_two_center_matrices(matrices)
+    for metric, compute_single in (
+        ("overlap", compute_overlap_matrix),
+        ("coulomb", compute_coulomb_matrix),
+    ):
+        ragged = compute_ragged_metric_matrices(systems, "def2-svp-jkfit", metric)
+        expected = [compute_single(system, "def2-svp-jkfit") for system in systems]
+        assert ragged.sizes == [matrix.shape[0] for matrix in expected]
+        for expected_matrix, actual_matrix in zip(
+            expected, ragged.matrices(), strict=True
+        ):
+            torch.testing.assert_close(actual_matrix, expected_matrix)
+
+
+def test_compute_metric_matrix_dtype_cast():
+    system = _make_systems()[0]
+    m64 = compute_metric_matrix(system, "def2-svp-jkfit", "overlap")
+    ragged32 = compute_ragged_metric_matrices(
+        [system], "def2-svp-jkfit", "overlap", dtype=torch.float32
+    )
     torch.testing.assert_close(
-        packed.block().samples.values[:, 1], torch.tensor([2, 1], dtype=torch.int32)
+        ragged32.matrices()[0], m64.to(torch.float32), rtol=0, atol=0
     )
-    unpacked = unpack_two_center_matrices(packed, [2, 1])
-
-    for expected, actual in zip(matrices, unpacked, strict=True):
-        torch.testing.assert_close(actual, expected)
-
-
-def test_unpack_two_center_matrices_rejects_basis_mismatch():
-    packed = pack_two_center_matrices([torch.eye(2, dtype=torch.float64)])
-
-    with pytest.raises(ValueError, match="RI target size does not match"):
-        unpack_two_center_matrices(packed, [1])
-
-
-def test_compute_batched_overlap_matrices_matches_individual_results():
-    systems = _make_systems()
-
-    packed = compute_batched_overlap_matrices(systems, "def2-svp-jkfit")
-    expected = [compute_overlap_matrix(system, "def2-svp-jkfit") for system in systems]
-    actual = unpack_two_center_matrices(
-        packed, [matrix.shape[0] for matrix in expected]
-    )
-
-    for expected_matrix, actual_matrix in zip(expected, actual, strict=True):
-        torch.testing.assert_close(actual_matrix, expected_matrix)
-
-
-def test_compute_batched_coulomb_matrices_matches_individual_results():
-    systems = _make_systems()
-
-    packed = compute_batched_coulomb_matrices(systems, "def2-svp-jkfit")
-    expected = [compute_coulomb_matrix(system, "def2-svp-jkfit") for system in systems]
-    actual = unpack_two_center_matrices(
-        packed, [matrix.shape[0] for matrix in expected]
-    )
-
-    for expected_matrix, actual_matrix in zip(expected, actual, strict=True):
-        torch.testing.assert_close(actual_matrix, expected_matrix)
 
 
 def test_metric_matrix_name_dispatches_correctly():

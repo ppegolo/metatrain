@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -240,206 +241,163 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
         )
 
 
-# ── TensorMap packing / unpacking ──────────────────────────────────────────────
+# ── Ragged metric-matrix container ─────────────────────────────────────────────
 
-def pack_two_center_matrices(matrices: list[torch.Tensor]) -> TensorMap:
+@dataclass
+class RaggedMetricMatrices:
     """
-    Pack variable-size per-system two-centre matrices into one padded TensorMap.
+    Per-system two-centre metric matrices stored ragged, with NO padding.
 
-    :param matrices: Dense square matrices, one per system.
-    :return: Single-block TensorMap with samples ``(system, basis_size)``.
+    The matrices are concatenated flat (``values`` = ``cat([M_i.reshape(-1)])``, length
+    ``Σ N_i²``) plus their sizes ``N_i``.  This is the channel used to carry metric
+    matrices through the dataloader: a single flat tensor transfers across the worker
+    boundary via shared memory (one fd, not one-per-system), and — because it is a raw
+    tensor rather than a :py:class:`TensorMap` — it bypasses ``save_buffer`` (float64
+    only) and any batch-max padding.
+
+    :param values: 1D tensor, concatenation of each row-major ``M_i``.
+    :param sizes: basis size ``N_i`` of each system's matrix.
     """
-    if len(matrices) == 0:
-        raise ValueError("Expected at least one two-centre matrix to pack.")
 
-    max_basis = max(matrix.shape[0] for matrix in matrices)
-    dtype = matrices[0].dtype
-    device = matrices[0].device
-    basis_sizes = torch.tensor(
-        [[matrix.shape[0]] for matrix in matrices], dtype=torch.int32, device=device
-    )
+    values: torch.Tensor
+    sizes: list[int]
 
-    values = torch.full(
-        (len(matrices), max_basis, max_basis),
-        fill_value=torch.nan,
-        dtype=dtype,
-        device=device,
-    )
-    for i_system, matrix in enumerate(matrices):
-        n_basis = matrix.shape[0]
-        values[i_system, :n_basis, :n_basis] = matrix
-
-    block = TensorBlock(
-        values=values,
-        samples=Labels(
-            names=["system", "basis_size"],
-            values=torch.hstack(
-                [
-                    torch.arange(
-                        len(matrices), dtype=torch.int32, device=device
-                    ).reshape(-1, 1),
-                    basis_sizes,
-                ]
-            ),
-        ),
-        components=[
-            Labels(
-                names=["basis_1"],
-                values=torch.arange(
-                    max_basis, dtype=torch.int32, device=device
-                ).reshape(-1, 1),
-            )
-        ],
-        properties=Labels(
-            names=["basis_2"],
-            values=torch.arange(max_basis, dtype=torch.int32, device=device).reshape(
-                -1, 1
-            ),
-        ),
-    )
-    return TensorMap(Labels.single().to(device=device), [block])
-
-
-def packed_two_center_basis_sizes(batched_matrices: TensorMap) -> torch.Tensor:
-    """Return the stored per-system basis sizes for packed two-centre matrices."""
-    return batched_matrices.block().samples.values[:, 1].to(torch.int64)
-
-
-def unpack_two_center_matrices(
-    batched_matrices: TensorMap, basis_sizes: list[int]
-) -> list[torch.Tensor]:
-    """
-    Unpack a padded batch of two-centre matrices back to dense per-system matrices.
-
-    :param batched_matrices: Padded batched two-centre matrices.
-    :param basis_sizes: Physical basis size for each system.
-    :return: Dense matrices cropped to each system size.
-    """
-    block = batched_matrices.block()
-    if len(block.samples) != len(basis_sizes):
-        raise ValueError(
-            "The number of packed two-centre matrices does not match the basis sizes."
+    def to(
+        self,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        non_blocking: bool = False,
+    ) -> "RaggedMetricMatrices":
+        """Move/cast the flat buffer (mirrors ``Tensor.to``); sizes are metadata."""
+        return RaggedMetricMatrices(
+            self.values.to(dtype=dtype, device=device, non_blocking=non_blocking),
+            self.sizes,
         )
 
-    packed_basis_sizes = packed_two_center_basis_sizes(batched_matrices).tolist()
-    for i_system, n_basis in enumerate(basis_sizes):
-        actual = packed_basis_sizes[i_system]
-        if n_basis > actual:
-            raise ValueError(
-                "At least one requested two-centre matrix basis size exceeds the "
-                "packed matrix size."
-            )
-        if n_basis != actual:
-            raise ValueError(
-                "The RI target size does not match the configured auxiliary basis. "
-                "Check that 'ri_aux_basis' matches the RI coefficients stored in the "
-                "dataset."
-            )
+    def matrices(self) -> list[torch.Tensor]:
+        """Reconstruct the dense per-system matrices ``M_i`` (views into ``values``)."""
+        out: list[torch.Tensor] = []
+        offset = 0
+        for n in self.sizes:
+            out.append(self.values[offset : offset + n * n].view(n, n))
+            offset += n * n
+        return out
 
-    return [
-        block.values[i_system, :n_basis, :n_basis]
-        for i_system, n_basis in enumerate(basis_sizes)
-    ]
+    @classmethod
+    def from_matrices(cls, matrices: list[torch.Tensor]) -> "RaggedMetricMatrices":
+        """Pack dense per-system matrices into the ragged layout.
+
+        :param matrices: One square ``(N_i, N_i)`` matrix per system.
+        :return: The packed ragged container.
+        """
+        sizes = [int(m.shape[0]) for m in matrices]
+        if matrices:
+            flat = torch.cat([m.reshape(-1) for m in matrices])
+        else:
+            flat = torch.zeros(0)
+        return cls(flat, sizes)
 
 
-def compute_batched_overlap_matrices(
-    systems: list[System], aux_basis: str
-) -> TensorMap:
+def compute_ragged_metric_matrices(
+    systems: list[System],
+    aux_basis: str,
+    metric: str,
+    dtype: torch.dtype = torch.float64,
+) -> RaggedMetricMatrices:
     """
-    Compute padded per-system overlap matrices for a batch of systems.
-
-    :param systems: Systems in one batch.
-    :param aux_basis: PySCF auxiliary basis name.
-    :return: Padded batch of overlap matrices.
-    """
-    matrices = [compute_overlap_matrix(system, aux_basis) for system in systems]
-    return pack_two_center_matrices(matrices)
-
-
-def compute_batched_coulomb_matrices(
-    systems: list[System], aux_basis: str
-) -> TensorMap:
-    """
-    Compute padded per-system Coulomb matrices for a batch of systems.
-
-    :param systems: Systems in one batch.
-    :param aux_basis: PySCF auxiliary basis name.
-    :return: Padded batch of Coulomb matrices.
-    """
-    matrices = [compute_coulomb_matrix(system, aux_basis) for system in systems]
-    return pack_two_center_matrices(matrices)
-
-
-def compute_batched_metric_matrices(
-    systems: list[System], aux_basis: str, metric: str
-) -> TensorMap:
-    """
-    Compute padded per-system metric matrices (overlap or Coulomb) for a batch.
+    Compute per-system metric matrices for a batch and pack them ragged (no padding).
 
     :param systems: Systems in one batch.
     :param aux_basis: PySCF auxiliary basis name.
     :param metric: ``"overlap"`` or ``"coulomb"``.
-    :return: Padded batch of metric matrices.
+    :param dtype: dtype of the stored matrices. Pass the model dtype (e.g. ``float32``)
+        to halve transport + memory; casting float64->float32 here is bit-identical to
+        the recast that ``batch_to`` applies today.
+    :return: Ragged metric matrices for the batch.
     """
-    matrices = [compute_metric_matrix(system, aux_basis, metric) for system in systems]
-    return pack_two_center_matrices(matrices)
+    matrices = [
+        compute_metric_matrix(system, aux_basis, metric).to(dtype) for system in systems
+    ]
+    if not matrices:
+        return RaggedMetricMatrices(torch.zeros(0, dtype=dtype), [])
+    return RaggedMetricMatrices.from_matrices(matrices)
 
 
 # ── Collate transforms ────────────────────────────────────────────────────────
 
-def get_overlap_matrices_transform(
+def _get_metric_matrices_transform_impl(
     target_to_aux_basis: Mapping[str, str],
+    metric: str,
+    name_fn: Callable[[str], str],
+    dtype: torch.dtype,
+    cache_across_epochs: bool,
 ) -> Callable:
-    """Create a collate transform that attaches per-target overlap matrices."""
+    """Collate transform attaching per-target RAGGED metric matrices.
+
+    The matrices are stored as :py:class:`RaggedMetricMatrices` (not a TensorMap), so
+    they bypass ``save_buffer`` (float64-only) and padding: the CollateFn carries them
+    raw through the worker boundary, and the density loss consumes them per system.
+    """
 
     def transform(
         systems: list[System],
         targets: dict[str, TensorMap],
-        extra: dict[str, TensorMap],
-    ) -> tuple[list[System], dict[str, TensorMap], dict[str, TensorMap]]:
-        cache: dict[str, TensorMap] = {}
+        extra: dict,
+    ) -> tuple[list[System], dict[str, TensorMap], dict]:
+        cache: dict[str, RaggedMetricMatrices] = {}
         for target_name, aux_basis in target_to_aux_basis.items():
             if aux_basis not in cache:
-                cache[aux_basis] = compute_batched_overlap_matrices(systems, aux_basis)
-            extra[overlap_matrix_name(target_name)] = cache[aux_basis]
+                cache[aux_basis] = compute_ragged_metric_matrices(
+                    systems, aux_basis, metric, dtype
+                )
+            extra[name_fn(target_name)] = cache[aux_basis]
         return systems, targets, extra
 
     return transform
+
+
+def get_overlap_matrices_transform(
+    target_to_aux_basis: Mapping[str, str],
+    dtype: torch.dtype = torch.float64,
+    cache_across_epochs: bool = False,
+) -> Callable:
+    """Create a collate transform that attaches per-target overlap matrices (ragged)."""
+    return _get_metric_matrices_transform_impl(
+        target_to_aux_basis, "overlap", overlap_matrix_name, dtype, cache_across_epochs
+    )
 
 
 def get_coulomb_matrices_transform(
     target_to_aux_basis: Mapping[str, str],
+    dtype: torch.dtype = torch.float64,
+    cache_across_epochs: bool = False,
 ) -> Callable:
-    """Create a collate transform that attaches per-target Coulomb matrices."""
-
-    def transform(
-        systems: list[System],
-        targets: dict[str, TensorMap],
-        extra: dict[str, TensorMap],
-    ) -> tuple[list[System], dict[str, TensorMap], dict[str, TensorMap]]:
-        cache: dict[str, TensorMap] = {}
-        for target_name, aux_basis in target_to_aux_basis.items():
-            if aux_basis not in cache:
-                cache[aux_basis] = compute_batched_coulomb_matrices(systems, aux_basis)
-            extra[coulomb_matrix_name(target_name)] = cache[aux_basis]
-        return systems, targets, extra
-
-    return transform
+    """Create a collate transform that attaches per-target Coulomb matrices (ragged)."""
+    return _get_metric_matrices_transform_impl(
+        target_to_aux_basis, "coulomb", coulomb_matrix_name, dtype, cache_across_epochs
+    )
 
 
 def get_metric_matrices_transform(
     target_to_aux_basis: Mapping[str, str],
     metric: str,
+    dtype: torch.dtype = torch.float64,
+    cache_across_epochs: bool = False,
 ) -> Callable:
-    """Create a collate transform that attaches per-target metric matrices.
+    """Create a collate transform that attaches per-target metric matrices (ragged).
 
     :param target_to_aux_basis: Mapping from target name to PySCF auxiliary basis name.
     :param metric: ``"overlap"`` or ``"coulomb"``.
+    :param dtype: dtype of the stored matrices (pass the model dtype to save memory).
     """
     if metric == "overlap":
-        return get_overlap_matrices_transform(target_to_aux_basis)
+        return get_overlap_matrices_transform(
+            target_to_aux_basis, dtype, cache_across_epochs
+        )
     elif metric == "coulomb":
-        return get_coulomb_matrices_transform(target_to_aux_basis)
+        return get_coulomb_matrices_transform(
+            target_to_aux_basis, dtype, cache_across_epochs
+        )
     else:
         raise ValueError(
             f"Unknown RI metric '{metric}'. Supported values are 'overlap' and 'coulomb'."
