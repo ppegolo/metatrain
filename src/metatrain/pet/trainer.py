@@ -44,6 +44,7 @@ from metatrain.utils.per_atom import average_by_num_atoms
 from metatensor.torch import TensorBlock, TensorMap
 from metatrain.utils.loss import DensityMSELossViaC
 from metatrain.utils.pyscf_loss import (
+    RaggedMetricMatrices,
     get_density_fit_constant_transform,
     get_metric_matrices_transform,
     get_overlap_matrices_transform,
@@ -57,6 +58,27 @@ from metatrain.utils.transfer import batch_to
 from . import checkpoints
 from .documentation import TrainerHypers
 from .model import PET
+
+
+def _unpack_batch_to(batch, dtype, device):
+    """Unpack a batch and move it to ``dtype``/``device``.
+
+    Ragged metric matrices (:py:class:`RaggedMetricMatrices`) are popped out before
+    :func:`batch_to`, which is TorchScript-typed ``Dict[str, TensorMap]`` and cannot
+    accept them, then moved and reattached. No-op for batches without such entries.
+    """
+    systems, targets, extra_data = unpack_batch(batch)
+    ragged = {
+        key: extra_data.pop(key)
+        for key in list(extra_data.keys())
+        if isinstance(extra_data[key], RaggedMetricMatrices)
+    }
+    systems, targets, extra_data = batch_to(
+        systems, targets, extra_data, dtype=dtype, device=device
+    )
+    for key, value in ragged.items():
+        extra_data[key] = value.to(dtype=dtype, device=device)
+    return systems, targets, extra_data
 
 
 def get_scheduler(
@@ -267,7 +289,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         }
         log_density_loss: bool = bool(self.hypers.get("log_density_loss", False))
 
-        ri_train_transforms, ri_val_transforms = self._get_ri_transforms(loss_hypers)
+        ri_train_transforms, ri_val_transforms = self._get_ri_transforms(
+            loss_hypers, dtype
+        )
 
         # Create collate functions
 
@@ -511,10 +535,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 optimizer.zero_grad()
 
-                systems, targets, extra_data = unpack_batch(batch)
-                systems, targets, extra_data = batch_to(
-                    systems, targets, extra_data, dtype=dtype, device=device
-                )
+                systems, targets, extra_data = _unpack_batch_to(batch, dtype, device)
                 predictions = evaluate_model(
                     model,
                     systems,
@@ -636,9 +657,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     if should_skip_batch(batch, is_distributed, device):
                         continue
 
-                    systems, targets, extra_data = unpack_batch(batch)
-                    systems, targets, extra_data = batch_to(
-                        systems, targets, extra_data, dtype=dtype, device=device
+                    systems, targets, extra_data = _unpack_batch_to(
+                        batch, dtype, device
                     )
                     predictions = evaluate_model(
                         model,
@@ -835,6 +855,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
     def _get_ri_transforms(
         self,
         loss_hypers: Dict[str, LossSpecification],
+        dtype: torch.dtype = torch.float64,
     ) -> tuple[list[Callable], list[Callable]]:
         """
         Build the collate transforms required for RI density losses.
@@ -845,6 +866,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         Transforms run *before* CM removal and scaling, which is necessary for the
         density-fit constant pre-computation.
+
+        :param dtype: dtype of the metric matrices. The matrices are stored ragged
+            (:py:class:`RaggedMetricMatrices`) and carried raw past ``save_buffer``, so —
+            unlike the old packed-TensorMap path — they can be the model dtype
+            (e.g. float32), halving their memory/transport. Casting matches the recast
+            ``batch_to`` applied before, so training numerics are unchanged.
         """
         ri_loss_types = {"density_mse_via_c", "density_mse_via_w"}
         ri_aux_basis = self.hypers["ri_aux_basis"]
@@ -908,7 +935,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         def _build_transforms(include_constant: bool) -> list[Callable]:
             transforms: list[Callable] = []
             for metric, targets_map in metric_targets.items():
-                transforms.append(get_metric_matrices_transform(targets_map, metric))
+                transforms.append(
+                    get_metric_matrices_transform(targets_map, metric, dtype)
+                )
             if include_constant and density_fit_target_to_proj_key:
                 # Must run before CM removal and scaling.
                 transforms.append(
