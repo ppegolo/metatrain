@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import importlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ RIAuxBasis = str | dict[str, str]
 
 
 # ── PySCF imports ──────────────────────────────────────────────────────────────
+
 
 @lru_cache(maxsize=1)
 def _import_pyscf_modules() -> tuple[ModuleType, ModuleType]:
@@ -84,6 +86,10 @@ def _load_auxiliary_basis(
       (e.g. ``"etb:def2-svp:2.0"``), which calls ``pyscf.df.aug_etb`` on a
       molecule built with the **orbital** basis ``<ao_basis>`` and ratio
       ``<beta>`` — the same algorithm used by SCFBench to generate RI datasets.
+
+    :param aux_basis: Auxiliary basis name or ETB specification.
+    :param atomic_numbers: Tuple of unique atomic numbers to load the basis for.
+    :return: Dictionary mapping element symbols to basis specifications.
     """
     gto, elements = _import_pyscf_modules()
 
@@ -104,13 +110,22 @@ def _load_auxiliary_basis(
 
 # ── extra_data key helpers ─────────────────────────────────────────────────────
 
+
 def overlap_matrix_name(target_name: str) -> str:
-    """Return the ``extra_data`` key used for a target's overlap matrix."""
+    """Return the ``extra_data`` key used for a target's overlap matrix.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The ``extra_data`` key.
+    """
     return f"{target_name}_overlap_matrix"
 
 
 def coulomb_matrix_name(target_name: str) -> str:
-    """Return the ``extra_data`` key used for a target's Coulomb matrix."""
+    """Return the ``extra_data`` key used for a target's Coulomb matrix.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The ``extra_data`` key.
+    """
     return f"{target_name}_coulomb_matrix"
 
 
@@ -119,6 +134,7 @@ def metric_matrix_name(target_name: str, metric: str) -> str:
 
     :param target_name: Name of the RI-coefficient target.
     :param metric: ``"overlap"`` (S) or ``"coulomb"`` (J).
+    :return: The ``extra_data`` key.
     """
     if metric == "overlap":
         return overlap_matrix_name(target_name)
@@ -126,22 +142,36 @@ def metric_matrix_name(target_name: str, metric: str) -> str:
         return coulomb_matrix_name(target_name)
     else:
         raise ValueError(
-            f"Unknown RI metric '{metric}'. Supported values are 'overlap' and 'coulomb'."
+            f"Unknown RI metric '{metric}'. "
+            "Supported values are 'overlap' and 'coulomb'."
         )
 
 
 def ri_projections_name(target_name: str) -> str:
-    """Return the ``extra_data`` key for a target's RI projections w = S c_RI."""
+    """Return the ``extra_data`` key for a target's RI projections w = S c_RI.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The ``extra_data`` key.
+    """
     return f"{target_name}_projections"
 
 
 def ri_density_fit_constant_name(target_name: str) -> str:
-    """Return the ``extra_data`` key for the pre-computed c_RI^T w_RI constant."""
+    """Return the ``extra_data`` key for the pre-computed c_RI^T w_RI constant.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The ``extra_data`` key.
+    """
     return f"{target_name}_density_fit_constant"
 
 
 def resolve_ri_aux_basis(target_name: str, ri_aux_basis: RIAuxBasis) -> str:
-    """Resolve the auxiliary basis configured for a given RI target."""
+    """Resolve the auxiliary basis configured for a given RI target.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param ri_aux_basis: Global basis name, or a per-target mapping.
+    :return: The auxiliary basis name for ``target_name``.
+    """
 
     if isinstance(ri_aux_basis, str):
         return ri_aux_basis
@@ -157,6 +187,7 @@ def resolve_ri_aux_basis(target_name: str, ri_aux_basis: RIAuxBasis) -> str:
 
 
 # ── Molecule / integral construction ──────────────────────────────────────────
+
 
 def _system_to_atom_string(system: System) -> str:
     _, elements = _import_pyscf_modules()
@@ -237,11 +268,13 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
         return compute_coulomb_matrix(system, aux_basis)
     else:
         raise ValueError(
-            f"Unknown RI metric '{metric}'. Supported values are 'overlap' and 'coulomb'."
+            f"Unknown RI metric '{metric}'. "
+            "Supported values are 'overlap' and 'coulomb'."
         )
 
 
 # ── Ragged metric-matrix container ─────────────────────────────────────────────
+
 
 @dataclass
 class RaggedMetricMatrices:
@@ -268,14 +301,23 @@ class RaggedMetricMatrices:
         device: torch.device | None = None,
         non_blocking: bool = False,
     ) -> "RaggedMetricMatrices":
-        """Move/cast the flat buffer (mirrors ``Tensor.to``); sizes are metadata."""
+        """Move/cast the flat buffer (mirrors ``Tensor.to``); sizes are metadata.
+
+        :param dtype: Target dtype (unchanged if ``None``).
+        :param device: Target device (unchanged if ``None``).
+        :param non_blocking: Forwarded to ``Tensor.to``.
+        :return: New :class:`RaggedMetricMatrices` with the moved buffer.
+        """
         return RaggedMetricMatrices(
             self.values.to(dtype=dtype, device=device, non_blocking=non_blocking),
             self.sizes,
         )
 
     def matrices(self) -> list[torch.Tensor]:
-        """Reconstruct the dense per-system matrices ``M_i`` (views into ``values``)."""
+        """Reconstruct the dense per-system matrices ``M_i`` (views into ``values``).
+
+        :return: One ``(N_i, N_i)`` matrix per system.
+        """
         out: list[torch.Tensor] = []
         offset = 0
         for n in self.sizes:
@@ -325,6 +367,62 @@ def compute_ragged_metric_matrices(
 
 # ── Collate transforms ────────────────────────────────────────────────────────
 
+
+def _batch_system_ids(extra: dict) -> list[int] | None:
+    """Native per-system ids of a batch, in batch order, if available.
+
+    :param extra: The batch's extra-data dictionary.
+    :return: One id per system, or ``None`` when the batch carries none.
+    """
+    index_map = extra.get("mtt::aux::system_index")
+    if index_map is None:
+        return None
+    return [int(v) for v in index_map[0].values[:, 0]]
+
+
+def _metric_matrices_transform_impl(
+    target_to_aux_basis: Mapping[str, str],
+    metric: str,
+    name_fn: Callable[[str], str],
+    dtype: torch.dtype,
+    persistent_cache: dict | None,
+    systems: list[System],
+    targets: dict[str, TensorMap],
+    extra: dict,
+) -> tuple[list[System], dict[str, TensorMap], dict]:
+    # ``persistent_cache`` (keyed by (aux_basis, native system id)) lives inside
+    # the functools.partial, so with persistent dataloader workers it survives
+    # across epochs. It must only be enabled for pipelines whose systems are
+    # identical every epoch (validation: no augmentation) — the trainer passes
+    # None for the training transforms, whose systems are rotated per epoch.
+    # Memory: one (N_aux, N_aux) matrix per cached system per worker.
+    system_ids = _batch_system_ids(extra) if persistent_cache is not None else None
+
+    per_batch: dict[str, RaggedMetricMatrices] = {}
+    for target_name, aux_basis in target_to_aux_basis.items():
+        if aux_basis not in per_batch:
+            if persistent_cache is not None and system_ids is not None:
+                matrices = []
+                for system, system_id in zip(systems, system_ids, strict=True):
+                    cache_key = (aux_basis, system_id)
+                    if cache_key not in persistent_cache:
+                        persistent_cache[cache_key] = compute_metric_matrix(
+                            system, aux_basis, metric
+                        ).to(dtype)
+                    matrices.append(persistent_cache[cache_key])
+                per_batch[aux_basis] = (
+                    RaggedMetricMatrices.from_matrices(matrices)
+                    if matrices
+                    else RaggedMetricMatrices(torch.zeros(0, dtype=dtype), [])
+                )
+            else:
+                per_batch[aux_basis] = compute_ragged_metric_matrices(
+                    systems, aux_basis, metric, dtype
+                )
+        extra[name_fn(target_name)] = per_batch[aux_basis]
+    return systems, targets, extra
+
+
 def _get_metric_matrices_transform_impl(
     target_to_aux_basis: Mapping[str, str],
     metric: str,
@@ -337,23 +435,23 @@ def _get_metric_matrices_transform_impl(
     The matrices are stored as :py:class:`RaggedMetricMatrices` (not a TensorMap), so
     they bypass ``save_buffer`` (float64-only) and padding: the CollateFn carries them
     raw through the worker boundary, and the density loss consumes them per system.
+
+    :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
+    :param metric: ``"overlap"`` or ``"coulomb"``.
+    :param name_fn: Maps a target name to its ``extra_data`` key.
+    :param dtype: dtype of the stored matrices.
+    :param cache_across_epochs: Cache per-system matrices across epochs (only
+        valid when the pipeline's systems are identical every epoch).
+    :return: Collate transform.
     """
-
-    def transform(
-        systems: list[System],
-        targets: dict[str, TensorMap],
-        extra: dict,
-    ) -> tuple[list[System], dict[str, TensorMap], dict]:
-        cache: dict[str, RaggedMetricMatrices] = {}
-        for target_name, aux_basis in target_to_aux_basis.items():
-            if aux_basis not in cache:
-                cache[aux_basis] = compute_ragged_metric_matrices(
-                    systems, aux_basis, metric, dtype
-                )
-            extra[name_fn(target_name)] = cache[aux_basis]
-        return systems, targets, extra
-
-    return transform
+    return functools.partial(
+        _metric_matrices_transform_impl,
+        target_to_aux_basis,
+        metric,
+        name_fn,
+        dtype,
+        {} if cache_across_epochs else None,
+    )
 
 
 def get_overlap_matrices_transform(
@@ -361,7 +459,14 @@ def get_overlap_matrices_transform(
     dtype: torch.dtype = torch.float64,
     cache_across_epochs: bool = False,
 ) -> Callable:
-    """Create a collate transform that attaches per-target overlap matrices (ragged)."""
+    """Create a collate transform that attaches per-target overlap matrices (ragged).
+
+    :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
+    :param dtype: dtype of the stored matrices.
+    :param cache_across_epochs: Cache per-system matrices across epochs (only
+        valid when the pipeline's systems are identical every epoch).
+    :return: Collate transform.
+    """
     return _get_metric_matrices_transform_impl(
         target_to_aux_basis, "overlap", overlap_matrix_name, dtype, cache_across_epochs
     )
@@ -372,7 +477,14 @@ def get_coulomb_matrices_transform(
     dtype: torch.dtype = torch.float64,
     cache_across_epochs: bool = False,
 ) -> Callable:
-    """Create a collate transform that attaches per-target Coulomb matrices (ragged)."""
+    """Create a collate transform that attaches per-target Coulomb matrices (ragged).
+
+    :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
+    :param dtype: dtype of the stored matrices.
+    :param cache_across_epochs: Cache per-system matrices across epochs (only
+        valid when the pipeline's systems are identical every epoch).
+    :return: Collate transform.
+    """
     return _get_metric_matrices_transform_impl(
         target_to_aux_basis, "coulomb", coulomb_matrix_name, dtype, cache_across_epochs
     )
@@ -389,6 +501,10 @@ def get_metric_matrices_transform(
     :param target_to_aux_basis: Mapping from target name to PySCF auxiliary basis name.
     :param metric: ``"overlap"`` or ``"coulomb"``.
     :param dtype: dtype of the stored matrices (pass the model dtype to save memory).
+    :param cache_across_epochs: Cache per-system matrices across epochs (only
+        valid when the pipeline's systems are identical every epoch, e.g. an
+        augmentation-free validation set).
+    :return: Collate transform.
     """
     if metric == "overlap":
         return get_overlap_matrices_transform(
@@ -400,8 +516,102 @@ def get_metric_matrices_transform(
         )
     else:
         raise ValueError(
-            f"Unknown RI metric '{metric}'. Supported values are 'overlap' and 'coulomb'."
+            f"Unknown RI metric '{metric}'. "
+            "Supported values are 'overlap' and 'coulomb'."
         )
+
+
+def _density_fit_constant_transform_impl(
+    target_to_projections_key: Mapping[str, str],
+    persistent_cache: dict,
+    systems: list[System],
+    targets: dict[str, TensorMap],
+    extra: dict[str, TensorMap],
+) -> tuple[list[System], dict[str, TensorMap], dict[str, TensorMap]]:
+    for target_name, proj_key in target_to_projections_key.items():
+        if target_name not in targets or proj_key not in extra:
+            continue
+
+        c_map = targets[target_name]
+        w_map = extra[proj_key]
+
+        first_block = c_map.block(c_map.keys[0])
+        device = first_block.values.device
+        dtype = first_block.values.dtype
+
+        # One constant per system actually present in the batch, keyed by the
+        # native "system" sample id (which is not necessarily 0..B-1: e.g. for
+        # a shuffled DiskDataset these are arbitrary storage entry numbers).
+        # torch.unique returns the ids sorted, which the loss relies on for
+        # its searchsorted lookup.
+        system_ids = torch.unique(
+            torch.cat([c_map.block(key).samples.values[:, 0] for key in c_map.keys])
+        )
+
+        # c_RI^T w is invariant under the rotational augmentation (c and w
+        # rotate covariantly), so it can be cached per (target, system id)
+        # across epochs — with persistent dataloader workers this makes the
+        # transform a dict lookup from the second epoch on.
+        id_list = [int(i) for i in system_ids]
+        cached = [persistent_cache.get((target_name, i)) for i in id_list]
+        if all(value is not None for value in cached):
+            constants = torch.tensor(cached, device=device, dtype=dtype)
+            extra[ri_density_fit_constant_name(target_name)] = _pack_constants(
+                constants, system_ids, device
+            )
+            continue
+
+        constants = torch.zeros(len(system_ids), device=device, dtype=dtype)
+
+        for key in c_map.keys:
+            c_block = c_map.block(key)
+            w_block = w_map.block(key)
+            positions = torch.searchsorted(
+                system_ids, c_block.samples.values[:, 0].contiguous()
+            ).long()
+
+            c_vals = c_block.values  # [n_samples, n_m, n_radial]
+            w_vals = w_block.values
+
+            # NaN entries are padding; zero them out before summing.
+            mask = ~(torch.isnan(c_vals) | torch.isnan(w_vals))
+            contrib = torch.where(mask, c_vals * w_vals, torch.zeros_like(c_vals))
+            per_sample = contrib.sum(dim=[1, 2])  # [n_samples]
+            constants.scatter_add_(0, positions, per_sample)
+
+        for i, system_id in enumerate(id_list):
+            persistent_cache[(target_name, system_id)] = float(constants[i])
+
+        extra[ri_density_fit_constant_name(target_name)] = _pack_constants(
+            constants, system_ids, device
+        )
+
+    return systems, targets, extra
+
+
+def _pack_constants(
+    constants: torch.Tensor, system_ids: torch.Tensor, device: torch.device
+) -> TensorMap:
+    """Pack per-system constants as a scalar TensorMap labelled by native id.
+
+    :param constants: One value per system, aligned with ``system_ids``.
+    :param system_ids: Sorted native system ids.
+    :param device: Device for the labels.
+    :return: Scalar TensorMap with one sample per system.
+    """
+    const_block = TensorBlock(
+        values=constants.unsqueeze(-1),  # [n_present_systems, 1]
+        samples=Labels(
+            names=["system"],
+            values=system_ids.to(dtype=torch.int32, device=device).reshape(-1, 1),
+        ),
+        components=[],
+        properties=Labels(
+            names=["_"],
+            values=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        ),
+    )
+    return TensorMap(Labels.single().to(device=device), [const_block])
 
 
 def get_density_fit_constant_transform(
@@ -410,72 +620,14 @@ def get_density_fit_constant_transform(
     """
     Create a collate transform that pre-computes the per-system density-fit constant.
 
-    For each target, computes ``c_RI^T w_RI`` (= ``c_RI^T S c_RI`` when
-    ``w_RI = S c_RI``) and stores the result in ``extra_data`` as a scalar
-    TensorMap.  This constant bounds the density-fit loss from below at zero and
-    has no gradient w.r.t. model parameters.
-
-    **This transform must run before the CM-removal and scale-removal transforms**
-    so that ``targets`` still contains raw RI coefficients in physical units.
+    For each target, computes ``c_RI^T w_RI`` and stores the result in ``extra_data``
+    as a scalar TensorMap. Must run before CM-removal and scale-removal transforms.
 
     :param target_to_projections_key: mapping from RI-coefficient target name to the
         ``extra_data`` key under which the corresponding projections ``w = M c_RI``
         are stored.
+    :return: Collate transform.
     """
-
-    def transform(
-        systems: list[System],
-        targets: dict[str, TensorMap],
-        extra: dict[str, TensorMap],
-    ) -> tuple[list[System], dict[str, TensorMap], dict[str, TensorMap]]:
-        for target_name, proj_key in target_to_projections_key.items():
-            if target_name not in targets or proj_key not in extra:
-                continue
-
-            c_map = targets[target_name]
-            w_map = extra[proj_key]
-
-            first_block = c_map.block(c_map.keys[0])
-            sys_idx_col = first_block.samples.values[:, 0]
-            n_systems = int(sys_idx_col.max().item()) + 1
-            device = first_block.values.device
-            dtype = first_block.values.dtype
-
-            constants = torch.zeros(n_systems, device=device, dtype=dtype)
-
-            for key in c_map.keys:
-                c_block = c_map.block(key)
-                w_block = w_map.block(key)
-                sys_idx = c_block.samples.values[:, 0].long()
-
-                c_vals = c_block.values  # [n_samples, n_m, n_radial]
-                w_vals = w_block.values
-
-                # NaN entries are padding; zero them out before summing.
-                mask = ~(torch.isnan(c_vals) | torch.isnan(w_vals))
-                contrib = torch.where(mask, c_vals * w_vals, torch.zeros_like(c_vals))
-                per_sample = contrib.sum(dim=[1, 2])  # [n_samples]
-                constants.scatter_add_(0, sys_idx, per_sample)
-
-            # Pack as a scalar TensorMap: one value per system.
-            const_block = TensorBlock(
-                values=constants.unsqueeze(-1),  # [n_systems, 1]
-                samples=Labels(
-                    names=["system"],
-                    values=torch.arange(
-                        n_systems, dtype=torch.int32, device=device
-                    ).reshape(-1, 1),
-                ),
-                components=[],
-                properties=Labels(
-                    names=["_"],
-                    values=torch.zeros((1, 1), dtype=torch.int32, device=device),
-                ),
-            )
-            extra[ri_density_fit_constant_name(target_name)] = TensorMap(
-                Labels.single().to(device=device), [const_block]
-            )
-
-        return systems, targets, extra
-
-    return transform
+    return functools.partial(
+        _density_fit_constant_transform_impl, target_to_projections_key, {}
+    )
