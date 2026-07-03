@@ -39,11 +39,6 @@ class Readout(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        if gather_chunk_size < 1:
-            raise ValueError(
-                f"gather_chunk_size must be >= 1, got {gather_chunk_size}."
-            )
-
         self.z_conditioned = z_conditioned
         self.in_features = in_features
         self.out_features = out_features
@@ -97,28 +92,54 @@ class Readout(torch.nn.Module):
         :return: Tensor of shape ``(n_atoms, out_features)`` or
             ``(n_atoms, n_neighbours, out_features)``.
         """
-        if self.z_conditioned:
-            idx = species_idx
-        else:
-            # All atoms share the single set of parameters stored at index 0.
-            idx = torch.zeros(
-                features.shape[0], dtype=torch.long, device=features.device
-            )
-
-        # Node features arrive as 2-D; unsqueeze so every path through the
-        # layers is uniformly 3-D (..., seq, dim) for the batched matmul.
         is_node = features.dim() == 2
         if is_node:
             features = features.unsqueeze(1)  # (n_atoms, 1, in_features)
 
         x = features
         n_layers = self.weights.__len__()  # type: ignore[attr-defined]
-        for i, (W, b) in enumerate(zip(self.weights, self.biases, strict=True)):
-            W_ = W[idx]  # (n_atoms, out_dim, in_dim)
-            b_ = b[idx]  # (n_atoms, out_dim)
-            x = torch.matmul(x, W_.transpose(-2, -1)) + b_.unsqueeze(1)
-            if i < n_layers - 1:
-                x = torch.nn.functional.silu(x)
+        if not self.z_conditioned:
+            # All atoms share weights[i][0]; use F.linear to avoid
+            # materialising the (n_atoms, out_dim, in_dim) gather tensor.
+            # TorchScript only allows ModuleList/ParameterList indexing via a
+            # literal or `enumerate`, not a `range()` loop variable.
+            for i, (W, b) in enumerate(zip(self.weights, self.biases, strict=True)):
+                x = torch.nn.functional.linear(x, W[0], b[0])
+                if i < n_layers - 1:
+                    x = torch.nn.functional.silu(x)
+        else:
+            # Group atoms by species and run one dense linear per species
+            # present: each weight matrix is read once (n_species × out × in
+            # traffic) instead of being gathered per atom (n_atoms × out × in),
+            # and the work runs as a few large GEMMs instead of many small
+            # batched ones.
+            order = torch.argsort(species_idx)
+            inverse_order = torch.argsort(order)
+            counts: List[int] = torch.bincount(
+                species_idx, minlength=self.n_species
+            ).tolist()
+            x = x.index_select(0, order)
+            for i, (W, b) in enumerate(zip(self.weights, self.biases, strict=True)):
+                pieces: List[torch.Tensor] = []
+                start = 0
+                for s in range(self.n_species):
+                    count = counts[s]
+                    if count > 0:
+                        pieces.append(
+                            torch.nn.functional.linear(
+                                x[start : start + count], W[s], b[s]
+                            )
+                        )
+                    start += count
+                if len(pieces) == 0:
+                    x = torch.zeros(
+                        0, x.shape[1], W.shape[-2], dtype=x.dtype, device=x.device
+                    )
+                else:
+                    x = torch.cat(pieces, dim=0)
+                if i < n_layers - 1:
+                    x = torch.nn.functional.silu(x)
+            x = x.index_select(0, inverse_order)
 
         if is_node:
             x = x.squeeze(1)
@@ -279,8 +300,8 @@ class MoEReadout(torch.nn.Module):
             )
         if num_topk_experts < 1 or num_topk_experts > num_routed_experts:
             raise ValueError(
-                f"num_topk_experts = {num_topk_experts}; "
-                f"must satisfy 1 ≤ num_topk_experts ≤ num_routed_experts ({num_routed_experts})."
+                f"num_topk_experts = {num_topk_experts}; must satisfy "
+                f"1 ≤ num_topk_experts ≤ num_routed_experts ({num_routed_experts})."
             )
 
         self.num_topk = num_topk_experts
@@ -481,7 +502,8 @@ class IrrepResidualZOutput(torch.nn.Module):
 
     .. math::
         \\text{output} = \\underbrace{W_z \\, h_i}_{\\text{trunk}}
-                       + \\underbrace{(W_z^{\\prime} \\, \\text{SiLU}(U \\, h_i))}_{\\text{correction}}
+                       + \\underbrace{(W_z^{\\prime} \\,
+                         \\text{SiLU}(U \\, h_i))}_{\\text{correction}}
 
     where :math:`U` is a *shared* hidden-layer weight (species-agnostic) and
     :math:`W_z^{\\prime}` is a *per-species* output-layer weight (zero-initialized).
@@ -511,9 +533,7 @@ class IrrepResidualZOutput(torch.nn.Module):
         super().__init__()
 
         # Z-conditioned trunk (dominant prediction path)
-        self.trunk = Readout(
-            in_features, out_features, n_species, z_conditioned=True
-        )
+        self.trunk = Readout(in_features, out_features, n_species, z_conditioned=True)
 
         # Shared hidden layer — species-agnostic nonlinear feature extraction
         self.correction_hidden = torch.nn.Sequential(
@@ -554,7 +574,8 @@ class IrrepResidualFiLM(torch.nn.Module):
     .. math::
         x_z       &= \\gamma_z \\odot h_i + \\beta_z  \\quad\\text{(FiLM)}\\\\
         \\text{output} &= W_z h_i
-                        + \\underbrace{U_\\text{out} \\, \\text{SiLU}(U_\\text{hid}\\, x_z)}_{\\text{correction}}
+                        + \\underbrace{U_\\text{out} \\,
+                          \\text{SiLU}(U_\\text{hid}\\, x_z)}_{\\text{correction}}
 
     where :math:`\\gamma_z` and :math:`\\beta_z` are per-species vectors of size
     ``in_features``, initialized to ones and zeros respectively (identity
@@ -583,9 +604,7 @@ class IrrepResidualFiLM(torch.nn.Module):
         super().__init__()
 
         # Z-conditioned trunk
-        self.trunk = Readout(
-            in_features, out_features, n_species, z_conditioned=True
-        )
+        self.trunk = Readout(in_features, out_features, n_species, z_conditioned=True)
 
         # FiLM parameters: per-species scale (γ) and shift (β)
         # γ = ones, β = zeros → identity at initialization
@@ -691,9 +710,7 @@ class IrrepResidualZCorrectionDeep(torch.nn.Module):
             )
 
         # Z-conditioned linear trunk — the dominant, warm-started prediction path
-        self.trunk = Readout(
-            in_features, out_features, n_species, z_conditioned=True
-        )
+        self.trunk = Readout(in_features, out_features, n_species, z_conditioned=True)
 
         # Deep Z-conditioned correction tower.
         # hidden_layer_widths=[in_features] * K gives K hidden layers, each

@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Union, cast
 
 import torch
+from metatensor.torch import TensorMap
+from metatomic.torch import System
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
-
-from metatomic.torch import System
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import add_additive, get_remove_additive_transform
@@ -34,15 +34,13 @@ from metatrain.utils.evaluate_model import evaluate_model
 from metatrain.utils.finetuning import apply_finetuning_strategy
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
-from metatrain.utils.loss import LossAggregator, LossSpecification
+from metatrain.utils.loss import DensityMSELossViaC, LossAggregator, LossSpecification
 from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator, get_selected_metric
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
 )
 from metatrain.utils.per_atom import average_by_num_atoms
-from metatensor.torch import TensorBlock, TensorMap
-from metatrain.utils.loss import DensityMSELossViaC
 from metatrain.utils.pyscf_loss import (
     RaggedMetricMatrices,
     get_density_fit_constant_transform,
@@ -59,12 +57,19 @@ from .documentation import TrainerHypers
 from .model import PET
 
 
-def _unpack_batch_to(batch, dtype, device):
+def _unpack_batch_to(
+    batch: Any, dtype: torch.dtype, device: torch.device
+) -> tuple[List[System], Dict[str, TensorMap], Dict[str, Any]]:
     """Unpack a batch and move it to ``dtype``/``device``.
 
     Ragged metric matrices (:py:class:`RaggedMetricMatrices`) are popped out before
     :func:`batch_to`, which is TorchScript-typed ``Dict[str, TensorMap]`` and cannot
     accept them, then moved and reattached. No-op for batches without such entries.
+
+    :param batch: Collated batch as produced by the dataloader.
+    :param dtype: Target dtype.
+    :param device: Target device.
+    :return: ``(systems, targets, extra_data)`` on the requested dtype/device.
     """
     systems, targets, extra_data = unpack_batch(batch)
     ragged = {
@@ -111,6 +116,24 @@ def get_scheduler(
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     return scheduler
+
+
+def _clone_state_dict_to_cpu(state: Any) -> Any:
+    """Recursively clone a (possibly nested) state dict, moving tensors to CPU.
+
+    Keeps the "best" checkpoint off the training device instead of holding a second
+    copy of every model/optimizer tensor on GPU (as ``copy.deepcopy`` would).
+
+    :param state: State dict (or nested container/tensor) to clone.
+    :return: Clone of ``state`` with all tensors on CPU.
+    """
+    if isinstance(state, torch.Tensor):
+        return state.detach().cpu().clone()
+    if isinstance(state, dict):
+        return {k: _clone_state_dict_to_cpu(v) for k, v in state.items()}
+    if isinstance(state, list):
+        return [_clone_state_dict_to_cpu(v) for v in state]
+    return copy.deepcopy(state)
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
@@ -230,13 +253,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             validate_num_workers(num_workers)
 
         # On CUDA (especially GH200 unified memory), forking after CUDA init causes
-        # workers to inherit GPU memory mappings, inflating per-worker RSS and triggering
+        # workers to inherit GPU memory mappings, inflating per-worker RSS and
         # OOM. Use 'spawn' to start workers as fresh processes instead.
         mp_context = "spawn" if num_workers > 0 and device.type == "cuda" else None
 
         if mp_context == "spawn":
-            # Some container setups (e.g. CSCS daint ml4es) restrict /dev/shm so that
-            # ftruncate() fails with EINVAL.  PyTorch's default 'file_descriptor' sharing
+            # Some container setups (e.g. CSCS daint ml4es) restrict /dev/shm so
+            # that ftruncate() fails with EINVAL.  PyTorch's 'file_descriptor' sharing
             # strategy creates POSIX shared-memory files in /dev/shm; switching to
             # 'file_system' uses regular files in /tmp instead, which always works.
             import torch.multiprocessing as _torch_mp
@@ -419,6 +442,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
                         multiprocessing_context=mp_context,
+                        persistent_workers=(num_workers > 0),
                     )
                 )
             else:
@@ -441,6 +465,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
                         multiprocessing_context=mp_context,
+                        persistent_workers=(num_workers > 0),
                     )
                 )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
@@ -463,6 +488,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
                         multiprocessing_context=mp_context,
+                        persistent_workers=(num_workers > 0),
                     )
                 )
             else:
@@ -476,6 +502,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
                         multiprocessing_context=mp_context,
+                        persistent_workers=(num_workers > 0),
                     )
                 )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
@@ -863,11 +890,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             )
             if val_metric < self.best_metric:
                 self.best_metric = val_metric
-                self.best_model_state_dict = copy.deepcopy(
+                self.best_model_state_dict = _clone_state_dict_to_cpu(
                     (model.module if is_distributed else model).state_dict()
                 )
                 self.best_epoch = epoch
-                self.best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
+                self.best_optimizer_state_dict = _clone_state_dict_to_cpu(
+                    optimizer.state_dict()
+                )
 
             if epoch % self.hypers["checkpoint_interval"] == 0:
                 if is_distributed:
@@ -929,7 +958,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         :param loss_hypers: Per-target loss specifications from the training hypers.
         :param dtype: dtype of the metric matrices. The matrices are stored ragged
-            (:py:class:`RaggedMetricMatrices`) and carried raw past ``save_buffer``, so —
+            (:py:class:`RaggedMetricMatrices`) and carried raw past ``save_buffer``,
             unlike the old packed-TensorMap path — they can be the model dtype
             (e.g. float32), halving their memory/transport. Casting matches the recast
             ``batch_to`` applied before, so training numerics are unchanged.
@@ -966,7 +995,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         density_fit_target_to_proj_key: dict[str, str] = {}
 
         for target_name, target_spec in ri_target_specs.items():
-            metric = target_spec.get("metric", "overlap")
+            metric = cast(str, target_spec.get("metric", "overlap"))
             aux_basis = resolve_ri_aux_basis(
                 target_name,
                 cast(str, ri_aux_basis)
@@ -975,8 +1004,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
             )
             metric_targets.setdefault(metric, {})[target_name] = aux_basis
             if target_spec.get("type") == "density_mse_via_w":
-                proj_key = target_spec.get(
-                    "projections_key", ri_projections_name(target_name)
+                proj_key = cast(
+                    str,
+                    target_spec.get(
+                        "projections_key", ri_projections_name(target_name)
+                    ),
                 )
                 density_fit_target_to_proj_key[target_name] = proj_key
 
@@ -1008,7 +1040,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
             transforms: list[Callable] = []
             for metric, targets_map in metric_targets.items():
                 transforms.append(
-                    get_metric_matrices_transform(targets_map, metric, dtype)
+                    get_metric_matrices_transform(
+                        targets_map, metric, dtype, cache_across_epochs
+                    )
                 )
             if density_fit_target_to_proj_key:
                 transforms.append(
@@ -1023,7 +1057,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
             _build_transforms(metric_targets, cache_across_epochs=False),
             _build_transforms(val_metric_targets, cache_across_epochs=True),
         )
-
 
     def _prepare_for_ri_loss(
         self,
@@ -1134,6 +1167,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
         This reverses the CM-removal applied by the collate pipeline, giving
         fully-reconstructed RI coefficients c_ML = (c_ML − CM) + CM.
         CM values are detached so no gradient flows through them.
+
+        :param inner_model: Unwrapped model holding the composition model.
+        :param systems: Systems in the batch.
+        :param predictions: CM-removed model predictions per target.
+        :param train_targets: Target infos seen by the model during training.
+        :param target_names: Targets to add the CM contribution back to.
+        :return: Predictions with CM contributions added back.
         """
         additive_model = inner_model.additive_models[0]
         cm_targets = {

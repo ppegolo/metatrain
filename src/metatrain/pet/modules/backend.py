@@ -215,7 +215,7 @@ class PETBackend(torch.nn.Module):
         name = self.readout_type.get("name", "ZConditioned")
         args = dict(self.readout_type.get("args", {}))
         allowed_args = {
-            "ZConditioned": {"hidden_layer_widths", "gather_chunk_size"},
+            "ZConditioned": {"hidden_layer_widths"},
             "MoE": {
                 "num_experts",
                 "num_routed_experts",
