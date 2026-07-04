@@ -211,6 +211,9 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 quantity=old_capabilities.outputs[name].quantity,
                 unit=old_capabilities.outputs[name].unit,
                 sample_kind=old_capabilities.outputs[name].sample_kind,
+                # positions/strain gradients of the ensemble are only meaningful for
+                # "energy_ensemble" output, for now
+                explicit_gradients=["positions", "strain"] if name == "energy" else [],
                 description=f"ensemble of '{name}'",
             )
         self.capabilities = ModelCapabilities(
@@ -564,19 +567,46 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             # for the num_ens dimension
             old_prop_val = return_dict[original_name].block().properties.values
             num_samples = old_prop_val.shape[0]
-            exp_prop_val = old_prop_val.repeat(num_ens, 1)
             ens_idxs = torch.arange(
                 num_ens,
                 device=old_prop_val.device,
                 dtype=old_prop_val.dtype,
             )
             ens_idxs = ens_idxs.repeat_interleave(num_samples).unsqueeze(1)
-            new_prop_val = torch.cat([ens_idxs, exp_prop_val], dim=-1)
-            ens_prop = Labels(
-                names=["ensemble_member"]
-                + return_dict[original_name].block().properties.names,
-                values=new_prop_val,
+            if ens_name == "energy_ensemble":
+                # "energy_ensemble" quantity requires a single "energy"
+                # property column holding the ensemble member index
+                ens_prop = Labels(names=["energy"], values=ens_idxs)
+            else:
+                exp_prop_val = old_prop_val.repeat(num_ens, 1)
+                new_prop_val = torch.cat([ens_idxs, exp_prop_val], dim=-1)
+                ens_prop = Labels(
+                    names=["ensemble_member"]
+                    + return_dict[original_name].block().properties.names,
+                    values=new_prop_val,
+                )
+
+            ensemble_block = TensorBlock(
+                values=ensemble_values,
+                samples=ll_features.block().samples,
+                components=return_dict[original_name].block().components,
+                properties=ens_prop,
             )
+
+            if ens_name == "energy_ensemble":
+                requested_gradients = outputs[ens_name].explicit_gradients
+                want_positions = "positions" in requested_gradients
+                want_strain = "strain" in requested_gradients
+                if want_positions or want_strain:
+                    self._add_energy_ensemble_gradients(
+                        ensemble_block,
+                        systems,
+                        ensemble_values,
+                        ens_prop,
+                        num_ens,
+                        want_positions,
+                        want_strain,
+                    )
 
             ensemble = TensorMap(
                 keys=Labels(
@@ -585,14 +615,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                         [[0]], device=ll_features.block().values.device
                     ),
                 ),
-                blocks=[
-                    TensorBlock(
-                        values=ensemble_values,
-                        samples=ll_features.block().samples,
-                        components=return_dict[original_name].block().components,
-                        properties=ens_prop,
-                    ),
-                ],
+                blocks=[ensemble_block],
             )
 
             return_dict[ens_name] = ensemble
@@ -605,6 +628,119 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 return_dict.pop(key)
 
         return return_dict
+
+    def _add_energy_ensemble_gradients(
+        self,
+        ensemble_block: TensorBlock,
+        systems: List[System],
+        ensemble_values: torch.Tensor,
+        ens_prop: Labels,
+        num_ens: int,
+        want_positions: bool,
+        want_strain: bool,
+    ) -> None:
+        """Attach "positions"/"strain" gradients to an "energy_ensemble" block.
+
+        Positions and cell are differentiated directly (no strain-trick deformation
+        needed): since the "strain" gradient is evaluated at strain = identity, the
+        virial can be recovered from the positions/cell gradients alone as
+        ``positions^T @ d(output)/d(positions) + cell^T @ d(output)/d(cell)``, which is
+        numerically equivalent to differentiating w.r.t. an explicit strain parameter.
+        This avoids needing a dedicated strain tensor.
+
+        :param ensemble_block: the "energy_ensemble" value block gradients are
+            attached to, in place, via ``add_gradient``.
+        :param systems: the systems this batch was computed for; ``positions`` and
+            ``cell`` must already require grad (set by the caller) for any of this to
+            produce non-trivial gradients.
+        :param ensemble_values: the (already recentered) ensemble values, with shape
+            ``(num_samples, num_ens)`` (one row per system, one column per ensemble
+            member). This is only valid for the "energy" quantity, which has no
+            components and a single property.
+        :param ens_prop: properties of ``ensemble_block``, reused verbatim for the
+            gradient blocks, as required by metatensor.
+        :param num_ens: number of ensemble members.
+        :param want_positions: whether to attach a "positions" gradient.
+        :param want_strain: whether to attach a "strain" gradient.
+        """
+        n_systems = len(systems)
+        all_positions = [system.positions for system in systems]
+        all_cells = [system.cell for system in systems]
+        n_atoms_per_system = [p.shape[0] for p in all_positions]
+        grad_inputs = all_positions + all_cells
+
+        dtype = ensemble_values.dtype
+        device = ensemble_values.device
+        n_atoms_total = sum(n_atoms_per_system)
+
+        positions_grad_values = torch.zeros(
+            (n_atoms_total, 3, num_ens), dtype=dtype, device=device
+        )
+        strain_grad_values = torch.zeros(
+            (n_systems, 3, 3, num_ens), dtype=dtype, device=device
+        )
+
+        for member in range(num_ens):
+            grads = torch.autograd.grad(
+                [ensemble_values[:, member].sum()],
+                grad_inputs,
+                retain_graph=(member < num_ens - 1),
+                create_graph=False,
+            )
+
+            atom_offset = 0
+            for s in range(n_systems):
+                pos_grad = grads[s]
+                cell_grad = grads[n_systems + s]
+                assert pos_grad is not None
+                assert cell_grad is not None
+
+                n_atoms_s = n_atoms_per_system[s]
+                # store dE/dr directly (not the force -dE/dr)
+                positions_grad_values[
+                    atom_offset : atom_offset + n_atoms_s, :, member
+                ] = pos_grad
+                strain_grad_values[s, :, :, member] = (
+                    all_positions[s].detach().t() @ pos_grad
+                    + all_cells[s].detach().t() @ cell_grad
+                )
+                atom_offset += n_atoms_s
+
+        xyz = torch.tensor([[0], [1], [2]])
+
+        if want_positions:
+            sample_col = torch.repeat_interleave(
+                torch.arange(n_systems), torch.tensor(n_atoms_per_system)
+            )
+            atom_col = torch.cat([torch.arange(n) for n in n_atoms_per_system])
+            ensemble_block.add_gradient(
+                "positions",
+                TensorBlock(
+                    values=positions_grad_values,
+                    samples=Labels(
+                        names=["sample", "system", "atom"],
+                        values=torch.stack([sample_col, sample_col, atom_col], dim=1),
+                    ),
+                    components=[Labels(["xyz"], xyz)],
+                    properties=ens_prop,
+                ),
+            )
+
+        if want_strain:
+            # build the "sample" Labels with the plain constructor, not
+            # `Labels.range(...)` as the latter breaks TorchScript compatibility
+            ensemble_block.add_gradient(
+                "strain",
+                TensorBlock(
+                    values=strain_grad_values,
+                    samples=Labels(
+                        names=["sample"],
+                        values=torch.arange(n_systems).reshape(-1, 1),
+                    ),
+                    components=[Labels(["xyz_1"], xyz), Labels(["xyz_2"], xyz)],
+                    properties=ens_prop,
+                ),
+            )
 
     def compute_covariance(
         self,
@@ -902,6 +1038,9 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 quantity=old_outputs[name].quantity,
                 unit=old_outputs[name].unit,
                 sample_kind=old_outputs[name].sample_kind,
+                # positions/strain gradients of the ensemble are only meaningful (and
+                # only computed in forward()) for the "energy_ensemble" output
+                explicit_gradients=["positions", "strain"] if name == "energy" else [],
                 description=f"ensemble of {name}",
             )
         self.capabilities = ModelCapabilities(
