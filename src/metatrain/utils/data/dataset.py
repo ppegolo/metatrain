@@ -1,10 +1,11 @@
 import math
 import multiprocessing
 import os
+import sys
 import warnings
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import IO, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -42,6 +43,50 @@ from metatrain.utils.data.target_info import (
 )
 from metatrain.utils.external_naming import to_external_name
 from metatrain.utils.units import get_gradient_units
+
+
+def _lock_exclusive(lock_file: IO[str]) -> None:
+    """Acquire an exclusive, blocking lock on ``lock_file`` (POSIX and Windows).
+
+    :param lock_file: Open file handle to lock.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        lock_file.write("0")
+        lock_file.flush()
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+
+def _unlock(lock_file: IO[str]) -> None:
+    """Release a lock acquired with :func:`_lock_exclusive`.
+
+    :param lock_file: Open file handle to unlock.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _is_writing_rank() -> bool:
+    """Whether this process is allowed to mutate shared dataset files.
+
+    :return: ``True`` outside distributed runs, else only on global rank 0.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
 
 
 def _set(values: List[int]) -> List[int]:
@@ -711,7 +756,39 @@ class DiskDataset(torch.utils.data.Dataset):
             for file_name in namelist:
                 if file_name.startswith("0/") and file_name.endswith(".mts"):
                     self._field_names.append(file_name[2:-4])
-            self._len = len([f for f in namelist if f.endswith(".mta")])
+            # Entries are read positionally as "0/", "1/", ...: require exactly
+            # the dense range, and fail loudly on duplicated entry names (e.g.
+            # produced by appending with an older, buggy DiskDatasetWriter that
+            # restarted indexing at 0 -- reading those would silently return
+            # the last-written copy) or on gaps.
+            entry_numbers = sorted(
+                int(f.split("/")[0]) for f in namelist if f.endswith("/system.mta")
+            )
+            if entry_numbers != list(range(len(entry_numbers))):
+                raise ValueError(
+                    "This DiskDataset zip file does not contain a dense range of "
+                    "entries `0/`, `1/`, ...: it has gaps or duplicated entry "
+                    "numbers and cannot be read reliably; re-write the dataset."
+                )
+            self._len = len(entry_numbers)
+
+            # Optional atom-count file (written by DiskDatasetWriter), keyed by
+            # sample index. Lets get_num_atoms()/get_all_atom_counts() below answer
+            # without opening/deserializing every system, which is what makes this
+            # dataset usable with MaxAtomDistributedBatchSampler.
+            self._atom_counts: Optional[np.ndarray] = None
+            if "_atom_counts.npy" in namelist:
+                with zip_file.open("_atom_counts.npy", "r") as f:
+                    atom_counts = np.load(f)
+                if len(atom_counts) >= self._len:
+                    self._atom_counts = atom_counts
+                else:
+                    warnings.warn(
+                        "Ignoring '_atom_counts.npy' in this DiskDataset: it has "
+                        f"{len(atom_counts)} entries, fewer than the {self._len} "
+                        "samples found. It is likely stale.",
+                        stacklevel=2,
+                    )
 
         # Determine which fields are going to be read
         if fields is None:
@@ -749,6 +826,112 @@ class DiskDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return self._len
+
+    def _backfill_atom_counts(self) -> np.ndarray:
+        """
+        Compute atom counts for every sample by reading each system directly (not
+        the full sample, so targets/extra fields are skipped), then append them to
+        the zip as ``_atom_counts.npy`` so future opens of this dataset don't pay
+        this cost again.
+
+        :return: Atom counts for all samples, in dataset order.
+        """
+        # The whole scan-and-append runs under an exclusive lock, so concurrent
+        # callers (e.g. the ranks of a distributed job all opening a dataset
+        # that lacks this file) don't each pay the full O(N) scan or append a
+        # duplicate copy: the first caller computes and writes the file while
+        # the others wait, then simply load it. This does not protect against
+        # an unrelated, unlocked reader observing the file mid-append, but this
+        # is accepted here for simplicity (it should never happen in practice).
+        lock_path = f"{self.zip_file_path}.lock"
+        try:
+            lock_file: Optional[IO[str]] = open(lock_path, "w")
+        except OSError as e:
+            # Read-only dataset location: no lock and no write-back possible.
+            # Fall back to computing the counts in memory for this process.
+            warnings.warn(
+                f"Could not create lock file '{lock_path}' ({e}); computing "
+                "atom counts in memory without persisting them to the zip.",
+                stacklevel=3,
+            )
+            lock_file = None
+
+        if lock_file is not None:
+            _lock_exclusive(lock_file)
+        try:
+            with zipfile.ZipFile(self.zip_file_path, "r") as zip_file:
+                # Another process may have just written the file while we were
+                # waiting for the lock: load it instead of re-scanning.
+                if "_atom_counts.npy" in zip_file.namelist():
+                    with zip_file.open("_atom_counts.npy", "r") as f:
+                        atom_counts = np.load(f)
+                    if len(atom_counts) >= self._len:
+                        self._atom_counts = atom_counts
+                        return atom_counts
+
+                warnings.warn(
+                    f"'{self.zip_file_path}' has no '_atom_counts.npy' file. "
+                    "Computing it now by reading every system once (one-time "
+                    "cost per dataset file).",
+                    stacklevel=3,
+                )
+                counts = []
+                for i in range(self._len):
+                    with zip_file.open(f"{i}/system.mta", "r") as f:
+                        counts.append(len(load_system(f)))
+            atom_counts = np.array(counts, dtype=np.int64)
+            self._atom_counts = atom_counts
+
+            # Only one process may mutate the shared dataset zip: file locks
+            # are not reliable across nodes on some parallel filesystems
+            # (e.g. Lustre mounted with noflock), so in distributed runs the
+            # write-back is restricted to rank 0. Other ranks keep their
+            # in-memory copy; the file is picked up on the next open.
+            if lock_file is not None and _is_writing_rank():
+                try:
+                    with zipfile.ZipFile(self.zip_file_path, "a") as zip_file:
+                        with zip_file.open("_atom_counts.npy", "w") as f:
+                            np.save(f, atom_counts)
+                except OSError as e:
+                    warnings.warn(
+                        f"Could not write '_atom_counts.npy' back to "
+                        f"'{self.zip_file_path}' ({e}); atom counts will be "
+                        "recomputed the next time this dataset is opened.",
+                        stacklevel=3,
+                    )
+        finally:
+            if lock_file is not None:
+                _unlock(lock_file)
+                lock_file.close()
+
+        return atom_counts
+
+    def get_num_atoms(self, i: int) -> int:
+        """
+        Return the atom count for sample index ``i``, using the ``_atom_counts.npy``
+        file (computed and cached into the zip on first use if missing). Enables
+        use with :class:`~metatrain.utils.data.samplers.MaxAtomDistributedBatchSampler`.
+
+        :param i: Dataset index.
+        :return: Number of atoms in sample ``i``.
+        """
+        atom_counts = self._atom_counts
+        if atom_counts is None:
+            atom_counts = self._backfill_atom_counts()
+        return int(atom_counts[i])
+
+    def get_all_atom_counts(self) -> np.ndarray:
+        """
+        Return atom counts for all samples in one vectorized call, using the
+        ``_atom_counts.npy`` file (computed and cached into the zip on first
+        use if missing).
+
+        :return: Atom counts for all samples, in dataset order.
+        """
+        atom_counts = self._atom_counts
+        if atom_counts is None:
+            atom_counts = self._backfill_atom_counts()
+        return atom_counts[: self._len].astype(np.int64)
 
     def __getitem__(self, index: int) -> Any:
         self._open_zip_once()
