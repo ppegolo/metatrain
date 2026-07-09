@@ -13,7 +13,12 @@ import tempfile
 import numpy as np
 import pytest
 import torch
-from metatomic.torch import ModelOutput, System
+from metatomic.torch import (
+    ModelEvaluationOptions,
+    ModelOutput,
+    System,
+    load_atomistic_model,
+)
 from omegaconf import OmegaConf
 
 from metatrain.llpr import LLPRUncertaintyModel
@@ -146,6 +151,20 @@ def _grad_systems(model: LLPRUncertaintyModel, n: int):
         get_system_with_neighbor_lists(new_system, requested_neighbor_lists)
         grad_systems.append(new_system)
     return grad_systems
+
+
+def _plain_systems(model: LLPRUncertaintyModel, n: int):
+    """Fresh `System`s as an engine hands them over when it is NOT doing its own
+    autograd: plain positions/cell (no grad), neighbor lists attached but not
+    autograd-registered. Explicit gradients then rely entirely on the in-forward
+    rebuild (`_systems_with_grad`).
+    """
+    systems = [s.to(DTYPE) for s in read_systems(DATASET_WITH_FORCES_PATH)[:n]]
+    requested_neighbor_lists = get_requested_neighbor_lists(model)
+    for system in systems:
+        assert not system.positions.requires_grad
+        get_system_with_neighbor_lists(system, requested_neighbor_lists)
+    return systems
 
 
 def _reference_energy_gradients(model, systems):
@@ -291,3 +310,66 @@ def test_energy_ensemble_gradients_batch(llpr_model):
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+def test_energy_ensemble_gradients_plain_systems(llpr_model):
+    """Explicit gradients must not depend on the caller having enabled grad:
+    engine-style plain systems go through the in-forward rebuild
+    (`_systems_with_grad`) and must give the same gradients as caller-prepared
+    grad-enabled systems. This is the contract that lets any engine request
+    ensemble gradients without engine-side autograd setup."""
+    outputs = {
+        "energy_ensemble": ModelOutput(
+            sample_kind="system", explicit_gradients=["positions", "strain"]
+        )
+    }
+    ref_block = llpr_model(_grad_systems(llpr_model, n=2), outputs)[
+        "energy_ensemble"
+    ].block()
+    block = llpr_model(_plain_systems(llpr_model, n=2), outputs)[
+        "energy_ensemble"
+    ].block()
+
+    assert torch.allclose(block.values, ref_block.values, atol=1e-10, rtol=1e-10)
+    for gradient_name in ("positions", "strain"):
+        assert torch.allclose(
+            block.gradient(gradient_name).values,
+            ref_block.gradient(gradient_name).values,
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
+
+def test_energy_ensemble_gradients_torchscript(llpr_model, tmp_path):
+    """The whole explicit-gradient path -- including the in-forward system rebuild
+    -- must survive `AtomisticModel.save()`'s `torch.jit.script` and produce the
+    same gradients from a re-loaded scripted model fed engine-style plain systems.
+    This is the deployment path (export -> load in an engine) the feature exists
+    for; the other tests only exercise the eager Python model."""
+    outputs = {
+        "energy_ensemble": ModelOutput(
+            sample_kind="system", explicit_gradients=["positions", "strain"]
+        )
+    }
+    ref_block = llpr_model(_grad_systems(llpr_model, n=2), outputs)[
+        "energy_ensemble"
+    ].block()
+
+    path = str(tmp_path / "llpr_ensemble.pt")
+    llpr_model.export().save(path)
+    loaded = load_atomistic_model(path)
+
+    options = ModelEvaluationOptions(
+        length_unit="angstrom", outputs=outputs, selected_atoms=None
+    )
+    result = loaded(_plain_systems(llpr_model, n=2), options, check_consistency=True)
+    block = result["energy_ensemble"].block()
+
+    assert torch.allclose(block.values, ref_block.values, atol=1e-10, rtol=1e-10)
+    for gradient_name in ("positions", "strain"):
+        assert torch.allclose(
+            block.gradient(gradient_name).values,
+            ref_block.gradient(gradient_name).values,
+            atol=1e-10,
+            rtol=1e-10,
+        )

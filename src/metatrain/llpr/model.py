@@ -10,6 +10,7 @@ from metatomic.torch import (
     ModelMetadata,
     ModelOutput,
     System,
+    register_autograd_neighbors,
 )
 from torch.utils.data import DataLoader
 
@@ -391,6 +392,15 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 continue
             outputs_for_model[name] = output
 
+        # Explicit gradients of "energy_ensemble" require grad-enabled positions/cell
+        # and autograd-registered neighbor lists *before* the wrapped model runs.
+        # Engines generally hand over systems without any of this set up, so rebuild
+        # them here if needed.
+        for name, output in outputs.items():
+            if name == "energy_ensemble" and len(output.explicit_gradients) > 0:
+                systems = self._systems_with_grad(systems)
+                break
+
         return_dict = self.model(systems, outputs_for_model, selected_atoms)
 
         requested_uncertainties: List[str] = []
@@ -629,6 +639,38 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
 
         return return_dict
 
+    def _systems_with_grad(self, systems: List[System]) -> List[System]:
+        """Rebuild ``systems`` so that positions and cell require grad and neighbor
+        lists are registered with autograd, as needed by
+        ``_add_energy_ensemble_gradients``.
+
+        Systems whose positions and cell already require grad (e.g. because the
+        engine is doing its own autograd on top of this call) are passed through
+        untouched, keeping the caller's graph intact. Everything else is replaced by
+        a copy built on detached, grad-enabled positions/cell tensors, with neighbor
+        lists re-registered against them.
+
+        :param systems: systems to rebuild.
+        :return: list with one system per input system, either the original object
+            (already grad-enabled) or its grad-enabled copy.
+        """
+        new_systems: List[System] = []
+        for system in systems:
+            if system.positions.requires_grad and system.cell.requires_grad:
+                new_systems.append(system)
+                continue
+            positions = system.positions.detach().requires_grad_(True)
+            cell = system.cell.detach().requires_grad_(True)
+            new_system = System(system.types, positions, cell, system.pbc)
+            for nl_options in system.known_neighbor_lists():
+                neighbors = mts.detach_block(system.get_neighbor_list(nl_options))
+                register_autograd_neighbors(new_system, neighbors, False)
+                new_system.add_neighbor_list(nl_options, neighbors)
+            for data_name in system.known_data():
+                new_system.add_data(data_name, system.get_data(data_name))
+            new_systems.append(new_system)
+        return new_systems
+
     def _add_energy_ensemble_gradients(
         self,
         ensemble_block: TensorBlock,
@@ -651,8 +693,9 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         :param ensemble_block: the "energy_ensemble" value block gradients are
             attached to, in place, via ``add_gradient``.
         :param systems: the systems this batch was computed for; ``positions`` and
-            ``cell`` must already require grad (set by the caller) for any of this to
-            produce non-trivial gradients.
+            ``cell`` must already require grad (ensured by ``_systems_with_grad`` in
+            ``forward``, or set up by the caller) for any of this to produce
+            non-trivial gradients.
         :param ensemble_values: the (already recentered) ensemble values, with shape
             ``(num_samples, num_ens)`` (one row per system, one column per ensemble
             member). This is only valid for the "energy" quantity, which has no
