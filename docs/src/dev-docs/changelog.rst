@@ -36,6 +36,10 @@ Added
 - ``max_atoms_per_batch`` now works with ``DiskDataset``: ``DiskDatasetWriter``
   stores the number of atoms of every structure in a ``metadata/atom_counts.npy``
   file, which the sampler reads without opening every entry in the zip.
+- Optional equivariance error evaluation in ``mtt eval``, enabled with the
+  ``equivariance`` key in the eval options file. The model is evaluated over a
+  grid of rotations of each structure, and the resulting error is reported
+  alongside the accuracy metrics, with the same normalization and units.
 - Possibility to avoid warm-up in ``mtt eval`` with the ``--no-warm-up`` flag.
 - Optional per-system charge and spin-multiplicity conditioning for PET. Enabled via the
   ``system_conditioning`` model hyperparameter, with per-system ``charge`` and

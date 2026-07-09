@@ -19,6 +19,7 @@ from metatrain.utils.data.readers.ase import read
 from metatrain.utils.data.target_info import get_energy_target_info
 from metatrain.utils.data.writers import DiskDatasetWriter
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+from metatrain.utils.pydantic import MetatrainValidationError
 
 from ..conftest import EVAL_OPTIONS_PATH, MODEL_HYPERS, RESOURCES_PATH
 
@@ -362,3 +363,89 @@ def test_eval_indices(monkeypatch, tmp_path, caplog, options, MODEL_PATH, indice
     # Test file is written predictions
     frames = read("foo.xyz", ":")
     assert len(frames) == 1
+
+
+@pytest.mark.parametrize("equivariance", [True, {"rotation_batch_size": 8}])
+def test_eval_equivariance(monkeypatch, tmp_path, caplog, model, options, equivariance):
+    """Test that the equivariance error is computed and logged during eval."""
+    monkeypatch.chdir(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    shutil.copy(RESOURCES_PATH / "qm9_reduced_100.xyz", "qm9_reduced_100.xyz")
+
+    options["equivariance"] = equivariance
+    options["indices"] = [0, 1, 2]
+
+    eval_model(
+        model=model,
+        options=options,
+        output="foo.xyz",
+        warm_up=False,
+    )
+
+    log = "".join([rec.message for rec in caplog.records])
+    assert "Equivariance error evaluation enabled" in log
+    assert "energy equivariance RMSE (per atom)" in log
+    # the fixture model is float32, so the noise floor must be reported
+    assert "equivariance errors below the round-off" in log
+    assert "nan" not in log
+
+
+def test_eval_equivariance_unknown_option(monkeypatch, tmp_path, model, options):
+    """Unknown equivariance sub-options must be rejected by validation."""
+    monkeypatch.chdir(tmp_path)
+
+    shutil.copy(RESOURCES_PATH / "qm9_reduced_100.xyz", "qm9_reduced_100.xyz")
+
+    options["equivariance"] = {"bad_option": 1}
+
+    with pytest.raises(MetatrainValidationError, match="bad_option"):
+        eval_model(model=model, options=options)
+
+
+def test_eval_equivariance_requires_targets(monkeypatch, tmp_path, model, options):
+    """The equivariance error needs target information, so a `targets` section
+    must be present."""
+    monkeypatch.chdir(tmp_path)
+
+    shutil.copy(RESOURCES_PATH / "qm9_reduced_100.xyz", "qm9_reduced_100.xyz")
+
+    options.pop("targets")
+    options["equivariance"] = True
+
+    with pytest.raises(ValueError, match="requires a `targets` section"):
+        eval_model(model=model, options=options)
+
+
+@pytest.mark.parametrize("gradients", [True, False])
+def test_eval_equivariance_gradients(monkeypatch, tmp_path, caplog, model, gradients):
+    """The equivariance error of conservative forces is only computed when
+    explicitly requested with the `gradients` option (it is expensive)."""
+    monkeypatch.chdir(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    shutil.copy(RESOURCES_PATH / "ethanol_reduced_100.xyz", "ethanol_reduced_100.xyz")
+
+    options = OmegaConf.create(
+        {
+            "systems": "ethanol_reduced_100.xyz",
+            "targets": {"energy": {"key": "energy", "unit": "eV", "forces": True}},
+            "indices": [0, 1, 2],
+            "equivariance": {"gradients": gradients},
+        }
+    )
+
+    eval_model(
+        model=model,
+        options=options,
+        output="foo.xyz",
+        warm_up=False,
+    )
+
+    log = "".join([rec.message for rec in caplog.records])
+    assert "energy equivariance RMSE (per atom)" in log
+    gradient_metric = "energy_positions_gradients equivariance RMSE"
+    if gradients:
+        assert gradient_metric in log
+    else:
+        assert gradient_metric not in log

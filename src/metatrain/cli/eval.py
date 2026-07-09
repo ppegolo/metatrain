@@ -38,7 +38,11 @@ from metatrain.utils.errors import ArchitectureError
 from metatrain.utils.evaluate_model import evaluate_model
 from metatrain.utils.io import load_model
 from metatrain.utils.logging import MetricLogger
-from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator
+from metatrain.utils.metrics import (
+    EquivarianceAccumulator,
+    MAEAccumulator,
+    RMSEAccumulator,
+)
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
@@ -150,6 +154,42 @@ def _prepare_eval_model_args(args: argparse.Namespace) -> None:
     )
 
 
+def _normalize_equivariance_options(conf: Union[None, bool, Dict]) -> Optional[Dict]:
+    """Normalize the ``equivariance`` entry of an eval options file.
+
+    :param conf: the validated ``equivariance`` entry: absent (``None``), a
+        boolean, or a dictionary of options.
+    :return: ``None`` if disabled, otherwise a dictionary with all options
+        filled in with their defaults.
+    """
+    if conf is None or conf is False:
+        return None
+    conf = {} if conf is True else dict(conf)
+    return {
+        "gradients": conf.get("gradients", False),
+        "rotation_batch_size": conf.get("rotation_batch_size", 16),
+        "max_o3_lambda_grid": conf.get("max_o3_lambda_grid", None),
+    }
+
+
+def _max_o3_lambda(targets: Dict[str, TargetInfo]) -> int:
+    """Maximum O(3) angular momentum among the target values, used to size the
+    rotation grid of the symmetrized model.
+
+    :param targets: the target information dictionary.
+    :return: the maximum angular momentum.
+    """
+    max_lambda = 0
+    for target in targets.values():
+        if target.is_spherical:
+            lambdas = target.layout.keys.column("o3_lambda")
+            max_lambda = max(max_lambda, int(lambdas.max()))
+        elif target.is_cartesian:
+            rank = len(target.layout.block(0).components)
+            max_lambda = max(max_lambda, rank)
+    return max_lambda
+
+
 def _eval_targets(
     model: Union[AtomisticModel, torch.jit.RecursiveScriptModule],
     dataset: Dataset,
@@ -158,6 +198,7 @@ def _eval_targets(
     check_consistency: bool = False,
     writer: Optional[Writer] = None,
     warm_up: bool = True,
+    equivariance: Optional[Dict] = None,
 ) -> None:
     """
     Evaluate `model` on `dataset`, accumulate RMSE/MAE, and (if `writer` is provided)
@@ -170,6 +211,9 @@ def _eval_targets(
     :param check_consistency: Whether to run consistency checks during model evaluation.
     :param writer: Optional writer to write out per-sample predictions.
     :param warm_up: Whether to do a warm-up of the model before evaluation.
+    :param equivariance: If not ``None``, also compute the equivariance error of
+        the model on the targets, with the options returned by
+        :func:`_normalize_equivariance_options`.
     """
     # Disable static fusion. Besides the fact that atomistic batches have variable
     # sizes, statically fused CUDA kernels cannot allocate new tensors at runtime,
@@ -189,6 +233,75 @@ def _eval_targets(
     ]
     logging.info(f"Running on device {device} with dtype {dtype}")
     model.to(dtype=dtype, device=device)
+
+    # Optional equivariance error evaluation
+    symmetrized_model = None
+    if equivariance is not None:
+        if not all(isinstance(target, TargetInfo) for target in options.values()):
+            raise ValueError(
+                "computing the equivariance error requires a `targets` section "
+                "in the eval options file"
+            )
+        try:
+            from metatomic.torch.symmetrized_model import SymmetrizedModel
+        except ImportError as e:
+            raise ImportError(
+                "computing the equivariance error requires a version of "
+                "metatomic-torch providing `metatomic.torch.symmetrized_model`, "
+                "as well as scipy >= 1.15"
+            ) from e
+
+        energy_gradients: List[str] = []
+        energy_name = "energy"
+        if equivariance["gradients"]:
+            candidates = [
+                name
+                for name, target in options.items()
+                if target.quantity == "energy" and target.gradients
+            ]
+            if len(candidates) == 0:
+                logging.warning(
+                    "the equivariance error of gradients was requested, but no "
+                    "energy target with gradients is present; skipping"
+                )
+            else:
+                if len(candidates) > 1:
+                    logging.warning(
+                        "the equivariance error of gradients only supports a "
+                        f"single energy target, using '{candidates[0]}'"
+                    )
+                energy_name = candidates[0]
+                energy_gradients = list(options[energy_name].gradients)
+
+        max_o3_lambda_target = _max_o3_lambda(options)
+        if "positions" in energy_gradients:
+            max_o3_lambda_target = max(max_o3_lambda_target, 1)
+        if "strain" in energy_gradients:
+            max_o3_lambda_target = max(max_o3_lambda_target, 2)
+
+        symmetrized_model = SymmetrizedModel(
+            model,
+            max_o3_lambda_target=max_o3_lambda_target,
+            batch_size=equivariance["rotation_batch_size"],
+            max_o3_lambda_grid=equivariance["max_o3_lambda_grid"],
+        )
+        symmetrized_outputs = {
+            key: ModelOutput(
+                quantity=value.quantity,
+                unit=value.unit,
+                sample_kind=value.sample_kind,
+                description=value.description,
+            )
+            for key, value in options.items()
+        }
+        equivariance_accumulator = EquivarianceAccumulator(
+            list(options.keys()), energy_gradients, energy_name=energy_name
+        )
+        n_grid = 2 * symmetrized_model.so3_rotations.shape[0]
+        logging.info(
+            "Equivariance error evaluation enabled: every system is additionally "
+            f"evaluated on {n_grid} rotated copies."
+        )
 
     # DataLoader & metrics setup
     if len(dataset) % batch_size != 0:
@@ -274,6 +387,16 @@ def _eval_targets(
         if writer:
             writer.write(systems, batch_predictions)
 
+        # Equivariance error, outside of the timed accuracy evaluation
+        if symmetrized_model is not None:
+            symmetrized_results = symmetrized_model(
+                systems,
+                symmetrized_outputs,
+                compute_gradients=len(energy_gradients) > 0,
+                energy_name=energy_name,
+            )
+            equivariance_accumulator.update(symmetrized_results, systems)
+
         # Timing
         time_taken = end_time - start_time
         total_time += time_taken
@@ -287,6 +410,30 @@ def _eval_targets(
     rmse_vals = rmse_acc.finalize(not_per_atom=["positions_gradients"])
     mae_vals = mae_acc.finalize(not_per_atom=["positions_gradients"])
     metrics = {**rmse_vals, **mae_vals}
+    if symmetrized_model is not None:
+        equivariance_metrics = equivariance_accumulator.finalize(
+            not_per_atom=["positions_gradients"]
+        )
+        metrics.update(equivariance_metrics)
+        if dtype == torch.float32:
+            floors = equivariance_accumulator.noise_floors(
+                not_per_atom=["positions_gradients"],
+                resolution=torch.finfo(torch.float32).eps,
+            )
+            floor_info = ", ".join(
+                f"'{key}': ~{floor:.1e}" for key, floor in floors.items()
+            )
+            logging.info(
+                "The model runs in float32: equivariance errors below the "
+                f"round-off of its outputs ({floor_info}, in the target units) "
+                "are not significant."
+            )
+            for key, floor in floors.items():
+                if equivariance_metrics[key] <= floor:
+                    logging.warning(
+                        f"the reported '{key}' is at or below the float32 "
+                        "round-off level and only reflects numerical noise"
+                    )
     metric_logger = MetricLogger(
         log_obj=logger, dataset_info=model.capabilities(), initial_metrics=metrics
     )
@@ -346,6 +493,15 @@ def eval_model(
         if is_memmap_output:
             filename = filename + "/"
 
+        equivariance = _normalize_equivariance_options(
+            OmegaConf.to_container(options).get("equivariance")
+        )
+        if equivariance is not None and not hasattr(options, "targets"):
+            raise ValueError(
+                "computing the equivariance error requires a `targets` section "
+                "in the eval options file"
+            )
+
         # pick the right writer
         writer = get_writer(filename, capabilities=model.capabilities(), append=append)
 
@@ -402,6 +558,7 @@ def eval_model(
                 check_consistency=check_consistency,
                 writer=writer,
                 warm_up=warm_up,
+                equivariance=equivariance,
             )
         except Exception as e:
             raise ArchitectureError(e)

@@ -2,8 +2,10 @@ import numpy as np
 import pytest
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatomic.torch import System
 
 from metatrain.utils.metrics import (
+    EquivarianceAccumulator,
     MAEAccumulator,
     RMSEAccumulator,
     _get_global_keys,
@@ -525,3 +527,201 @@ def test_finalize_distributed_separate_blocks_missing_block_on_local_rank(
     assert (
         abs(result[f"energy (label_name=1) {metric_suffix}"] - expected_block1) < 1e-6
     )
+
+
+def _system(n_atoms, cell=None):
+    return System(
+        types=torch.ones(n_atoms, dtype=torch.int32),
+        positions=torch.rand(n_atoms, 3, dtype=torch.float64),
+        cell=(
+            torch.zeros(3, 3, dtype=torch.float64)
+            if cell is None
+            else torch.tensor(cell, dtype=torch.float64)
+        ),
+        pbc=torch.tensor([cell is not None] * 3),
+    )
+
+
+def _single_key_tensor_map(values, sample_names, sample_values, n_components):
+    """A TensorMap with a single block, as returned by a SymmetrizedModel for
+    non-spherical targets. ``n_components`` mimics the o3_mu axis of the
+    ``_mean`` entries; ``_var`` entries pass ``0`` (components summed out)."""
+    if n_components > 0:
+        components = [Labels.range("o3_mu", n_components)]
+        values = values.unsqueeze(1).expand(-1, n_components, -1) / n_components
+    else:
+        components = []
+    block = TensorBlock(
+        values=values,
+        samples=Labels(sample_names, torch.tensor(sample_values)),
+        components=components,
+        properties=Labels.range("p", values.shape[-1]),
+    )
+    return TensorMap(keys=Labels.single(), blocks=[block])
+
+
+def test_equivariance_accumulator_energy_and_forces():
+    # 2 systems with 2 and 1 atoms; energy variance is divided by n_atoms^2
+    # (matching the per-atom accuracy RMSE), force variance is pooled raw over
+    # 3 Cartesian components per atom
+    systems = [_system(2), _system(1)]
+    results = {
+        "energy_l0_var": _single_key_tensor_map(
+            torch.tensor([[4.0], [16.0]]), ["system"], [[0], [1]], 0
+        ),
+        "energy_l0_mean": _single_key_tensor_map(
+            torch.tensor([[1.0], [1.0]]), ["system"], [[0], [1]], 1
+        ),
+        "forces_l1_var": _single_key_tensor_map(
+            torch.tensor([[3.0], [6.0], [9.0]]),
+            ["system", "atom"],
+            [[0, 0], [0, 1], [1, 0]],
+            0,
+        ),
+        "forces_l1_mean": _single_key_tensor_map(
+            torch.tensor([[1.0], [1.0], [1.0]]),
+            ["system", "atom"],
+            [[0, 0], [0, 1], [1, 0]],
+            3,
+        ),
+        "energy_l0_norm_squared": _single_key_tensor_map(
+            torch.tensor([[100.0], [100.0]]), ["system"], [[0], [1]], 0
+        ),
+        "forces_l1_norm_squared": _single_key_tensor_map(
+            torch.tensor([[3.0], [6.0], [9.0]]),
+            ["system", "atom"],
+            [[0, 0], [0, 1], [1, 0]],
+            0,
+        ),
+    }
+
+    acc = EquivarianceAccumulator(["energy"], energy_gradients=["positions"])
+    acc.update(results, systems)
+    metrics = acc.finalize(not_per_atom=["positions_gradients"])
+
+    # energy: (4 / 2^2 + 16 / 1^2) / 2 elements
+    expected_energy = ((4.0 / 4.0 + 16.0) / 2.0) ** 0.5
+    # forces: (3 + 6 + 9) / (3 atoms * 3 components)
+    expected_forces = (18.0 / 9.0) ** 0.5
+    assert metrics == {
+        "energy equivariance RMSE (per atom)": pytest.approx(expected_energy),
+        "energy_positions_gradients equivariance RMSE": pytest.approx(expected_forces),
+    }
+
+
+def test_equivariance_accumulator_stress_recombination():
+    # the l0 (trace) and l2 (half-weight symmetric traceless) variances must
+    # recombine to the element-wise squared error over the 3x3 dE/dstrain,
+    # rescaled by the cell volume and by n_atoms (per-atom accuracy RMSE)
+    volume = 8.0
+    n_atoms = 2
+    systems = [_system(n_atoms, cell=[[2.0, 0, 0], [0, 2.0, 0], [0, 0, 2.0]])]
+    results = {
+        "stress_l0_var": _single_key_tensor_map(
+            torch.tensor([[6.0]]), ["system"], [[0]], 0
+        ),
+        "stress_l0_mean": _single_key_tensor_map(
+            torch.tensor([[1.0]]), ["system"], [[0]], 1
+        ),
+        "stress_l2_var": _single_key_tensor_map(
+            torch.tensor([[5.0]]), ["system"], [[0]], 0
+        ),
+        "stress_l2_mean": _single_key_tensor_map(
+            torch.tensor([[1.0]]), ["system"], [[0]], 5
+        ),
+        "stress_l0_norm_squared": _single_key_tensor_map(
+            torch.tensor([[3.0]]), ["system"], [[0]], 0
+        ),
+        "stress_l2_norm_squared": _single_key_tensor_map(
+            torch.tensor([[4.5]]), ["system"], [[0]], 0
+        ),
+    }
+
+    acc = EquivarianceAccumulator(["energy"], energy_gradients=["strain"])
+    acc.update(results, systems)
+    metrics = acc.finalize(not_per_atom=["positions_gradients"])
+
+    scale = volume**2 / n_atoms**2
+    expected = (scale * (6.0 / 3.0 + 2.0 * 5.0) / 9.0) ** 0.5
+    assert metrics == {
+        "energy_strain_gradients equivariance RMSE (per atom)": pytest.approx(expected)
+    }
+
+
+def test_equivariance_accumulator_spherical_target():
+    # multi-block spherical targets pool over blocks, properties, and irrep
+    # components with the same element counting as the accuracy RMSE
+    systems = [_system(2)]
+    keys = Labels(["o3_lambda", "o3_sigma"], torch.tensor([[0, 1], [2, 1]]))
+
+    def spherical_map(values_per_block, n_components_per_block):
+        blocks = []
+        for values, n_components in zip(
+            values_per_block, n_components_per_block, strict=True
+        ):
+            if n_components > 0:
+                components = [Labels.range("o3_mu", n_components)]
+                values = values.unsqueeze(1).expand(-1, n_components, -1).clone()
+            else:
+                components = []
+            blocks.append(
+                TensorBlock(
+                    values=values,
+                    samples=Labels(["system"], torch.tensor([[0]])),
+                    components=components,
+                    properties=Labels.range("p", values.shape[-1]),
+                )
+            )
+        return TensorMap(keys=keys, blocks=blocks)
+
+    results = {
+        "mtt::spherical_var": spherical_map(
+            [torch.tensor([[1.0, 2.0]]), torch.tensor([[5.0, 10.0]])], [0, 0]
+        ),
+        "mtt::spherical_mean": spherical_map(
+            [torch.tensor([[1.0, 1.0]]), torch.tensor([[1.0, 1.0]])], [1, 5]
+        ),
+        "mtt::spherical_norm_squared": spherical_map(
+            [torch.tensor([[1.0, 2.0]]), torch.tensor([[5.0, 10.0]])], [0, 0]
+        ),
+    }
+
+    acc = EquivarianceAccumulator(["mtt::spherical"], energy_gradients=[])
+    acc.update(results, systems)
+    metrics = acc.finalize(not_per_atom=["positions_gradients"])
+
+    # per-structure: divided by n_atoms^2 = 4; elements: 1 sample x (1 + 5)
+    # components x 2 properties
+    expected = (((1.0 + 2.0 + 5.0 + 10.0) / 4.0) / 12.0) ** 0.5
+    assert metrics == {
+        "mtt::spherical equivariance RMSE (per atom)": pytest.approx(expected)
+    }
+
+
+def test_equivariance_accumulator_custom_energy_name():
+    # gradient metrics must follow the name of the energy target they derive
+    # from, so they line up with the accuracy metrics of that target
+    systems = [_system(1)]
+    results = {
+        "forces_l1_var": _single_key_tensor_map(
+            torch.tensor([[9.0]]), ["system", "atom"], [[0, 0]], 0
+        ),
+        "forces_l1_mean": _single_key_tensor_map(
+            torch.tensor([[1.0]]), ["system", "atom"], [[0, 0]], 3
+        ),
+        "forces_l1_norm_squared": _single_key_tensor_map(
+            torch.tensor([[9.0]]), ["system", "atom"], [[0, 0]], 0
+        ),
+    }
+
+    acc = EquivarianceAccumulator(
+        ["mtt::U0"], energy_gradients=["positions"], energy_name="mtt::U0"
+    )
+    acc.update(results, systems)
+    metrics = acc.finalize(not_per_atom=["positions_gradients"])
+
+    assert metrics == {
+        "mtt::U0_positions_gradients equivariance RMSE": pytest.approx(
+            (9.0 / 3.0) ** 0.5
+        )
+    }

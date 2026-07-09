@@ -396,6 +396,25 @@ ValOrTestSetSpec = Annotated[
 
 
 @with_config(ConfigDict(extra="forbid", strict=True))
+class EquivarianceHypers(TypedDict):
+    """Options for the equivariance error computation during evaluation."""
+
+    gradients: NotRequired[bool]
+    """Whether to also compute the equivariance error of the conservative
+    forces (and stress, for periodic systems) obtained as gradients of an
+    energy target (default: ``false``). This requires evaluating the gradients
+    on every rotated copy of every structure, which is significantly more
+    expensive."""
+    rotation_batch_size: NotRequired[int]
+    """Number of rotated copies of a system evaluated in a single forward
+    call of the model (default: 16). Lower this to reduce memory usage."""
+    max_o3_lambda_grid: NotRequired[int]
+    """Maximum O(3) angular momentum the rotation quadrature grid integrates
+    exactly. If not given, a grid sufficient for the requested targets is
+    chosen automatically."""
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
 class EvalDatasetDictHypers(TypedDict):
     systems: str | SystemsHypers
     """Path to the dataset file or a dictionary specifying the dataset."""
@@ -412,6 +431,17 @@ class EvalDatasetDictHypers(TypedDict):
     text file containing one index per line. When specified, only the structures
     at these indices will be used from the dataset.
     """
+    equivariance: NotRequired[bool | EquivarianceHypers]
+    """Whether to also compute the equivariance error of the model on the
+    targets, i.e. how much the predictions change under rotations and
+    inversions of the input structures.
+
+    Set to ``true`` to enable with default settings, or to a dictionary of
+    options (see :class:`EquivarianceHypers`). The error is reported as an
+    additional RMSE-like metric for each target, directly comparable with the
+    corresponding accuracy RMSE. This evaluates the model on a grid of
+    rotations for every structure and makes evaluation significantly more
+    expensive. Requires a ``targets`` section."""
 
 
 EvalHypers = EvalDatasetDictHypers | list[EvalDatasetDictHypers]
