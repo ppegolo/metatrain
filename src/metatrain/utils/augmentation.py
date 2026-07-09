@@ -10,6 +10,11 @@ from scipy.spatial.transform import Rotation
 
 from . import torch_jit_script_unless_coverage
 from .data import TargetInfo
+from .pyscf_loss import (
+    BATCH_ROTATIONS_NAME,
+    BatchRotations,
+    RaggedMetricMatrices,
+)
 
 
 def get_random_rotation() -> Rotation:
@@ -101,9 +106,18 @@ class RotationalAugmenter:
 
             self._largest_l = largest_l
             self.wigner = spherical.Wigner(largest_l)
+            self._wigner_index_grids = {}
             for ell in range(largest_l + 1):
                 self.complex_to_real_spherical_harmonics_transforms[ell] = (
                     _complex_to_real_spherical_harmonics_transform(ell)
+                )
+                # Gather grid for vectorised extraction of the (2l+1, 2l+1)
+                # complex Wigner block from spherical's flat coefficient array.
+                self._wigner_index_grids[ell] = np.array(
+                    [
+                        [self.wigner.Dindex(ell, m, mp) for mp in range(-ell, ell + 1)]
+                        for m in range(-ell, ell + 1)
+                    ]
                 )
 
     def __getstate__(self) -> dict:
@@ -180,13 +194,48 @@ class RotationalAugmenter:
             for r, i in zip(rotations, inversions, strict=True)
         ]
 
+        # Raw (non-TensorMap) payloads — cached metric matrices attached by
+        # transforms that deliberately run on the unrotated data — cannot pass
+        # through the TorchScript-typed augmentation core; carry them around it.
+        raw_extra: Dict[str, Union[RaggedMetricMatrices, BatchRotations]] = {}
+        if extra_data is not None:
+            raw_extra = {
+                name: value
+                for name, value in extra_data.items()
+                if isinstance(value, (RaggedMetricMatrices, BatchRotations))
+            }
+            extra_data = {
+                name: value
+                for name, value in extra_data.items()
+                if name not in raw_extra
+            }
+
         wigner_D_matrices = self._create_wigner_D_matrices(
             rotations, targets, extra_data=extra_data
         )
 
-        return _apply_augmentations(
-            systems, targets, transformations, wigner_D_matrices, extra_data=extra_data
+        inverted = torch.tensor([i == -1 for i in inversions])
+        systems, targets, extra_data = _apply_augmentations(
+            systems,
+            targets,
+            transformations,
+            inverted,
+            wigner_D_matrices,
+            extra_data=extra_data,
         )
+
+        extra_data.update(raw_extra)
+
+        # Stash the per-system rotation info for downstream consumers (the
+        # density losses un-rotate their residuals with it, which keeps metric
+        # matrices cached on the unrotated geometries valid).
+        if wigner_D_matrices and extra_data is not None:
+            extra_data[BATCH_ROTATIONS_NAME] = BatchRotations(
+                wigner=wigner_D_matrices,
+                inverted=inverted,
+            )
+
+        return systems, targets, extra_data
 
     def _validate(
         self, systems: List[System], rotations: List[Rotation], inversions: List[int]
@@ -208,16 +257,18 @@ class RotationalAugmenter:
         rotations: List[Rotation],
         targets: Dict[str, TensorMap],
         extra_data: Optional[Dict[str, TensorMap]] = None,
-    ) -> Dict[int, List[torch.Tensor]]:
-        wigner_D_matrices = {}
+    ) -> Dict[int, torch.Tensor]:
+        wigner_D_matrices: Dict[int, torch.Tensor] = {}
         if self.wigner is not None:
-            scipy_quaternions = [r.as_quat() for r in rotations]
             quaternionic_quaternions = [
-                _scipy_quaternion_to_quaternionic(q) for q in scipy_quaternions
+                _scipy_quaternion_to_quaternionic(r.as_quat()) for r in rotations
             ]
-            wigner_D_matrices_complex = [
-                self.wigner.D(q) for q in quaternionic_quaternions
-            ]
+            # (n_rotations, n_coefficients) complex Wigner coefficient stack
+            coefficients = np.stack(
+                [self.wigner.D(q) for q in quaternionic_quaternions]
+            )
+
+            needed_ells = set()
             tensormap_dicts = (
                 [targets, extra_data] if extra_data is not None else [targets]
             )
@@ -233,77 +284,61 @@ class RotationalAugmenter:
                     if name.endswith("_mask"):
                         # skip loss masks
                         continue
+                    if name not in info_dict:
+                        # raw auxiliary payloads (e.g. cached metric matrices
+                        # attached by transforms that run before augmentation)
+                        continue
                     tensormap_info = info_dict[name]
                     if tensormap_info.is_spherical:
                         for block in tensormap_info.layout.blocks():
-                            ell = (len(block.components[0]) - 1) // 2
-                            U = self.complex_to_real_spherical_harmonics_transforms[ell]
-                            if ell not in wigner_D_matrices:  # skip if already computed
-                                wigner_D_matrices_l = []
-                                for (
-                                    wigner_D_matrix_complex
-                                ) in wigner_D_matrices_complex:
-                                    wigner_D_matrix = np.zeros(
-                                        (2 * ell + 1, 2 * ell + 1), dtype=np.complex128
-                                    )
-                                    for mp in range(-ell, ell + 1):
-                                        for m in range(-ell, ell + 1):
-                                            wigner_D_matrix[m + ell, mp + ell] = (
-                                                wigner_D_matrix_complex[
-                                                    self.wigner.Dindex(ell, m, mp)
-                                                ]
-                                            ).conj()
+                            needed_ells.add((len(block.components[0]) - 1) // 2)
 
-                                    wigner_D_matrix = U.conj() @ wigner_D_matrix @ U.T
-                                    assert np.allclose(wigner_D_matrix.imag, 0.0)
-                                    wigner_D_matrix = wigner_D_matrix.real
-                                    wigner_D_matrices_l.append(
-                                        torch.from_numpy(wigner_D_matrix)
-                                    )
-                                wigner_D_matrices[ell] = wigner_D_matrices_l
+            for ell in sorted(needed_ells):
+                U = self.complex_to_real_spherical_harmonics_transforms[ell]
+                # (n_rotations, 2l+1, 2l+1), same element order as the old
+                # per-element Dindex loop
+                blocks = coefficients[:, self._wigner_index_grids[ell]].conj()
+                real = np.einsum("ab,rbc,cd->rad", U.conj(), blocks, U.T)
+                assert np.allclose(real.imag, 0.0)
+                wigner_D_matrices[ell] = torch.from_numpy(
+                    np.ascontiguousarray(real.real)
+                )
         return wigner_D_matrices
 
 
 def _apply_wigner_D_matrices(
     systems: List[System],
     target_tmap: TensorMap,
-    transformations: List[torch.Tensor],
-    wigner_D_matrices: Dict[int, List[torch.Tensor]],
+    inverted: torch.Tensor,
+    wigner_D_matrices: Dict[int, torch.Tensor],
 ) -> TensorMap:
     new_blocks: List[TensorBlock] = []
     is_atomic_basis = any(k.startswith("atom_type") for k in target_tmap.keys.names)
     for key, block in target_tmap.items():
         values = block.values
         if block.samples.names == ["system"]:
-            split_values = torch.split(values, [1 for _ in systems])
+            split_sizes = [1 for _ in systems]
         elif not is_atomic_basis:
-            split_values = torch.split(
-                values, [len(system.positions) for system in systems]
-            )
+            split_sizes = [len(system.positions) for system in systems]
         else:
             # Atomic basis: not straightforward because a given block doesn't
             # necessarily have all atoms nor all systems.
             raise ValueError(
                 "Rotational augmentation of atomic basis targets is not supported yet."
             )
+        counts = torch.tensor(split_sizes)
 
-        new_values = []
         rank = len(block.components)
         if rank == 1:
             ell, sigma = int(key["o3_lambda"]), int(key["o3_sigma"])
-            for v, transformation, wigner_D_matrix in zip(
-                split_values, transformations, wigner_D_matrices[ell], strict=True
-            ):
-                is_inverted = torch.det(transformation) < 0
-                new_v = v.clone()
-                if is_inverted:  # inversion
-                    new_v = new_v * (-1) ** ell * sigma
-                # fold property dimension in, apply transformation,
-                # unfold property dimension
-                new_v = new_v.transpose(1, 2)
-                new_v = new_v @ wigner_D_matrix.T
-                new_v = new_v.transpose(1, 2)
-                new_values.append(new_v)
+            wigner = wigner_D_matrices[ell].to(values.dtype)
+            # one batched matmul over all systems' rows instead of a
+            # per-system Python loop
+            wigner_rows = torch.repeat_interleave(wigner, counts, dim=0)
+            parity_factor = float((-1) ** ell) * float(sigma)
+            parity = 1.0 + inverted.to(values.dtype) * (parity_factor - 1.0)
+            parity_rows = torch.repeat_interleave(parity, counts).reshape(-1, 1, 1)
+            new_values = torch.bmm(wigner_rows, values) * parity_rows
         elif rank == 2:
             ell1, ell2, sigma1, sigma2 = (
                 int(key["o3_lambda_1"]),
@@ -311,36 +346,33 @@ def _apply_wigner_D_matrices(
                 int(key["o3_sigma_1"]),
                 int(key["o3_sigma_2"]),
             )
-            for v, transformation, wigner_D_matrix1, wigner_D_matrix2 in zip(
-                split_values,
-                transformations,
-                wigner_D_matrices[ell1],
-                wigner_D_matrices[ell2],
-                strict=True,
-            ):
-                is_inverted = torch.det(transformation) < 0
-                new_v = v.clone()
-                if is_inverted:
-                    # Invert if the two components have different parity.
-                    new_v = new_v * (-1) ** ell1 * sigma1 * (-1) ** ell2 * sigma2
-                new_v = torch.einsum(
-                    "Aa,iabp,bB->iABp", wigner_D_matrix1, new_v, wigner_D_matrix2.T
-                )
+            wigner_1 = wigner_D_matrices[ell1].to(values.dtype)
+            wigner_2 = wigner_D_matrices[ell2].to(values.dtype)
+            wigner_1_rows = torch.repeat_interleave(wigner_1, counts, dim=0)
+            wigner_2_rows = torch.repeat_interleave(wigner_2, counts, dim=0)
+            parity_factor = float((-1) ** (ell1 + ell2)) * float(sigma1 * sigma2)
+            parity = 1.0 + inverted.to(values.dtype) * (parity_factor - 1.0)
+            parity_rows = torch.repeat_interleave(parity, counts).reshape(-1, 1, 1, 1)
+            # v'_{m1 m2} = sum_{p1 p2} D1_{m1 p1} D2_{m2 p2} v_{p1 p2}
+            new_values = torch.einsum(
+                "rab,rbcn,rdc->radn", wigner_1_rows, values, wigner_2_rows
+            )
+            new_values = new_values * parity_rows
+        else:
+            raise ValueError(
+                "Spherical targets with more than 2 components are not supported."
+            )
 
-                new_values.append(new_v)
-        new_values = torch.concatenate(new_values)
-        new_block = TensorBlock(
-            values=new_values,
-            samples=block.samples,
-            components=block.components,
-            properties=block.properties,
+        new_blocks.append(
+            TensorBlock(
+                values=new_values,
+                samples=block.samples,
+                components=block.components,
+                properties=block.properties,
+            )
         )
-        new_blocks.append(new_block)
 
-    return TensorMap(
-        keys=target_tmap.keys,
-        blocks=new_blocks,
-    )
+    return TensorMap(keys=target_tmap.keys, blocks=new_blocks)
 
 
 @torch_jit_script_unless_coverage  # script for speed
@@ -348,7 +380,8 @@ def _apply_augmentations(
     systems: List[System],
     targets: Dict[str, TensorMap],
     transformations: List[torch.Tensor],
-    wigner_D_matrices: Dict[int, List[torch.Tensor]],
+    inverted: torch.Tensor,
+    wigner_D_matrices: Dict[int, torch.Tensor],
     extra_data: Optional[Dict[str, TensorMap]] = None,
 ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
     # Apply the transformations to the systems
@@ -514,7 +547,7 @@ def _apply_augmentations(
 
             elif is_spherical:
                 new_dict[name] = _apply_wigner_D_matrices(
-                    systems, original_tmap, transformations, wigner_D_matrices
+                    systems, original_tmap, inverted, wigner_D_matrices
                 )
 
             elif is_cartesian:

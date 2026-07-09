@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import functools
 import importlib
+import os
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -426,12 +428,62 @@ def _batch_system_ids(extra: dict) -> list[int] | None:
     return [int(v) for v in index_map[0].values[:, 0]]
 
 
+DEFAULT_METRIC_CACHE_MAX_BYTES = 2 * 1024**3
+
+
+def _metric_cache_max_bytes() -> int:
+    """Per-worker byte budget for the metric-matrix cache.
+
+    Overridable via ``METATRAIN_METRIC_CACHE_MAX_BYTES``. The budget applies
+    per dataloader worker process: the total host-memory footprint is
+    ``budget × num_workers × ranks_per_node``.
+    """
+    return int(
+        os.environ.get(
+            "METATRAIN_METRIC_CACHE_MAX_BYTES", DEFAULT_METRIC_CACHE_MAX_BYTES
+        )
+    )
+
+
+class _ByteBudgetCache:
+    """LRU tensor cache bounded by total byte size.
+
+    Unbounded caching is not an option here: on large datasets (e.g. >1M
+    systems) the per-system metric matrices exceed host memory long before an
+    epoch completes. Entries larger than the whole budget are not cached.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._data: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self._bytes = 0
+        self._max_bytes = max_bytes
+
+    def get(self, key: tuple) -> torch.Tensor | None:
+        tensor = self._data.get(key)
+        if tensor is not None:
+            self._data.move_to_end(key)
+        return tensor
+
+    def put(self, key: tuple, tensor: torch.Tensor) -> None:
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes > self._max_bytes:
+            return
+        existing = self._data.pop(key, None)
+        if existing is not None:
+            self._bytes -= existing.numel() * existing.element_size()
+        self._data[key] = tensor
+        self._bytes += nbytes
+        while self._bytes > self._max_bytes:
+            _, evicted = self._data.popitem(last=False)
+            self._bytes -= evicted.numel() * evicted.element_size()
+
+
 def _metric_matrices_transform_impl(
     target_to_aux_basis: Mapping[str, str],
     metric: str,
     name_fn: Callable[[str], str],
     dtype: torch.dtype,
-    persistent_cache: dict | None,
+    persistent_cache: _ByteBudgetCache | None,
     systems: list[System],
     targets: dict[str, TensorMap],
     extra: dict,
@@ -441,7 +493,8 @@ def _metric_matrices_transform_impl(
     # across epochs. It must only be enabled for pipelines whose systems are
     # identical every epoch (validation: no augmentation) — the trainer passes
     # None for the training transforms, whose systems are rotated per epoch.
-    # Memory: one (N_aux, N_aux) matrix per cached system per worker.
+    # Memory: bounded per worker by _metric_cache_max_bytes(); on datasets too
+    # large to fit the budget the LRU degrades to per-epoch recomputation.
     system_ids = _batch_system_ids(extra) if persistent_cache is not None else None
 
     per_batch: dict[str, RaggedMetricMatrices] = {}
@@ -451,11 +504,13 @@ def _metric_matrices_transform_impl(
                 matrices = []
                 for system, system_id in zip(systems, system_ids, strict=True):
                     cache_key = (aux_basis, system_id)
-                    if cache_key not in persistent_cache:
-                        persistent_cache[cache_key] = compute_metric_matrix(
-                            system, aux_basis, metric
-                        ).to(dtype)
-                    matrices.append(persistent_cache[cache_key])
+                    matrix = persistent_cache.get(cache_key)
+                    if matrix is None:
+                        matrix = compute_metric_matrix(system, aux_basis, metric).to(
+                            dtype
+                        )
+                        persistent_cache.put(cache_key, matrix)
+                    matrices.append(matrix)
                 per_batch[aux_basis] = (
                     RaggedMetricMatrices.from_matrices(matrices)
                     if matrices
@@ -496,7 +551,7 @@ def _get_metric_matrices_transform_impl(
         metric,
         name_fn,
         dtype,
-        {} if cache_across_epochs else None,
+        _ByteBudgetCache(_metric_cache_max_bytes()) if cache_across_epochs else None,
     )
 
 

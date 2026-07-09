@@ -16,6 +16,8 @@ from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
 from metatrain.utils.pyscf_loss import (
+    BATCH_ROTATIONS_NAME,
+    BatchRotations,
     metric_matrix_name,
     ri_density_fit_constant_name,
     ri_projections_name,
@@ -556,6 +558,52 @@ def _ri_coefficients_pyscf_order_aligned(
 ########################################################################################
 
 
+def _unrotate_spherical_map(
+    tensor_map: TensorMap, rotations: BatchRotations
+) -> TensorMap:
+    """Undo the per-system rotational augmentation of a spherical TensorMap.
+
+    The augmenter applies ``v' = parity * D_l v`` along the ``o3_mu`` component
+    dimension (``parity = (-1)^l * sigma`` for inverted systems); this applies
+    the exact inverse, so quantities compared against *unrotated* references
+    (e.g. metric matrices cached on unrotated geometries) stay consistent:
+    ``Δc'ᵀ (D M Dᵀ) Δc' == (Dᵀ Δc')ᵀ M (Dᵀ Δc')``.
+
+    :param tensor_map: Densified spherical map with rows grouped consecutively
+        per system, in batch order.
+    :param rotations: The batch's rotation info, as stashed by the augmenter.
+    :return: The un-rotated map.
+    """
+    new_blocks = []
+    for key, block in tensor_map.items():
+        ell, sigma = int(key[0]), int(key[1])
+        values = block.values  # (rows, 2l+1, properties)
+        _, counts = torch.unique_consecutive(
+            block.samples.values[:, 0], return_counts=True
+        )
+        wigner = rotations.wigner[ell].to(dtype=values.dtype, device=values.device)
+        # inverse of v' = D v along the component dimension is Dᵀ v'
+        wigner_rows = torch.repeat_interleave(wigner, counts, dim=0)
+        new_values = torch.bmm(wigner_rows.transpose(1, 2), values)
+        parity = torch.where(
+            rotations.inverted.to(values.device),
+            float((-1) ** ell * sigma),
+            1.0,
+        ).to(values.dtype)
+        new_values = new_values * torch.repeat_interleave(parity, counts).reshape(
+            -1, 1, 1
+        )
+        new_blocks.append(
+            TensorBlock(
+                values=new_values,
+                samples=block.samples,
+                components=block.components,
+                properties=block.properties,
+            )
+        )
+    return TensorMap(tensor_map.keys, new_blocks)
+
+
 def _validate_coefficient_sizes(
     coefficient_sizes: list[int], basis_sizes: list[int]
 ) -> None:
@@ -648,6 +696,13 @@ class DensityMSELossViaC(LossInterface):
 
         tensor_map_pred = predictions[self.target]
         tensor_map_targ = targets[self.target]
+        rotations = extra_data.get(BATCH_ROTATIONS_NAME)
+        if rotations is not None:
+            # Training batches are rotationally augmented, but the metric
+            # matrices are cached on the unrotated geometries: un-rotate the
+            # coefficients so the quadratic form is evaluated consistently.
+            tensor_map_pred = _unrotate_spherical_map(tensor_map_pred, rotations)
+            tensor_map_targ = _unrotate_spherical_map(tensor_map_targ, rotations)
         delta_coefficients = _ri_coefficients_delta_pyscf_order(
             tensor_map_pred, tensor_map_targ
         )
@@ -747,6 +802,14 @@ class DensityMSELossViaW(LossInterface):
 
         tensor_map_pred = predictions[self.target]
         projection_map = extra_data[projection_name]
+        rotations = extra_data.get(BATCH_ROTATIONS_NAME)
+        if rotations is not None:
+            # See DensityMSELossViaC: metric matrices are cached unrotated, so
+            # both the coefficients and the projections are rotated back (the
+            # linear term is invariant under the shared rotation, the
+            # pre-computed constant needs no change).
+            tensor_map_pred = _unrotate_spherical_map(tensor_map_pred, rotations)
+            projection_map = _unrotate_spherical_map(projection_map, rotations)
 
         # Align predictions and projections under a shared NaN mask so both
         # flat vectors are the same length per system.

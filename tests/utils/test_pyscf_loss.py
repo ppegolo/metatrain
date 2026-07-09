@@ -174,3 +174,46 @@ def test_missing_pyscf_dependency(monkeypatch):
     finally:
         _import_pyscf_modules.cache_clear()
         _load_auxiliary_basis.cache_clear()
+
+
+def test_metric_cache_byte_budget_bounds_memory():
+    # The per-worker metric-matrix cache must stay within its byte budget on
+    # datasets too large to fit (the original unbounded dict OOM-killed
+    # multi-node runs on >1M-system datasets), evicting least-recently-used
+    # entries instead of growing without bound.
+    from metatrain.utils.atomic_basis.pyscf import _ByteBudgetCache
+
+    t = torch.zeros(100, dtype=torch.float32)  # 400 bytes each
+    cache = _ByteBudgetCache(max_bytes=1000)  # fits 2 entries
+
+    cache.put(("aux", 0), t)
+    cache.put(("aux", 1), t)
+    assert cache.get(("aux", 0)) is not None
+    assert cache.get(("aux", 1)) is not None
+
+    # 3rd entry exceeds the budget -> the least recently used entry (id 0,
+    # touched before id 1 by the gets above) is evicted
+    cache.put(("aux", 2), t)
+    assert cache.get(("aux", 0)) is None  # evicted (least recently used)
+    assert cache.get(("aux", 1)) is not None
+    assert cache.get(("aux", 2)) is not None
+
+    # re-putting an existing key must not double-count its bytes
+    cache.put(("aux", 1), t)
+    assert cache.get(("aux", 2)) is not None
+
+    # an entry larger than the whole budget is never cached
+    big = torch.zeros(1000, dtype=torch.float32)  # 4000 bytes
+    cache.put(("aux", 3), big)
+    assert cache.get(("aux", 3)) is None
+
+
+def test_metric_cache_budget_env_override(monkeypatch):
+    from metatrain.utils.atomic_basis.pyscf import (
+        DEFAULT_METRIC_CACHE_MAX_BYTES,
+        _metric_cache_max_bytes,
+    )
+
+    assert _metric_cache_max_bytes() == DEFAULT_METRIC_CACHE_MAX_BYTES
+    monkeypatch.setenv("METATRAIN_METRIC_CACHE_MAX_BYTES", "12345")
+    assert _metric_cache_max_bytes() == 12345

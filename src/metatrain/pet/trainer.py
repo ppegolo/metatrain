@@ -42,6 +42,7 @@ from metatrain.utils.neighbor_lists import (
 )
 from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.pyscf_loss import (
+    BatchRotations,
     RaggedMetricMatrices,
     get_density_fit_constant_transform,
     get_metric_matrices_transform,
@@ -75,7 +76,7 @@ def _unpack_batch_to(
     ragged = {
         key: extra_data.pop(key)
         for key in list(extra_data.keys())
-        if isinstance(extra_data[key], RaggedMetricMatrices)
+        if isinstance(extra_data[key], (RaggedMetricMatrices, BatchRotations))
     }
     systems, targets, extra_data = batch_to(
         systems, targets, extra_data, dtype=dtype, device=device
@@ -394,8 +395,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_keys=target_keys,
             callables=[
                 atomic_basis_transform,
-                rotational_augmenter.apply_random_augmentations,
+                # RI transforms run on the *unrotated* systems/targets: metric
+                # matrices are cached per system across epochs (the density
+                # losses un-rotate their residuals via the BatchRotations the
+                # augmenter stashes), and the density-fit constant is
+                # rotation-invariant.
                 *ri_train_transforms,
+                rotational_augmenter.apply_random_augmentations,
                 *base_callables,
             ],
             batch_atom_bounds=batch_atom_bounds,
@@ -1050,11 +1056,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
             return transforms
 
-        # Validation systems are identical every epoch (no augmentation), so
-        # their metric matrices can be cached across epochs in the persistent
-        # dataloader workers; training systems are rotated per epoch.
+        # Metric matrices are cached per system across epochs in the
+        # persistent dataloader workers: the train transforms run before the
+        # rotational augmenter (unrotated geometries; the density losses
+        # un-rotate their residuals instead), and validation applies no
+        # augmentation at all.
         return (
-            _build_transforms(metric_targets, cache_across_epochs=False),
+            _build_transforms(metric_targets, cache_across_epochs=True),
             _build_transforms(val_metric_targets, cache_across_epochs=True),
         )
 
