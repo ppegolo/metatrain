@@ -340,6 +340,52 @@ class RaggedMetricMatrices:
         return cls(flat, sizes)
 
 
+@dataclass
+class BatchRotations:
+    """Per-system rotational-augmentation info for one batch.
+
+    Stashed into ``extra_data`` by the rotational augmenter (under
+    ``"mtt::aux::rotations"``) and consumed by the density losses to un-rotate
+    coefficient residuals, so that metric matrices cached on the *unrotated*
+    geometries stay valid: ``Δcᵀ (D M Dᵀ) Δc == (Dᵀ Δc)ᵀ M (Dᵀ Δc)``.
+
+    Carried raw through the dataloader worker boundary, like
+    :class:`RaggedMetricMatrices`.
+
+    :param wigner: Per-``o3_lambda`` stacked real Wigner matrices, one
+        ``(n_systems, 2l+1, 2l+1)`` tensor per ``l``, in batch order.
+    :param inverted: Boolean tensor ``(n_systems,)``; whether each system's
+        augmentation includes an inversion.
+    """
+
+    wigner: dict[int, torch.Tensor]
+    inverted: torch.Tensor
+
+    def to(
+        self,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        non_blocking: bool = False,
+    ) -> "BatchRotations":
+        """Move/cast the Wigner blocks (mirrors ``Tensor.to``).
+
+        :param dtype: Target dtype (unchanged if ``None``).
+        :param device: Target device (unchanged if ``None``).
+        :param non_blocking: Forwarded to ``Tensor.to``.
+        :return: New :class:`BatchRotations` with moved tensors.
+        """
+        return BatchRotations(
+            {
+                ell: w.to(dtype=dtype, device=device, non_blocking=non_blocking)
+                for ell, w in self.wigner.items()
+            },
+            self.inverted.to(device=device, non_blocking=non_blocking),
+        )
+
+
+BATCH_ROTATIONS_NAME = "mtt::aux::rotations"
+
+
 def compute_ragged_metric_matrices(
     systems: list[System],
     aux_basis: str,
