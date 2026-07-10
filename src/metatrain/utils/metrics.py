@@ -481,7 +481,11 @@ class EquivarianceAccumulator:
         for name in target_names:
             if name == "energy":
                 self._specs["energy_l0"] = ("energy", "generic")
-            elif name in ("forces", "non_conservative_forces"):
+            elif name in (
+                "forces",
+                "non_conservative_force",
+                "non_conservative_forces",
+            ):
                 self._specs[name + "_l1"] = (name, "generic")
             elif name in ("stress", "non_conservative_stress"):
                 self._specs[name + "_l0"] = (name, "rank2_l0")
