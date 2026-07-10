@@ -188,6 +188,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
         else:
             logging.info(f"Training on device {device} with dtype {dtype}")
 
+        if self.hypers.get("compile", False):
+            # Opt-in torch.compile of the backbone's feature calculation: the
+            # collate/loss plumbing stays eager, but the launch-bound GNN math
+            # gets fused. dynamic=True avoids a recompile per batch shape.
+            # runs before the DDP wrap: ``model`` is still the raw PET here
+            model.backend.calculate_features = torch.compile(  # type: ignore[method-assign]
+                model.backend.calculate_features, dynamic=True
+            )
+            logging.info("torch.compile enabled for the PET backbone")
+
         # Apply fine-tuning strategy if provided
         if is_finetune:
             assert self.hypers["finetune"]["read_from"] is not None  # for mypy

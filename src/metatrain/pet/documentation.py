@@ -369,6 +369,12 @@ class TrainerHypers(TypedDict):
     memory."""
     num_epochs: int = 1000
     """Number of epochs."""
+    compile: bool = False
+    """Wrap the PET backbone's feature calculation in ``torch.compile`` (with
+    dynamic shapes) for training. Opt-in: compilation takes a few tens of
+    seconds up front and the first few batches trigger recompiles while the
+    dynamic shapes settle, but steady-state training steps get measurably
+    faster on GPU. Only affects training; exported models are unchanged."""
     warmup_fraction: float = 0.01
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 1e-4
