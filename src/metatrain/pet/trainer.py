@@ -234,6 +234,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
         batch_atom_bounds = (
             None if max_atoms is not None else self.hypers["batch_atom_bounds"]
         )
+        # The collate function only produces None batches when atom bounds are
+        # active; otherwise the per-batch skip check (an all_reduce in
+        # distributed mode) is pure overhead.
+        bounds_active = batch_atom_bounds is not None and any(
+            bound is not None for bound in batch_atom_bounds
+        )
         atomic_basis_transform, atomic_basis_reverse_transform = (
             get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
         )
@@ -605,10 +611,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
                 val_mae_calculator = MAEAccumulator(self.hypers["log_separate_blocks"])
 
-            train_loss = 0.0
+            is_log_epoch = (
+                epoch == start_epoch or epoch % self.hypers["log_interval"] == 0
+            )
+            # Accumulate the loss as a device tensor: a per-batch .item() (and,
+            # when distributed, a per-batch all_reduce) drains the CUDA queue
+            # and serializes the Python-side batch preparation with the GPU.
+            train_loss_acc: Optional[torch.Tensor] = None
             for batch in train_dataloader:
                 # Skip None batches (those outside batch_atom_bounds)
-                if should_skip_batch(batch, is_distributed, device):
+                if bounds_active and should_skip_batch(batch, is_distributed, device):
                     continue
 
                 optimizer.zero_grad()
@@ -640,41 +652,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     use_per_property_scales=True,
                 )
 
-                # Rescale predictions/targets to the physical units expected by
-                # the active RI loss type (density_mse_via_c / density_mse_via_w).
-                # For direct-c this is a no-op.
-                loss_predictions, loss_targets = self._prepare_for_ri_loss(
-                    predictions,
-                    targets,
-                    systems,
-                    model.module if is_distributed else model,
-                    density_mse_via_c_targets,
-                    density_mse_via_w_targets,
-                    train_targets,
-                )
-                train_loss_batch = loss_fn(loss_predictions, loss_targets, extra_data)
-
-                if is_distributed:
-                    # make sure all parameters contribute to the gradient calculation
-                    # to make torch DDP happy
-                    for param in model.parameters():
-                        train_loss_batch += 0.0 * param.sum()
-
-                train_loss_batch.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), self.hypers["grad_clip_norm"]
-                )
-                optimizer.step()
-                lr_scheduler.step()
-
-                if is_distributed:
-                    # sum the loss over all processes
-                    torch.distributed.all_reduce(train_loss_batch)
-                train_loss += train_loss_batch.item()
-
-                # Reapply scales and accumulate quantities for computing train metrics,
-                # but only if this is an epoch to log
-                if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+                # On log epochs, compute the per-target scaled maps once: they
+                # are needed for the metrics below and reused by the RI loss
+                # preparation.
+                scaled_predictions: Optional[Dict[str, Any]] = None
+                scaled_targets: Optional[Dict[str, Any]] = None
+                if is_log_epoch:
                     scaled_predictions = (
                         model.module if is_distributed else model
                     ).scaler(
@@ -692,6 +675,47 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         use_per_property_scales=False,
                     )
 
+                # Rescale predictions/targets to the physical units expected by
+                # the active RI loss type (density_mse_via_c / density_mse_via_w).
+                # For direct-c this is a no-op.
+                loss_predictions, loss_targets = self._prepare_for_ri_loss(
+                    predictions,
+                    targets,
+                    systems,
+                    model.module if is_distributed else model,
+                    density_mse_via_c_targets,
+                    density_mse_via_w_targets,
+                    train_targets,
+                    scaled_predictions=scaled_predictions,
+                    scaled_targets=scaled_targets,
+                )
+                train_loss_batch = loss_fn(loss_predictions, loss_targets, extra_data)
+
+                if is_distributed:
+                    # make sure all parameters contribute to the gradient calculation
+                    # to make torch DDP happy
+                    for param in model.parameters():
+                        train_loss_batch += 0.0 * param.sum()
+
+                train_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.hypers["grad_clip_norm"]
+                )
+                optimizer.step()
+                lr_scheduler.step()
+
+                detached_loss = train_loss_batch.detach()
+                train_loss_acc = (
+                    detached_loss
+                    if train_loss_acc is None
+                    else train_loss_acc + detached_loss
+                )
+
+                # Accumulate quantities for computing train metrics, but only if
+                # this is an epoch to log (scaled maps were computed above)
+                if is_log_epoch:
+                    assert scaled_predictions is not None
+                    assert scaled_targets is not None
                     if self.hypers["log_separate_blocks"]:
                         # if any atomic basis outputs are present and metrics are to be
                         # reported per-block, reverse the transform (i.e. sparsify)
@@ -713,8 +737,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             scaled_predictions, scaled_targets, extra_data
                         )
 
+            # One sync (and one distributed reduction) per epoch for the
+            # accumulated loss, instead of one per batch.
+            if train_loss_acc is None:
+                train_loss = 0.0
+            else:
+                if is_distributed:
+                    torch.distributed.all_reduce(train_loss_acc)
+                train_loss = train_loss_acc.item()
+
             # Compute train metrics if they are to be logged this epoch:
-            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+            if is_log_epoch:
                 finalized_train_info = train_rmse_calculator.finalize(
                     not_per_atom=["positions_gradients"] + per_structure_targets,
                     is_distributed=is_distributed,
@@ -733,11 +766,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             with torch.set_grad_enabled(
                 any(target_info.gradients for target_info in train_targets.values())
             ):  # keep gradients on if any of the targets require them
-                val_loss = 0.0
-                val_density_loss = 0.0
+                val_loss_acc: Optional[torch.Tensor] = None
+                val_density_acc: Optional[torch.Tensor] = None
                 for batch in val_dataloader:
                     # Skip None batches (those outside batch_atom_bounds)
-                    if should_skip_batch(batch, is_distributed, device):
+                    if bounds_active and should_skip_batch(
+                        batch, is_distributed, device
+                    ):
                         continue
 
                     systems, targets, extra_data = _unpack_batch_to(
@@ -805,10 +840,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     )
                     val_loss_batch = loss_fn(loss_predictions, loss_targets, extra_data)
 
-                    if is_distributed:
-                        # sum the loss over all processes
-                        torch.distributed.all_reduce(val_loss_batch)
-                    val_loss += val_loss_batch.item()
+                    detached_loss = val_loss_batch.detach()
+                    val_loss_acc = (
+                        detached_loss
+                        if val_loss_acc is None
+                        else val_loss_acc + detached_loss
+                    )
 
                     if log_density_loss:
                         # Compute the real-space density L2 metric:
@@ -820,10 +857,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         # log_separate_blocks sparsification below.
                         density_batch = density_loss_fn(
                             scaled_predictions, scaled_targets, extra_data
+                        ).detach()
+                        val_density_acc = (
+                            density_batch
+                            if val_density_acc is None
+                            else val_density_acc + density_batch
                         )
-                        if is_distributed:
-                            torch.distributed.all_reduce(density_batch)
-                        val_density_loss += density_batch.item()
 
                     if self.hypers["log_separate_blocks"]:
                         # if any atomic basis outputs are present and metrics are to be
@@ -846,6 +885,26 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             scaled_predictions, scaled_targets, extra_data
                         )
 
+            # One sync (and one distributed reduction) per epoch for the
+            # accumulated validation scalars.
+            val_scalars = torch.stack(
+                [
+                    (
+                        val_loss_acc
+                        if val_loss_acc is not None
+                        else torch.zeros((), device=device)
+                    ).double(),
+                    (
+                        val_density_acc
+                        if val_density_acc is not None
+                        else torch.zeros((), device=device)
+                    ).double(),
+                ]
+            )
+            if is_distributed:
+                torch.distributed.all_reduce(val_scalars)
+            val_loss, val_density_loss = val_scalars.tolist()
+
             # Compute val metrics:
             finalized_val_info = val_rmse_calculator.finalize(
                 not_per_atom=["positions_gradients"] + per_structure_targets,
@@ -862,7 +921,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
             # Now we log the information:
-            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+            if is_log_epoch:
                 finalized_train_info = {
                     "loss": train_loss,
                     **finalized_train_info,

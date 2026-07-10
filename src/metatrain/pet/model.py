@@ -1151,31 +1151,47 @@ def _extract_charge_spin_multiplicity(
     :return: ``(charges, spin_multiplicities)`` tensors of shape ``[n_systems]``,
         ``dtype=torch.long``.
     """
-    n_systems = len(systems)
-    charges = torch.zeros(n_systems, dtype=torch.long, device=device)
-    spin_multiplicities = torch.ones(n_systems, dtype=torch.long, device=device)
-    for i, system in enumerate(systems):
+    # Gather all per-system values first and validate them in one fused check:
+    # per-system torch.equal calls are host-device syncs that serialize the
+    # forward pass with the CPU (two per system per step).
+    charge_values: List[torch.Tensor] = []
+    spin_values: List[torch.Tensor] = []
+    for system in systems:
         if "charge" in system.known_data():
-            raw_charge = system.get_data("charge").block().values
-            if not torch.equal(raw_charge.round(), raw_charge):
-                raise ValueError(
-                    "charge must be an integer value, got "
-                    + str(raw_charge.item())
-                    + " for system "
-                    + str(i)
-                )
-            charges[i] = raw_charge.long().squeeze()
+            charge_values.append(
+                system.get_data("charge").block().values.reshape(-1)[:1].float()
+            )
+        else:
+            charge_values.append(torch.zeros(1, device=device))
         if "spin_multiplicity" in system.known_data():
-            raw_spin_multiplicity = system.get_data("spin_multiplicity").block().values
-            if not torch.equal(raw_spin_multiplicity.round(), raw_spin_multiplicity):
-                raise ValueError(
-                    "spin_multiplicity must be an integer value, got "
-                    + str(raw_spin_multiplicity.item())
-                    + " for system "
-                    + str(i)
-                )
-            spin_multiplicities[i] = raw_spin_multiplicity.long().squeeze()
-    return charges, spin_multiplicities
+            spin_values.append(
+                system.get_data("spin_multiplicity")
+                .block()
+                .values.reshape(-1)[:1]
+                .float()
+            )
+        else:
+            spin_values.append(torch.ones(1, device=device))
+
+    raw_charges = torch.cat(charge_values).to(device)
+    raw_spins = torch.cat(spin_values).to(device)
+    if not torch.equal(raw_charges.round(), raw_charges):
+        bad = int(torch.nonzero(raw_charges.round() != raw_charges)[0])
+        raise ValueError(
+            "charge must be an integer value, got "
+            + str(raw_charges[bad].item())
+            + " for system "
+            + str(bad)
+        )
+    if not torch.equal(raw_spins.round(), raw_spins):
+        bad = int(torch.nonzero(raw_spins.round() != raw_spins)[0])
+        raise ValueError(
+            "spin_multiplicity must be an integer value, got "
+            + str(raw_spins[bad].item())
+            + " for system "
+            + str(bad)
+        )
+    return raw_charges.long(), raw_spins.long()
 
 
 def get_last_layer_features_name(target_name: str) -> str:
