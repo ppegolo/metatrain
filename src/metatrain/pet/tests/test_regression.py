@@ -26,7 +26,6 @@ from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists,
 )
-from metatrain.utils.pyscf_loss import build_auxiliary_molecule
 
 from . import (
     DATASET_PATH,
@@ -51,6 +50,8 @@ def _get_aux_basis_irreps(
     aux_basis: str,
 ) -> dict[int, list[dict[str, int]]]:
     irreps: dict[int, list[dict[str, int]]] = {}
+
+    from metatrain.utils.atomic_basis.pyscf import build_auxiliary_molecule
 
     for atomic_type in atomic_types:
         auxmol = build_auxiliary_molecule(

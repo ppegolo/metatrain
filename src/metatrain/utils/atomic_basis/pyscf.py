@@ -14,6 +14,8 @@ import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
+from ..data.dataset import RawExtraPayload
+
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -279,7 +281,7 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
 
 
 @dataclass
-class RaggedMetricMatrices:
+class RaggedMetricMatrices(RawExtraPayload):
     """
     Per-system two-centre metric matrices stored ragged, with NO padding.
 
@@ -343,7 +345,7 @@ class RaggedMetricMatrices:
 
 
 @dataclass
-class BatchRotations:
+class BatchRotations(RawExtraPayload):
     """Per-system rotational-augmentation info for one batch.
 
     Stashed into ``extra_data`` by the rotational augmenter (under

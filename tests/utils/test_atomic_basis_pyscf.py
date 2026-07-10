@@ -4,7 +4,7 @@ import pytest
 import torch
 from metatomic.torch import System
 
-from metatrain.utils.pyscf_loss import (
+from metatrain.utils.atomic_basis.pyscf import (
     _load_auxiliary_basis,
     build_auxiliary_molecule,
     compute_coulomb_matrix,
@@ -164,7 +164,7 @@ def test_missing_pyscf_dependency(monkeypatch):
     # patched importlib entirely and make this test vacuous when pyscf is
     # installed. Clear them (and restore afterwards so later tests are
     # unaffected by cache state).
-    from metatrain.utils.pyscf_loss import _import_pyscf_modules
+    from metatrain.utils.atomic_basis.pyscf import _import_pyscf_modules
 
     _import_pyscf_modules.cache_clear()
     _load_auxiliary_basis.cache_clear()

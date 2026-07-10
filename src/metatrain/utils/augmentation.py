@@ -10,11 +10,7 @@ from scipy.spatial.transform import Rotation
 
 from . import torch_jit_script_unless_coverage
 from .data import TargetInfo
-from .pyscf_loss import (
-    BATCH_ROTATIONS_NAME,
-    BatchRotations,
-    RaggedMetricMatrices,
-)
+from .data.dataset import RawExtraPayload
 
 
 def get_random_rotation() -> Rotation:
@@ -197,12 +193,12 @@ class RotationalAugmenter:
         # Raw (non-TensorMap) payloads — cached metric matrices attached by
         # transforms that deliberately run on the unrotated data — cannot pass
         # through the TorchScript-typed augmentation core; carry them around it.
-        raw_extra: Dict[str, Union[RaggedMetricMatrices, BatchRotations]] = {}
+        raw_extra: Dict[str, RawExtraPayload] = {}
         if extra_data is not None:
             raw_extra = {
                 name: value
                 for name, value in extra_data.items()
-                if isinstance(value, (RaggedMetricMatrices, BatchRotations))
+                if isinstance(value, RawExtraPayload)
             }
             extra_data = {
                 name: value
@@ -230,6 +226,10 @@ class RotationalAugmenter:
         # density losses un-rotate their residuals with it, which keeps metric
         # matrices cached on the unrotated geometries valid).
         if wigner_D_matrices and extra_data is not None:
+            # Lazy import: only spherical-target training ever stashes this,
+            # and the atomic-basis package must not load for MLIP runs.
+            from .atomic_basis.pyscf import BATCH_ROTATIONS_NAME, BatchRotations
+
             extra_data[BATCH_ROTATIONS_NAME] = BatchRotations(
                 wigner=wigner_D_matrices,
                 inverted=inverted,

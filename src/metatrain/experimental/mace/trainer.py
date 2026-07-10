@@ -14,6 +14,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.atomic_basis.helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.data import (
     CollateFn,
     CombinedDataLoader,
@@ -21,9 +24,6 @@ from metatrain.utils.data import (
     get_num_workers,
     unpack_batch,
     validate_num_workers,
-)
-from metatrain.utils.data.atomic_basis_helpers import (
-    get_prepare_atomic_basis_targets_transform,
 )
 from metatrain.utils.distributed.batch_utils import should_skip_batch
 from metatrain.utils.distributed.distributed_data_parallel import (

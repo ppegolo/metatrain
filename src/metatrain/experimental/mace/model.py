@@ -23,11 +23,11 @@ from metatomic.torch import (
 
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import CompositionModel
-from metatrain.utils.data import DatasetInfo, TargetInfo
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )
+from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler

@@ -1,5 +1,15 @@
+"""Species-conditioned readout modules and their build registry.
+
+Architecture-agnostic last-layer readouts: a plain shared linear layer
+(:class:`LinearReadout`), species-conditioned linear/MLP readouts
+(:class:`Readout`), mixture-of-experts and residual-correction variants. Any
+architecture that predicts per-(block, species) quantities can build them via
+:func:`build_readout`.
+"""
+
+import inspect
 import math
-from typing import List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 import torch
 
@@ -844,10 +854,11 @@ class IrrepThenMoE(torch.nn.Module):
     :param in_features: Input feature dimension ``d``.
     :param out_features: Total output dimension for this block.
     :param n_species: Number of distinct atomic species.
-    :param d_irrep: Hidden dimension produced by the irrep MLP.
     :param num_experts: Total number of experts N.
     :param num_routed_experts: Z-gated routed experts I (1 ≤ I ≤ N).
     :param num_topk_experts: TopK experts K' selected per atom (1 ≤ K' ≤ I).
+    :param d_irrep: Hidden dimension produced by the irrep MLP.
+        Defaults to ``in_features``.
     :param embedding_dim: Species embedding dimension for the MoE router.
     """
 
@@ -856,13 +867,16 @@ class IrrepThenMoE(torch.nn.Module):
         in_features: int,
         out_features: int,
         n_species: int,
-        d_irrep: int,
         num_experts: int,
         num_routed_experts: int,
         num_topk_experts: int,
+        d_irrep: Optional[int] = None,
         embedding_dim: int = 16,
     ) -> None:
         super().__init__()
+
+        if d_irrep is None:
+            d_irrep = in_features
 
         # Stage 1: per-irrep shared feature extraction
         self.irrep_mlp = torch.nn.Sequential(
@@ -891,3 +905,76 @@ class IrrepThenMoE(torch.nn.Module):
         :return: Same leading dims as ``features``, last dim ``out_features``.
         """
         return self.readout(self.irrep_mlp(features), species_idx)
+
+
+READOUT_REGISTRY: Dict[str, type] = {
+    "ZConditioned": Readout,
+    "MoE": MoEReadout,
+    "IrrepThenZConditioned": IrrepThenZConditioned,
+    "IrrepThenMoE": IrrepThenMoE,
+    "IrrepResidual": IrrepResidualReadout,
+    "IrrepResidualZOutput": IrrepResidualZOutput,
+    "IrrepResidualFiLM": IrrepResidualFiLM,
+    # alias: the depth-parameterised variant with a single hidden layer
+    "IrrepResidualZCorrection": IrrepResidualZCorrectionDeep,
+    "IrrepResidualZCorrectionDeep": IrrepResidualZCorrectionDeep,
+}
+
+# constructor arguments every readout receives positionally
+_BASE_READOUT_ARGS = ("in_features", "out_features", "n_species")
+
+# per-name defaults that differ from the constructor defaults
+_READOUT_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "ZConditioned": {"z_conditioned": True},
+    "IrrepResidualZCorrection": {"num_correction_layers": 1},
+}
+
+
+def allowed_readout_args(name: str) -> Set[str]:
+    """Configurable constructor arguments of a registered readout.
+
+    Derived from the constructor signature, so it cannot drift from the
+    implementation.
+
+    :param name: Registered readout name.
+    :return: Names of accepted ``args`` keys.
+    """
+    cls = READOUT_REGISTRY[name]
+    signature = inspect.signature(cls)
+    fixed = set(_BASE_READOUT_ARGS) | {"self"}
+    fixed |= set(_READOUT_DEFAULTS.get(name, {}))
+    return {p for p in signature.parameters if p not in fixed}
+
+
+def build_readout(
+    name: str,
+    args: Mapping[str, Any],
+    in_features: int,
+    out_features: int,
+    n_species: int,
+) -> torch.nn.Module:
+    """Build a readout module from its registered name and config args.
+
+    :param name: Registered readout name (see :data:`READOUT_REGISTRY`).
+    :param args: Configuration arguments for the readout.
+    :param in_features: Input feature dimension.
+    :param out_features: Output dimension for the block.
+    :param n_species: Number of atomic species.
+    :return: The readout module.
+    """
+    if name not in READOUT_REGISTRY:
+        raise ValueError(
+            f"Unknown readout_type name: '{name}'. "
+            f"Available: {', '.join(sorted(READOUT_REGISTRY))}."
+        )
+    allowed = allowed_readout_args(name)
+    unknown = set(args) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown readout_type args for '{name}': "
+            f"{', '.join(sorted(unknown))}. "
+            f"Allowed: {', '.join(sorted(allowed)) or '(none)'}."
+        )
+    kwargs: Dict[str, Any] = dict(_READOUT_DEFAULTS.get(name, {}))
+    kwargs.update(args)
+    return READOUT_REGISTRY[name](in_features, out_features, n_species, **kwargs)

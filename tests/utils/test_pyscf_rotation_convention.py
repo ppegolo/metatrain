@@ -22,7 +22,10 @@ import torch
 from metatomic.torch import System
 from scipy.spatial.transform import Rotation
 
-from metatrain.utils.pyscf_loss import build_auxiliary_molecule, compute_metric_matrix
+from metatrain.utils.atomic_basis.pyscf import (
+    build_auxiliary_molecule,
+    compute_metric_matrix,
+)
 
 
 pyscf = pytest.importorskip("pyscf")

@@ -43,8 +43,18 @@ from metatrain.utils.data.target_info import (
     get_generic_target_info,
 )
 from metatrain.utils.external_naming import to_external_name
-from metatrain.utils.pyscf_loss import BatchRotations, RaggedMetricMatrices
 from metatrain.utils.units import get_gradient_units
+
+
+class RawExtraPayload:
+    """Marker base class for non-TensorMap extra-data payloads.
+
+    Entries in a batch's ``extra`` dictionary that subclass this are carried
+    RAW through the dataloader worker boundary (as plain tensors via shared
+    memory) instead of being serialised with ``save_buffer``. Subclasses must
+    implement ``to(dtype=..., device=..., non_blocking=...)`` so the trainer
+    can move them alongside the rest of the batch.
+    """
 
 
 def _lock_exclusive(lock_file: IO[str]) -> None:
@@ -678,17 +688,15 @@ class CollateFn:
 
         target_names = list(targets.keys())
         # Partition extra data. TensorMaps are serialised into the blob via
-        # save_buffer (float64 only). Non-TensorMap payloads (the ragged metric
-        # matrices and the per-batch rotation info for density losses) are
-        # carried RAW alongside the blob: this avoids save_buffer's
+        # save_buffer (float64 only). RawExtraPayload entries (e.g. the ragged
+        # metric matrices and per-batch rotation info used by density losses)
+        # are carried RAW alongside the blob: this avoids save_buffer's
         # float64-only constraint and the padding/extra copy, and lets them
         # ride through the worker boundary as plain tensors.
-        # NB: metatensor's TensorMap is a TorchScript class and cannot be used as the
-        # second argument to isinstance(), so we test for the raw types instead.
         raw_extra = {
             name: value
             for name, value in extra.items()
-            if isinstance(value, (RaggedMetricMatrices, BatchRotations))
+            if isinstance(value, RawExtraPayload)
         }
         extra_names = [name for name in extra if name not in raw_extra]
 

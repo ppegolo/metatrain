@@ -11,7 +11,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
-from metatrain.utils.additive import add_additive, get_remove_additive_transform
+from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.atomic_basis import get_trainer_hooks
+from metatrain.utils.atomic_basis.helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.augmentation import RotationalAugmenter
 from metatrain.utils.data import (
     CollateFn,
@@ -22,9 +26,7 @@ from metatrain.utils.data import (
     unpack_batch,
     validate_num_workers,
 )
-from metatrain.utils.data.atomic_basis_helpers import (
-    get_prepare_atomic_basis_targets_transform,
-)
+from metatrain.utils.data.dataset import RawExtraPayload
 from metatrain.utils.distributed.batch_utils import should_skip_batch
 from metatrain.utils.distributed.distributed_data_parallel import (
     DistributedDataParallel,
@@ -34,21 +36,13 @@ from metatrain.utils.evaluate_model import evaluate_model
 from metatrain.utils.finetuning import apply_finetuning_strategy
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
-from metatrain.utils.loss import DensityMSELossViaC, LossAggregator, LossSpecification
+from metatrain.utils.loss import LossAggregator, LossSpecification
 from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator, get_selected_metric
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists_transform,
 )
 from metatrain.utils.per_atom import average_by_num_atoms
-from metatrain.utils.pyscf_loss import (
-    BatchRotations,
-    RaggedMetricMatrices,
-    get_density_fit_constant_transform,
-    get_metric_matrices_transform,
-    resolve_ri_aux_basis,
-    ri_projections_name,
-)
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.system_data import get_system_data_transform
 from metatrain.utils.transfer import batch_to
@@ -63,9 +57,10 @@ def _unpack_batch_to(
 ) -> tuple[List[System], Dict[str, TensorMap], Dict[str, Any]]:
     """Unpack a batch and move it to ``dtype``/``device``.
 
-    Ragged metric matrices (:py:class:`RaggedMetricMatrices`) are popped out before
-    :func:`batch_to`, which is TorchScript-typed ``Dict[str, TensorMap]`` and cannot
-    accept them, then moved and reattached. No-op for batches without such entries.
+    Raw payloads (:class:`~metatrain.utils.data.dataset.RawExtraPayload`, e.g.
+    ragged metric matrices) are popped out before :func:`batch_to`, which is
+    TorchScript-typed ``Dict[str, TensorMap]`` and cannot accept them, then
+    moved and reattached. No-op for batches without such entries.
 
     :param batch: Collated batch as produced by the dataloader.
     :param dtype: Target dtype.
@@ -76,7 +71,7 @@ def _unpack_batch_to(
     ragged = {
         key: extra_data.pop(key)
         for key in list(extra_data.keys())
-        if isinstance(extra_data[key], (RaggedMetricMatrices, BatchRotations))
+        if isinstance(extra_data[key], RawExtraPayload)
     }
     systems, targets, extra_data = batch_to(
         systems, targets, extra_data, dtype=dtype, device=device
@@ -360,22 +355,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
         model.scaler.to(device)
         model.scaler.scales_to(device=device, dtype=torch.float64)
 
-        # Classify which targets use each RI loss type (needed for in-loop scaling).
-        density_mse_via_c_targets: set[str] = {
-            name
-            for name, spec in loss_hypers.items()
-            if spec.get("type") == "density_mse_via_c"
-        }
-        density_mse_via_w_targets: set[str] = {
-            name
-            for name, spec in loss_hypers.items()
-            if spec.get("type") == "density_mse_via_w"
-        }
-        log_density_loss: bool = bool(self.hypers.get("log_density_loss", False))
-
-        ri_train_transforms, ri_val_transforms = self._get_ri_transforms(
-            loss_hypers, dtype
+        # Target-type-specific orchestration (currently: atomic-basis RI
+        # density training) is delegated to hooks; the no-op NullTrainerHooks
+        # is returned when nothing of the sort is configured.
+        target_hooks = get_trainer_hooks(
+            loss_hypers,
+            train_targets,
+            self.hypers["ri_aux_basis"],
+            bool(self.hypers.get("log_density_loss", False)),
         )
+        ri_train_transforms, ri_val_transforms = target_hooks.collate_transforms(dtype)
 
         # Create collate functions
 
@@ -578,27 +567,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         per_structure_targets = self.hypers["per_structure_targets"]
 
-        # Create the validation density-loss evaluator (Δc^T S Δc) if needed;
-        # it is only evaluated on the validation set.
-        if log_density_loss:
-            # Use the first (and typically only) RI target for the density metric.
-            # Non-RI losses (e.g. an energy MSE listed first) must not be picked:
-            # DensityMSELossViaC only makes sense on RI-coefficient targets.
-            # _get_ri_transforms already raised if no RI loss is configured.
-            _ri_target = next(
-                name
-                for name in loss_hypers
-                if name in density_mse_via_c_targets
-                or name in density_mse_via_w_targets
-            )
-            density_loss_fn = DensityMSELossViaC(
-                name=_ri_target,
-                gradient=None,
-                weight=1.0,
-                reduction="mean",
-                metric="overlap",
-            )
-
         # Log the initial learning rate:
         logging.info(f"Base learning rate: {self.hypers['learning_rate']}")
 
@@ -688,14 +656,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 # Rescale predictions/targets to the physical units expected by
                 # the active RI loss type (density_mse_via_c / density_mse_via_w).
                 # For direct-c this is a no-op.
-                loss_predictions, loss_targets = self._prepare_for_ri_loss(
+                loss_predictions, loss_targets = target_hooks.prepare_for_loss(
                     predictions,
                     targets,
                     systems,
                     model.module if is_distributed else model,
-                    density_mse_via_c_targets,
-                    density_mse_via_w_targets,
-                    train_targets,
                     scaled_predictions=scaled_predictions,
                     scaled_targets=scaled_targets,
                 )
@@ -777,7 +742,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 any(target_info.gradients for target_info in train_targets.values())
             ):  # keep gradients on if any of the targets require them
                 val_loss_acc: Optional[torch.Tensor] = None
-                val_density_acc: Optional[torch.Tensor] = None
                 for batch in val_dataloader:
                     # Skip None batches (those outside batch_atom_bounds)
                     if bounds_active and should_skip_batch(
@@ -837,14 +801,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         use_per_property_scales=False,
                     )
 
-                    loss_predictions, loss_targets = self._prepare_for_ri_loss(
+                    loss_predictions, loss_targets = target_hooks.prepare_for_loss(
                         predictions,
                         targets,
                         systems,
                         model.module if is_distributed else model,
-                        density_mse_via_c_targets,
-                        density_mse_via_w_targets,
-                        train_targets,
                         scaled_predictions=scaled_predictions,
                         scaled_targets=scaled_targets,
                     )
@@ -857,22 +818,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         else val_loss_acc + detached_loss
                     )
 
-                    if log_density_loss:
-                        # Compute the real-space density L2 metric:
-                        # L = Δc^T S Δc, where Δc = c_ML - c_RI (CM-removed).
-                        # scaled_predictions = c_ML - CM, scaled_targets = c_RI - CM,
-                        # so their difference is Δc.  Overlap S is in extra_data when
-                        # ri_aux_basis is set and log_density_loss is True.
-                        # This must run on the dense maps, i.e. before the
-                        # log_separate_blocks sparsification below.
-                        density_batch = density_loss_fn(
-                            scaled_predictions, scaled_targets, extra_data
-                        ).detach()
-                        val_density_acc = (
-                            density_batch
-                            if val_density_acc is None
-                            else val_density_acc + density_batch
-                        )
+                    # Extra target-type metrics (e.g. the density L2 metric)
+                    # accumulate on the dense maps, i.e. before the
+                    # log_separate_blocks sparsification below.
+                    target_hooks.update_validation_metrics(
+                        scaled_predictions, scaled_targets, extra_data
+                    )
 
                     if self.hypers["log_separate_blocks"]:
                         # if any atomic basis outputs are present and metrics are to be
@@ -897,23 +848,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
             # One sync (and one distributed reduction) per epoch for the
             # accumulated validation scalars.
-            val_scalars = torch.stack(
-                [
-                    (
-                        val_loss_acc
-                        if val_loss_acc is not None
-                        else torch.zeros((), device=device)
-                    ).double(),
-                    (
-                        val_density_acc
-                        if val_density_acc is not None
-                        else torch.zeros((), device=device)
-                    ).double(),
-                ]
+            val_loss_total = (
+                val_loss_acc
+                if val_loss_acc is not None
+                else torch.zeros((), device=device)
             )
             if is_distributed:
-                torch.distributed.all_reduce(val_scalars)
-            val_loss, val_density_loss = val_scalars.tolist()
+                torch.distributed.all_reduce(val_loss_total)
+            val_loss = float(val_loss_total.item())
 
             # Compute val metrics:
             finalized_val_info = val_rmse_calculator.finalize(
@@ -940,8 +882,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 "loss": val_loss,
                 **finalized_val_info,
             }
-            if log_density_loss:
-                finalized_val_info["density_loss"] = val_density_loss
+            finalized_val_info.update(
+                target_hooks.finalize_validation_metrics(is_distributed, device)
+            )
 
             if epoch == start_epoch:
                 metric_logger = MetricLogger(
@@ -1014,258 +957,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
             checkpoint,
             check_file_extension(path, ".ckpt"),
         )
-
-    def _get_ri_transforms(
-        self,
-        loss_hypers: Dict[str, LossSpecification],
-        dtype: torch.dtype = torch.float64,
-    ) -> tuple[list[Callable], list[Callable]]:
-        """
-        Build the collate transforms required for RI density losses.
-
-        The validation transforms additionally include the overlap-matrix
-        computation for the RI targets when ``log_density_loss`` is enabled; the
-        training transforms never do, since the density metric is only evaluated
-        on the validation set.
-
-        Transforms run *before* CM removal and scaling, which is necessary for the
-        density-fit constant pre-computation.
-
-        :param loss_hypers: Per-target loss specifications from the training hypers.
-        :param dtype: dtype of the metric matrices. The matrices are stored ragged
-            (:py:class:`RaggedMetricMatrices`) and carried raw past ``save_buffer``,
-            unlike the old packed-TensorMap path — they can be the model dtype
-            (e.g. float32), halving their memory/transport. Casting matches the recast
-            ``batch_to`` applied before, so training numerics are unchanged.
-        :return: ``(train_transforms, val_transforms)`` collate transform lists.
-        """
-        ri_loss_types = {"density_mse_via_c", "density_mse_via_w"}
-        ri_aux_basis = self.hypers["ri_aux_basis"]
-        log_density_loss = bool(self.hypers.get("log_density_loss", False))
-
-        # Only losses of an RI type ever need metric matrices; other targets
-        # (e.g. an energy MSE in the same config) must not trigger PySCF work.
-        ri_target_specs = {
-            name: spec
-            for name, spec in loss_hypers.items()
-            if spec.get("type", "mse") in ri_loss_types
-        }
-
-        if ri_target_specs and ri_aux_basis is None:
-            raise ValueError(
-                "PET training with RI density losses ('density_mse_via_c', "
-                "'density_mse_via_w') requires 'ri_aux_basis' to be set."
-            )
-        if log_density_loss and not ri_target_specs:
-            raise ValueError(
-                "'log_density_loss' requires at least one loss of type "
-                "'density_mse_via_c' or 'density_mse_via_w'."
-            )
-        if not ri_target_specs:
-            return [], []
-
-        # Build per-metric, per-target → aux_basis mappings.
-        metric_targets: dict[str, dict[str, str]] = {}  # metric → {target: aux_basis}
-        # Maps density_mse_via_w target name → the extra_data key for its projections.
-        density_fit_target_to_proj_key: dict[str, str] = {}
-
-        for target_name, target_spec in ri_target_specs.items():
-            metric = cast(str, target_spec.get("metric", "overlap"))
-            aux_basis = resolve_ri_aux_basis(
-                target_name,
-                cast(str, ri_aux_basis)
-                if isinstance(ri_aux_basis, str)
-                else cast(dict, ri_aux_basis),
-            )
-            metric_targets.setdefault(metric, {})[target_name] = aux_basis
-            if target_spec.get("type") == "density_mse_via_w":
-                proj_key = cast(
-                    str,
-                    target_spec.get(
-                        "projections_key", ri_projections_name(target_name)
-                    ),
-                )
-                density_fit_target_to_proj_key[target_name] = proj_key
-
-        # The density-loss validation metric additionally needs overlap matrices
-        # for the RI targets. Only the validation dataloaders pay for them: the
-        # training loop never evaluates the density metric.
-        val_metric_targets = {
-            metric: dict(targets_map) for metric, targets_map in metric_targets.items()
-        }
-        if log_density_loss:
-            for target_name in ri_target_specs:
-                aux_basis = resolve_ri_aux_basis(
-                    target_name,
-                    cast(str, ri_aux_basis)
-                    if isinstance(ri_aux_basis, str)
-                    else cast(dict, ri_aux_basis),
-                )
-                val_metric_targets.setdefault("overlap", {}).setdefault(
-                    target_name, aux_basis
-                )
-
-        # Build transform lists: one matrix transform per metric, plus the
-        # density-fit constant (needed by the loss in both train and val;
-        # must run before CM removal and scaling).
-        def _build_transforms(
-            metric_targets: dict[str, dict[str, str]],
-            cache_across_epochs: bool,
-        ) -> list[Callable]:
-            transforms: list[Callable] = []
-            for metric, targets_map in metric_targets.items():
-                transforms.append(
-                    get_metric_matrices_transform(
-                        targets_map, metric, dtype, cache_across_epochs
-                    )
-                )
-            if density_fit_target_to_proj_key:
-                transforms.append(
-                    get_density_fit_constant_transform(density_fit_target_to_proj_key)
-                )
-            return transforms
-
-        # Metric matrices are cached per system across epochs in the
-        # persistent dataloader workers: the train transforms run before the
-        # rotational augmenter (unrotated geometries; the density losses
-        # un-rotate their residuals instead), and validation applies no
-        # augmentation at all.
-        return (
-            _build_transforms(metric_targets, cache_across_epochs=True),
-            _build_transforms(val_metric_targets, cache_across_epochs=True),
-        )
-
-    def _prepare_for_ri_loss(
-        self,
-        predictions: Dict[str, Any],
-        targets: Dict[str, Any],
-        systems: List[System],
-        inner_model: torch.nn.Module,
-        density_mse_via_c_targets: set[str],
-        density_mse_via_w_targets: set[str],
-        train_targets: Dict[str, Any],
-        scaled_predictions: Optional[Dict[str, Any]] = None,
-        scaled_targets: Optional[Dict[str, Any]] = None,
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        Rescale predictions (and targets for density_mse_via_c) to the physical units
-        required by the active RI loss type before passing to the loss function.
-
-        direct-c:
-            No change.  Predictions = (c_ML − CM)/σ_t, targets = (c_RI − CM)/σ_t.
-
-        density_mse_via_c  (L = Δc^T M Δc):
-            Multiply both by σ_t.
-            Predictions → c_ML − CM,  targets → c_RI − CM.
-
-        density_mse_via_w  (L = c_ML^T M c_ML − 2 c_ML^T w):
-            Multiply predictions by σ_t, then add CM back.
-            Predictions → c_ML.  Targets (c_RI) are not used by the loss module;
-            the reference data are w_RI and the constant, both in extra_data.
-
-        :param predictions: Model predictions per target.
-        :param targets: Reference targets per target name.
-        :param systems: Systems in the batch.
-        :param inner_model: Unwrapped model (no DDP wrapper).
-        :param density_mse_via_c_targets: Targets trained with ``density_mse_via_c``.
-        :param density_mse_via_w_targets: Targets trained with ``density_mse_via_w``.
-        :param train_targets: Target infos seen by the model during training.
-        :param scaled_predictions: Optional precomputed ``scaler(predictions)``
-            (same flags as used here); avoids rescaling twice when the caller
-            already needs the scaled maps, as in the validation loop.
-        :param scaled_targets: Optional precomputed ``scaler(targets)``.
-        :return: ``(predictions, targets)`` rescaled as described above.
-        """
-        if not density_mse_via_c_targets and not density_mse_via_w_targets:
-            return predictions, targets
-
-        all_ri_targets = density_mse_via_c_targets | density_mse_via_w_targets
-        loss_predictions = dict(predictions)
-        loss_targets = dict(targets)
-
-        # Apply σ_t to predictions for all RI targets that need physical-unit
-        # rescaling, in one scaler call (or reuse the caller's scaled maps).
-        pred_names = [t for t in all_ri_targets if t in predictions]
-        if pred_names:
-            rescaled = (
-                scaled_predictions
-                if scaled_predictions is not None
-                else inner_model.scaler(
-                    systems,
-                    {t: predictions[t] for t in pred_names},
-                    remove=False,
-                    use_per_target_scales=True,
-                    use_per_property_scales=False,
-                )
-            )
-            for target_name in pred_names:
-                loss_predictions[target_name] = rescaled[target_name]
-
-        # Apply σ_t to targets for density_mse_via_c (so both sides are CM-removed).
-        targ_names = [t for t in density_mse_via_c_targets if t in targets]
-        if targ_names:
-            rescaled = (
-                scaled_targets
-                if scaled_targets is not None
-                else inner_model.scaler(
-                    systems,
-                    {t: targets[t] for t in targ_names},
-                    remove=False,
-                    use_per_target_scales=True,
-                    use_per_property_scales=False,
-                )
-            )
-            for target_name in targ_names:
-                loss_targets[target_name] = rescaled[target_name]
-
-        # Add CM back to predictions for density_mse_via_w.
-        if density_mse_via_w_targets:
-            loss_predictions = self._add_composition_model_contribution(
-                inner_model,
-                systems,
-                loss_predictions,
-                train_targets,
-                density_mse_via_w_targets,
-            )
-
-        return loss_predictions, loss_targets
-
-    def _add_composition_model_contribution(
-        self,
-        inner_model: torch.nn.Module,
-        systems: List[System],
-        predictions: Dict[str, Any],
-        train_targets: Dict[str, Any],
-        target_names: set[str],
-    ) -> Dict[str, Any]:
-        """
-        Add composition-model (CM) contributions back to predictions.
-
-        This reverses the CM-removal applied by the collate pipeline, giving
-        fully-reconstructed RI coefficients c_ML = (c_ML − CM) + CM.
-        CM values are detached so no gradient flows through them.
-
-        :param inner_model: Unwrapped model holding the composition model.
-        :param systems: Systems in the batch.
-        :param predictions: CM-removed model predictions per target.
-        :param train_targets: Target infos seen by the model during training.
-        :param target_names: Targets to add the CM contribution back to.
-        :return: Predictions with CM contributions added back.
-        """
-        additive_model = inner_model.additive_models[0]
-        cm_targets = {
-            k: predictions[k]
-            for k in target_names
-            if k in train_targets and k in additive_model.outputs and k in predictions
-        }
-        if not cm_targets:
-            return predictions
-
-        # add_additive detaches the CM values, so no gradient flows through them.
-        updated = add_additive(systems, cm_targets, additive_model, train_targets)
-        new_predictions = dict(predictions)
-        new_predictions.update(updated)
-        return new_predictions
 
     @classmethod
     def load_checkpoint(

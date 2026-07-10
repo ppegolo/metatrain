@@ -7,6 +7,12 @@ import pytest
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 
+from metatrain.utils.atomic_basis.pyscf import (
+    RaggedMetricMatrices,
+    overlap_matrix_name,
+    ri_density_fit_constant_name,
+    ri_projections_name,
+)
 from metatrain.utils.data import TargetInfo
 from metatrain.utils.loss import (
     DensityMSELossViaC,
@@ -25,12 +31,6 @@ from metatrain.utils.loss import (
     _ri_coefficients_delta_pyscf_order,
     _ri_coefficients_pyscf_order,
     create_loss,
-)
-from metatrain.utils.pyscf_loss import (
-    RaggedMetricMatrices,
-    overlap_matrix_name,
-    ri_density_fit_constant_name,
-    ri_projections_name,
 )
 
 
@@ -902,7 +902,7 @@ def test_density_fit_constant_and_loss_align_by_system_id():
     """Constants are keyed by native system id and matched to the predictions'
     per-system losses by id, not by position: native ids are arbitrary storage
     entry numbers for a shuffled DiskDataset (e.g. [523, 7])."""
-    from metatrain.utils.pyscf_loss import _density_fit_constant_transform_impl
+    from metatrain.utils.atomic_basis.pyscf import _density_fit_constant_transform_impl
 
     target_name = "mtt::ri"
     # appearance order [523, 7]; sorted id order [7, 523]
@@ -966,7 +966,7 @@ def test_density_fit_constant_single_system_nonzero_id():
     """A batch of one system with a nonzero native id must receive its constant
     exactly (previously the constant vector was indexed 0..max_id, silently
     broadcasting and diluting the mean)."""
-    from metatrain.utils.pyscf_loss import _density_fit_constant_transform_impl
+    from metatrain.utils.atomic_basis.pyscf import _density_fit_constant_transform_impl
 
     target_name = "mtt::ri"
     samples = [[5, 0]]

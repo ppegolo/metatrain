@@ -4,7 +4,7 @@
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Type
 
 import metatensor.torch as mts
 import torch
@@ -15,13 +15,10 @@ from torch.nn.modules.loss import _Loss
 from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
-from metatrain.utils.pyscf_loss import (
-    BATCH_ROTATIONS_NAME,
-    BatchRotations,
-    metric_matrix_name,
-    ri_density_fit_constant_name,
-    ri_projections_name,
-)
+
+
+if TYPE_CHECKING:
+    from metatrain.utils.atomic_basis.pyscf import BatchRotations
 
 
 @with_config(ConfigDict(extra="allow"))
@@ -576,7 +573,7 @@ def _ri_coefficients_pyscf_order_aligned(
 
 
 def _unrotate_spherical_map(
-    tensor_map: TensorMap, rotations: BatchRotations
+    tensor_map: TensorMap, rotations: "BatchRotations"
 ) -> TensorMap:
     """Undo the per-system rotational augmentation of a spherical TensorMap.
 
@@ -706,6 +703,13 @@ class DensityMSELossViaC(LossInterface):
         assert extra_data is not None, (
             "DensityMSELossViaC requires extra_data with the packed metric matrix."
         )
+        # Lazy import: the atomic-basis machinery must not load for users
+        # who never configure a density loss.
+        from metatrain.utils.atomic_basis.pyscf import (
+            BATCH_ROTATIONS_NAME,
+            metric_matrix_name,
+        )
+
         mat_name = metric_matrix_name(self.target, self.metric)
         assert mat_name in extra_data, (
             f"DensityMSELossViaC requires '{mat_name}' in extra_data"
@@ -789,6 +793,8 @@ class DensityMSELossViaW(LossInterface):
         projections_key: Optional[str] = None,
     ):
         super().__init__(name, gradient, weight, reduction)
+        from metatrain.utils.atomic_basis.pyscf import ri_projections_name
+
         self.metric = metric
         self.projections_key = (
             projections_key
@@ -810,6 +816,14 @@ class DensityMSELossViaW(LossInterface):
             "DensityMSELossViaW requires extra_data with the packed metric matrix "
             "and RI projections."
         )
+        # Lazy import: the atomic-basis machinery must not load for users
+        # who never configure a density loss.
+        from metatrain.utils.atomic_basis.pyscf import (
+            BATCH_ROTATIONS_NAME,
+            metric_matrix_name,
+            ri_density_fit_constant_name,
+        )
+
         mat_name = metric_matrix_name(self.target, self.metric)
         projection_name = self.projections_key
         assert mat_name in extra_data, (

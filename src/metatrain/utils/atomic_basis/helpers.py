@@ -7,7 +7,7 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
 from ..data import DatasetInfo
-from .target_info import TargetInfo
+from ..data.target_info import TargetInfo
 
 
 # ===== General utilities

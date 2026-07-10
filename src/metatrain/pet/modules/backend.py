@@ -3,18 +3,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ...utils.readouts import LinearReadout, Readout, build_readout
 from ..documentation import ModelHypers
-from .atomic_basis import (
-    IrrepResidualFiLM,
-    IrrepResidualReadout,
-    IrrepResidualZCorrectionDeep,
-    IrrepResidualZOutput,
-    IrrepThenMoE,
-    IrrepThenZConditioned,
-    LinearReadout,
-    MoEReadout,
-    Readout,
-)
 from .conditioning import SystemConditioningEmbedding
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
@@ -182,156 +172,32 @@ class PETBackend(torch.nn.Module):
         """
         Factory: return the readout module for one output block.
 
-        For non-atomic-basis targets (or when ``readout_type`` is ``None``),
-        returns a plain shared linear layer (:class:`LinearReadout`, a
+        Non-atomic-basis targets (or ``readout_type: null``) get a plain shared
+        linear layer (:class:`~metatrain.utils.readouts.LinearReadout`, a
         ``torch.nn.Linear`` with checkpoint-compatible parameter names).
-
-        For atomic basis targets with ``readout_type`` set, dispatches on
-        ``readout_type["name"]``:
-
-        - ``"ZConditioned"``        — :class:`Readout`
-        - ``"MoE"``                 — :class:`MoEReadout`
-        - ``"IrrepThenZConditioned"``— :class:`IrrepThenZConditioned`
-        - ``"IrrepThenMoE"``        — :class:`IrrepThenMoE`
-        - ``"IrrepResidual"``       — :class:`IrrepResidualReadout`
-        - ``"IrrepResidualZOutput"``— :class:`IrrepResidualZOutput`
-        - ``"IrrepResidualFiLM"``   — :class:`IrrepResidualFiLM`
-        - ``"IrrepResidualZCorrection"`` /
-          ``"IrrepResidualZCorrectionDeep"`` —
-          :class:`IrrepResidualZCorrectionDeep`
-
-        All returned modules share ``forward(features, species_idx)`` so they
-        are drop-in replaceable in the model's ``ModuleDict`` containers.
+        Atomic-basis targets with ``readout_type`` set are dispatched through
+        :func:`~metatrain.utils.readouts.build_readout`; all readouts share
+        ``forward(features, species_idx)``, so they are drop-in replaceable in
+        the model's ``ModuleDict`` containers.
 
         :param in_features: Input feature dimension (``d_head``).
         :param out_features: Output dimension for this block.
         :param is_atomic_basis: Whether the target is an atomic-basis target.
         :return: The readout module.
         """
-        n_species = self.n_species
-
         if not is_atomic_basis or self.readout_type is None:
             # Vanilla shared linear — same for all species, no Z-conditioning.
             # Parameter names/shapes identical to the previous plain
             # torch.nn.Linear last layers, so old checkpoints keep loading.
             return LinearReadout(in_features, out_features, bias=True)
 
-        name = self.readout_type.get("name", "ZConditioned")
-        args = dict(self.readout_type.get("args", {}))
-        allowed_args = {
-            "ZConditioned": {"hidden_layer_widths"},
-            "MoE": {
-                "num_experts",
-                "num_routed_experts",
-                "num_topk_experts",
-                "embedding_dim",
-                "hidden_layer_widths",
-            },
-            "IrrepThenZConditioned": {"z_conditioned", "hidden_layer_widths"},
-            "IrrepThenMoE": {
-                "d_irrep",
-                "num_experts",
-                "num_routed_experts",
-                "num_topk_experts",
-                "embedding_dim",
-            },
-            "IrrepResidual": {"z_conditioned"},
-            "IrrepResidualZOutput": set(),
-            "IrrepResidualFiLM": set(),
-            "IrrepResidualZCorrection": {"expansion_factor"},
-            "IrrepResidualZCorrectionDeep": {
-                "num_correction_layers",
-                "expansion_factor",
-            },
-        }
-        if name not in allowed_args:
-            raise ValueError(
-                f"Unknown readout_type name: '{name}'. "
-                f"Available: {', '.join(sorted(allowed_args))}."
-            )
-        unknown_args = set(args) - allowed_args[name]
-        if unknown_args:
-            raise ValueError(
-                f"Unknown readout_type args for '{name}': "
-                f"{', '.join(sorted(unknown_args))}. "
-                f"Allowed: {', '.join(sorted(allowed_args[name])) or '(none)'}."
-            )
-
-        if name == "ZConditioned":
-            return Readout(
-                in_features,
-                out_features,
-                n_species,
-                z_conditioned=True,
-                hidden_layer_widths=args.get("hidden_layer_widths", None),
-            )
-
-        elif name == "MoE":
-            return MoEReadout(
-                in_features,
-                out_features,
-                n_species,
-                num_experts=args["num_experts"],
-                num_routed_experts=args["num_routed_experts"],
-                num_topk_experts=args["num_topk_experts"],
-                hidden_layer_widths=args.get("hidden_layer_widths", None),
-                embedding_dim=args.get("embedding_dim", 16),
-            )
-
-        elif name == "IrrepThenZConditioned":
-            return IrrepThenZConditioned(
-                in_features,
-                out_features,
-                n_species,
-                z_conditioned=args.get("z_conditioned", True),
-                hidden_layer_widths=args.get("hidden_layer_widths", None),
-            )
-
-        elif name == "IrrepThenMoE":
-            return IrrepThenMoE(
-                in_features,
-                out_features,
-                n_species,
-                d_irrep=args.get("d_irrep", in_features),
-                num_experts=args["num_experts"],
-                num_routed_experts=args["num_routed_experts"],
-                num_topk_experts=args["num_topk_experts"],
-                embedding_dim=args.get("embedding_dim", 16),
-            )
-
-        elif name == "IrrepResidual":
-            return IrrepResidualReadout(
-                in_features,
-                out_features,
-                n_species,
-                z_conditioned=args.get("z_conditioned", True),
-            )
-
-        elif name == "IrrepResidualZOutput":
-            return IrrepResidualZOutput(in_features, out_features, n_species)
-
-        elif name == "IrrepResidualFiLM":
-            return IrrepResidualFiLM(in_features, out_features, n_species)
-
-        elif name == "IrrepResidualZCorrection":
-            # Alias for the depth-parameterised variant with a single hidden layer.
-            return IrrepResidualZCorrectionDeep(
-                in_features,
-                out_features,
-                n_species,
-                num_correction_layers=1,
-                expansion_factor=args.get("expansion_factor", 1),
-            )
-
-        else:
-            assert name == "IrrepResidualZCorrectionDeep"
-            return IrrepResidualZCorrectionDeep(
-                in_features,
-                out_features,
-                n_species,
-                num_correction_layers=args.get("num_correction_layers", 2),
-                expansion_factor=args.get("expansion_factor", 1),
-            )
+        return build_readout(
+            name=self.readout_type.get("name", "ZConditioned"),
+            args=dict(self.readout_type.get("args", {})),
+            in_features=in_features,
+            out_features=out_features,
+            n_species=self.n_species,
+        )
 
     def add_output(
         self,
