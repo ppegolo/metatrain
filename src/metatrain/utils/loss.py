@@ -501,11 +501,21 @@ def _ri_coefficients_pyscf_order_aligned(
         return []
 
     first_map = tensor_maps[0]
-    ordered_keys = sorted(first_map.keys, key=lambda key: int(key[0]))
-    if len(ordered_keys) == 0:
+    # fetch all blocks once per map: repeated .block(key) lookups cost ~100 us
+    # of metatensor dispatch each, right in the loss hot path
+    key_order = sorted(
+        range(len(first_map.keys)),
+        key=lambda i: int(first_map.keys.values[i, 0]),
+    )
+    if len(key_order) == 0:
         return []
 
-    first_block = first_map.block(ordered_keys[0])
+    ordered_lambdas = [int(first_map.keys.values[i, 0]) for i in key_order]
+    per_map_blocks = [
+        [tensor_map.blocks()[i] for i in key_order] for tensor_map in tensor_maps
+    ]
+
+    first_block = per_map_blocks[0][0]
     if len(first_block.samples) == 0:
         return []
 
@@ -519,11 +529,11 @@ def _ri_coefficients_pyscf_order_aligned(
     # masked-index per (atom, block, map) in the loss hot path.
     per_map_flat: list[torch.Tensor] = []
     union_invalid: Optional[torch.Tensor] = None
-    for tensor_map in tensor_maps:
+    for blocks in per_map_blocks:
         per_block = []
-        for key in ordered_keys:
-            values = tensor_map.block(key).values
-            if int(key[0]) == 1:
+        for ell, block in zip(ordered_lambdas, blocks, strict=True):
+            values = block.values
+            if ell == 1:
                 values = values[:, [2, 0, 1], :]
             per_block.append(values.transpose(1, 2).reshape(values.shape[0], -1))
         flat = torch.cat(per_block, dim=1)
@@ -533,13 +543,20 @@ def _ri_coefficients_pyscf_order_aligned(
     assert union_invalid is not None
     valid = ~union_invalid
 
-    # Retained elements per system: valid entries per sample, summed over each
-    # system's consecutive samples.
+    # Retained elements per system: valid entries per sample, segment-summed
+    # over each system's consecutive samples — one device sync for the whole
+    # batch instead of one per system.
     per_sample_counts = valid.sum(dim=1)
-    per_system_counts = [
-        int(chunk.sum())
-        for chunk in torch.split(per_sample_counts, sample_counts.tolist())
-    ]
+    system_positions = torch.repeat_interleave(
+        torch.arange(len(sample_counts), device=per_sample_counts.device),
+        sample_counts.to(per_sample_counts.device),
+    )
+    per_system_counts_t = torch.zeros(
+        len(sample_counts),
+        dtype=per_sample_counts.dtype,
+        device=per_sample_counts.device,
+    ).scatter_add_(0, system_positions, per_sample_counts)
+    per_system_counts = per_system_counts_t.tolist()
 
     flat_mask = valid.reshape(-1)
     per_map_split = [
@@ -725,7 +742,9 @@ class DensityMSELossViaC(LossInterface):
         per_system = []
         for delta, matrix in zip(delta_coefficients, matrices, strict=True):
             delta = delta.to(matrix.dtype)
-            per_system.append(torch.einsum("i,ij,j->", delta, matrix, delta))
+            # dot(mv(...)) is the same contraction as the previous einsum but
+            # ~3x cheaper: no dispatch/reshape overhead and a leaner backward
+            per_system.append(torch.dot(delta, torch.mv(matrix, delta)))
         loss_values = torch.stack(per_system)
 
         return _reduce(loss_values, self.reduction)
@@ -837,7 +856,7 @@ class DensityMSELossViaW(LossInterface):
         lin_parts = []
         for c, p, matrix in zip(coefficients, projections, matrices, strict=True):
             c = c.to(mdtype)
-            quad_parts.append(torch.einsum("i,ij,j->", c, matrix, c))
+            quad_parts.append(torch.dot(c, torch.mv(matrix, c)))
             lin_parts.append(torch.dot(c, p.to(mdtype)))
         quadratic = torch.stack(quad_parts)
         linear = torch.stack(lin_parts)
