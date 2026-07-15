@@ -1,11 +1,12 @@
 import functools
+import io
 import math
 import multiprocessing
 import os
 import sys
 import warnings
 import zipfile
-from collections import Counter
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -944,21 +945,53 @@ class DiskDataset(torch.utils.data.Dataset):
             fields = {options.get("key", key): key for key, options in fields.items()}
 
         self._field_names = ["system"]
-        # check that we have at least one sample:
+        # Parse the zip's central directory ONCE, into compact numpy arrays of
+        # member locations. Keeping a zipfile.ZipFile per process instead is
+        # prohibitive for large datasets: every open re-parses the whole
+        # central directory into per-member Python objects (measured ~10 GB
+        # RSS and ~80 s for a 13M-member zip), and each dataloader worker
+        # process would pay it again. __getitem__ reads members by direct
+        # seek+decompress using these offsets instead.
         with zipfile.ZipFile(path, "r") as zip_file:
-            namelist = zip_file.namelist()
+            infos = zip_file.infolist()
+            n_members = len(infos)
+            member_entries = np.full(n_members, -1, dtype=np.int64)
+            member_offsets = np.empty(n_members, dtype=np.int64)
+            member_csizes = np.empty(n_members, dtype=np.int64)
+            member_methods = np.empty(n_members, dtype=np.int64)
+            member_field_ids = np.full(n_members, -1, dtype=np.int64)
+            field_ids: Dict[str, int] = {}
+            has_atom_counts = False
+            for i, info in enumerate(infos):
+                name = info.filename
+                if name == "_atom_counts.npy":
+                    has_atom_counts = True
+                    continue
+                slash = name.find("/")
+                if slash <= 0 or not name[:slash].isdigit():
+                    continue
+                field = name[slash + 1 :]
+                if field == "system.mta":
+                    field = "system"
+                elif field.endswith(".mts"):
+                    field = field[:-4]
+                else:
+                    continue
+                member_entries[i] = int(name[:slash])
+                member_offsets[i] = info.header_offset
+                member_csizes[i] = info.compress_size
+                member_methods[i] = info.compress_type
+                member_field_ids[i] = field_ids.setdefault(field, len(field_ids))
+            self._field_names += [f for f in field_ids if f != "system"]
+
             # Build an explicit mapping position→zip_entry so that positional
             # indices 0..N-1 always land on a valid entry even when the zip has
             # gaps (missing entries due to failed structure processing).
-            entry_numbers = [
-                int(f.split("/")[0]) for f in namelist if f.endswith("/system.mta")
-            ]
-            if len(set(entry_numbers)) != len(entry_numbers):
-                duplicates = sorted(
-                    entry
-                    for entry, count in Counter(entry_numbers).items()
-                    if count > 1
-                )
+            system_field_id = field_ids.get("system", -1)
+            entry_numbers = member_entries[member_field_ids == system_field_id]
+            unique_entries, entry_counts = np.unique(entry_numbers, return_counts=True)
+            if len(unique_entries) != len(entry_numbers):
+                duplicates = unique_entries[entry_counts > 1].tolist()
                 raise ValueError(
                     f"Duplicate entries {duplicates[:10]} found in this DiskDataset "
                     "zip file. Reading such a file would silently return the "
@@ -966,19 +999,13 @@ class DiskDataset(torch.utils.data.Dataset):
                     "produced by appending with an older, buggy DiskDatasetWriter "
                     "that restarted indexing at 0; re-write the dataset."
                 )
-            self._valid_entry_indices: List[int] = sorted(entry_numbers)
-            if not self._valid_entry_indices:
+            self._valid_entry_indices: np.ndarray = unique_entries  # sorted
+            if len(self._valid_entry_indices) == 0:
                 raise ValueError(
                     "Could not find any `<N>/system.mta` entries in the zip file. "
                     "The dataset format might be wrong, or the dataset might be empty. "
                     "Empty disk datasets are not supported."
                 )
-            first_entry = self._valid_entry_indices[0]
-            for file_name in namelist:
-                if file_name.startswith(f"{first_entry}/") and file_name.endswith(
-                    ".mts"
-                ):
-                    self._field_names.append(file_name[len(f"{first_entry}/") : -4])
             self._len = len(self._valid_entry_indices)
 
             # Optional atom-count file (written by DiskDatasetWriter), keyed by
@@ -986,7 +1013,7 @@ class DiskDataset(torch.utils.data.Dataset):
             # answer without opening/deserializing every system, which is what makes
             # this dataset usable with MaxAtomDistributedBatchSampler.
             self._atom_counts: Optional[np.ndarray] = None
-            if "_atom_counts.npy" in namelist:
+            if has_atom_counts:
                 with zip_file.open("_atom_counts.npy", "r") as f:
                     atom_counts = np.load(f)
                 if len(atom_counts) > self._valid_entry_indices[-1]:
@@ -1017,11 +1044,34 @@ class DiskDataset(torch.utils.data.Dataset):
 
         self._fields_to_read.append("mtt::aux::system_index")
 
+        # Per-(entry, field) member locations for the fields we read:
+        # (header_offset, compress_size, compress_type), -1 where a member is
+        # missing. This is the only zip metadata workers need to read samples.
+        zip_fields = [f for f in self._fields_to_read if f != "mtt::aux::system_index"]
+        self._member_cols: Dict[str, int] = {f: c for c, f in enumerate(zip_fields)}
+        locs = np.full((self._len, len(zip_fields), 3), -1, dtype=np.int64)
+        for field_name, col in self._member_cols.items():
+            mask = member_field_ids == field_ids[field_name]
+            rows = np.searchsorted(self._valid_entry_indices, member_entries[mask])
+            # entries carrying this field but no system.mta are gaps: drop them
+            in_range = rows < self._len
+            ok = np.zeros(len(rows), dtype=bool)
+            ok[in_range] = (
+                self._valid_entry_indices[rows[in_range]]
+                == member_entries[mask][in_range]
+            )
+            rows = rows[ok]
+            sel = np.flatnonzero(mask)[ok]
+            locs[rows, col, 0] = member_offsets[sel]
+            locs[rows, col, 1] = member_csizes[sel]
+            locs[rows, col, 2] = member_methods[sel]
+        self._member_locs = locs
+
         # target-config dicts remap dataset field names to target names
         self._fields_map: Dict[str, str] = fields if isinstance(fields, dict) else {}
 
         # Do not open file in the main process and start sub-processes with None
-        self.zip_file: Optional[zipfile.ZipFile] = None
+        self.zip_file: Optional[IO[bytes]] = None
         self._zip_file_pid: Optional[int] = None
 
     @functools.cached_property
@@ -1046,8 +1096,51 @@ class DiskDataset(torch.utils.data.Dataset):
         if self._zip_file_pid != pid:
             if self.zip_file is not None:
                 self.zip_file.close()
-            self.zip_file = zipfile.ZipFile(self.zip_file_path, "r")
+            # A plain handle, NOT zipfile.ZipFile: members are read via the
+            # offsets indexed at construction, so per-process opens stay O(1)
+            # in memory and time regardless of how many members the zip has.
+            self.zip_file = open(self.zip_file_path, "rb")
             self._zip_file_pid = pid
+
+    def _read_member(self, index: int, field_name: str) -> io.BytesIO:
+        """Read one zip member by its indexed offset, bypassing the central
+        directory.
+
+        Sizes and compression method come from the construction-time index;
+        the member's local header is only parsed for its variable-length name
+        and extra fields. CRC is not re-verified.
+
+        :param index: Positional dataset index (row in the member index).
+        :param field_name: Field to read ("system" or a target/extra field).
+        :return: Decompressed member contents.
+        """
+        offset, csize, method = self._member_locs[index, self._member_cols[field_name]]
+        if offset < 0:
+            entry = int(self._valid_entry_indices[index])
+            raise KeyError(
+                f"There is no item named '{entry}/{field_name}' in the archive"
+            )
+        assert self.zip_file is not None
+        self.zip_file.seek(int(offset))
+        header = self.zip_file.read(30)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            raise zipfile.BadZipFile(
+                f"Bad local file header at offset {int(offset)} in "
+                f"'{self.zip_file_path}'"
+            )
+        name_len = int.from_bytes(header[26:28], "little")
+        extra_len = int.from_bytes(header[28:30], "little")
+        self.zip_file.seek(int(offset) + 30 + name_len + extra_len)
+        data = self.zip_file.read(int(csize))
+        if method == zipfile.ZIP_DEFLATED:
+            decompressor = zlib.decompressobj(-15)
+            data = decompressor.decompress(data) + decompressor.flush()
+        elif method != zipfile.ZIP_STORED:
+            raise NotImplementedError(
+                f"Unsupported zip compression method {int(method)} in "
+                f"'{self.zip_file_path}'"
+            )
+        return io.BytesIO(data)
 
     def __len__(self) -> int:
         return self._len
@@ -1165,17 +1258,16 @@ class DiskDataset(torch.utils.data.Dataset):
         self._open_zip_once()
         assert self.zip_file is not None
 
-        # Translate positional index → actual zip entry path.
+        # Translate positional index → actual zip entry number.
         # _valid_entry_indices covers only entries that have system.mta, so
         # we never hit gaps left by failed structure processing in the zip.
-        zip_entry = self._valid_entry_indices[index]
+        zip_entry = int(self._valid_entry_indices[index])
 
         system_and_targets = []
         for field_name in self._fields_to_read:
             if field_name == "system":
-                with self.zip_file.open(f"{zip_entry}/system.mta", "r") as file:
-                    system = load_system(file)
-                    system_and_targets.append(system)
+                system = load_system(self._read_member(index, field_name))
+                system_and_targets.append(system)
             elif field_name == "mtt::aux::system_index":
                 tensor_map = TensorMap(
                     keys=Labels(["_"], torch.tensor([[0]])),
@@ -1194,10 +1286,9 @@ class DiskDataset(torch.utils.data.Dataset):
                 )
                 system_and_targets.append(tensor_map)
             else:
-                with self.zip_file.open(f"{zip_entry}/{field_name}.mts", "r") as file:
-                    numpy_buffer = np.load(file)
-                    tensor_buffer = torch.from_numpy(numpy_buffer)
-                    tensor_map = load_buffer(tensor_buffer)
+                numpy_buffer = np.load(self._read_member(index, field_name))
+                tensor_buffer = torch.from_numpy(numpy_buffer)
+                tensor_map = load_buffer(tensor_buffer)
                 system_and_targets.append(tensor_map)
         return self._sample_class(*system_and_targets)
 
