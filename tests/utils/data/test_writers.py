@@ -734,3 +734,49 @@ def test_disk_dataset_rejects_non_dense_entries(monkeypatch, tmp_path):
                 mta.save(f, _make_system(n))
     with pytest.raises(ValueError, match="dense range"):
         DiskDataset("test_gaps.zip", fields=[])
+
+
+def test_disk_dataset_reads_bypass_central_directory(monkeypatch, tmp_path):
+    """After construction, reading samples must never re-open zipfile.ZipFile.
+
+    DiskDataset indexes member offsets once at construction; __getitem__ reads
+    by direct seek. Re-parsing the central directory per process is what made
+    dataloader workers OOM on large datasets (~10 GB RSS per open for a
+    13M-member zip), so a read path that silently falls back to zipfile would
+    reintroduce that.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_no_cd.zip")
+    writer.write([_make_system(2)], {})
+    writer.write([_make_system(4)], {})
+    writer.finish()
+
+    dataset = DiskDataset("test_no_cd.zip", fields=[])
+
+    def _no_zipfile(*args, **kwargs):
+        raise AssertionError("sample reads must not construct zipfile.ZipFile")
+
+    monkeypatch.setattr(zipfile, "ZipFile", _no_zipfile)
+    assert len(dataset[0].system) == 2
+    assert len(dataset[1].system) == 4
+
+
+def test_disk_dataset_reads_deflated_members(monkeypatch, tmp_path):
+    """Externally-produced zips may be DEFLATE-compressed (our writer uses
+    STORED); the direct-seek read path must decompress those too."""
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_stored.zip")
+    writer.write([_make_system(3)], {})
+    writer.finish()
+
+    with (
+        zipfile.ZipFile("test_stored.zip", "r") as src,
+        zipfile.ZipFile("test_deflated.zip", "w", zipfile.ZIP_DEFLATED) as dst,
+    ):
+        for info in src.infolist():
+            dst.writestr(info.filename, src.read(info.filename))
+
+    dataset = DiskDataset("test_deflated.zip", fields=[])
+    assert len(dataset[0].system) == 3
