@@ -6,6 +6,11 @@ lives in this package, so architectures and users that only train MLIP-style
 targets never need to look at it.
 """
 
+from .eval_hooks import (  # noqa: F401
+    DensityErrorEvalHooks,
+    NullEvalHooks,
+    get_eval_hooks,
+)
 from .helpers import (  # noqa: F401
     DensifyStatics,
     densify_atomic_basis_dataset_info,
