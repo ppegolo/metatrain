@@ -398,10 +398,16 @@ ValOrTestSetSpec = Annotated[
 @with_config(ConfigDict(extra="forbid", strict=True))
 class DensityErrorHypers(TypedDict):
     aux_basis: str | dict[str, str]
-    """Auxiliary basis for the overlap matrices of the density error.
+    """Auxiliary basis for the metric matrices of the density error.
 
     Either a single PySCF basis name applied to every atomic-basis target, or
     a per-target-name dictionary.
+    """
+    metric: NotRequired[Literal["overlap", "coulomb"]]
+    """Two-centre metric for the quadratic form (default: ``"overlap"``).
+
+    ``"overlap"`` gives the real-space L2 error of the density;
+    ``"coulomb"`` gives the electrostatic self-energy of the density error.
     """
 
 

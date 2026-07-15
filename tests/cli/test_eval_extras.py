@@ -119,6 +119,23 @@ def test_eval_options_schema_accepts_new_keys():
             "density_error": {"aux_basis": {"mtt::ri": "def2-universal-jfit"}},
         }
     )
+    validate_eval_options(
+        {
+            "systems": "data.xyz",
+            "targets": {"energy": {"key": "U0"}},
+            "density_error": {"aux_basis": "def2-universal-jfit", "metric": "coulomb"},
+        }
+    )
+
+
+def test_eval_options_schema_rejects_unknown_metric():
+    with pytest.raises(MetatrainValidationError):
+        validate_eval_options(
+            {
+                "systems": "data.xyz",
+                "density_error": {"aux_basis": "x", "metric": "euclidean"},
+            }
+        )
 
 
 def test_eval_options_schema_rejects_unknown_density_error_keys():

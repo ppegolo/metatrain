@@ -53,26 +53,28 @@ class NullEvalHooks:
 class DensityErrorEvalHooks(NullEvalHooks):
     """Accumulates the real-space density RMSE for RI-coefficient targets.
 
-    Per target: ``RMSE = sqrt(Σ_i Δc_i^T S_i Δc_i / Σ_i N_atoms,i)`` over the
-    evaluated systems, where ``S`` is the two-centre overlap matrix of the
-    auxiliary basis — i.e. the root-mean integrated squared error of the
-    predicted density, per atom.
+    Per target: ``RMSE = sqrt(Σ_i Δc_i^T M_i Δc_i / Σ_i N_atoms,i)`` over the
+    evaluated systems, where ``M`` is the two-centre metric matrix of the
+    auxiliary basis: the overlap ``S`` (the root-mean integrated squared error
+    of the predicted density, per atom) or the Coulomb kernel ``J`` (the
+    root-mean electrostatic self-energy of the density error, per atom).
 
     The density loss consumes the *dense* (per-λ, species-in-samples, padded)
-    map layout the training pipeline uses: the targets are densified by the
-    prepare transform this class contributes to the collate pipeline, and the
-    model's sparse per-species predictions are densified in :meth:`update`.
+    map layout the training pipeline uses: both the model's sparse per-species
+    predictions and the collated targets are densified in :meth:`update`.
 
     :param target_to_aux_basis: Mapping from RI target name to its auxiliary
         basis.
     :param target_infos: Target infos of the evaluated targets; the layouts
         drive the densification.
+    :param metric: Two-centre metric — ``"overlap"`` or ``"coulomb"``.
     """
 
     def __init__(
         self,
         target_to_aux_basis: Mapping[str, str],
         target_infos: Mapping[str, Any],
+        metric: str = "overlap",
     ):
         # Lazy import: the loss module is only needed on the density path.
         from metatrain.utils.loss import DensityMSELossViaC
@@ -80,6 +82,7 @@ class DensityErrorEvalHooks(NullEvalHooks):
         from .helpers import DensifyStatics
 
         self._target_to_aux_basis = dict(target_to_aux_basis)
+        self._metric = metric
         self._target_infos = {
             name: target_infos[name] for name in self._target_to_aux_basis
         }
@@ -93,7 +96,7 @@ class DensityErrorEvalHooks(NullEvalHooks):
                 gradient=None,
                 weight=1.0,
                 reduction="sum",
-                metric="overlap",
+                metric=metric,
             )
             for name in self._target_to_aux_basis
         }
@@ -101,10 +104,14 @@ class DensityErrorEvalHooks(NullEvalHooks):
         self._atom_counts = dict.fromkeys(self._target_to_aux_basis, 0)
 
     def collate_transforms(self, dtype: torch.dtype) -> List[Callable]:
-        from .pyscf import get_overlap_matrices_transform
+        from .pyscf import get_metric_matrices_transform
 
         # No cross-epoch caching: evaluation sees each system exactly once.
-        return [get_overlap_matrices_transform(self._target_to_aux_basis, dtype)]
+        return [
+            get_metric_matrices_transform(
+                self._target_to_aux_basis, self._metric, dtype
+            )
+        ]
 
     def _densify(
         self,
@@ -144,7 +151,7 @@ class DensityErrorEvalHooks(NullEvalHooks):
         targets: Dict[str, Any],
         extra_data: Dict[str, Any],
     ) -> None:
-        from .pyscf import overlap_matrix_name
+        from .pyscf import metric_matrix_name
 
         n_atoms = sum(len(system) for system in systems)
         cpu = torch.device("cpu")
@@ -182,7 +189,7 @@ class DensityErrorEvalHooks(NullEvalHooks):
                 systems,
                 target_ids,
             )
-            matrix_key = overlap_matrix_name(name)
+            matrix_key = metric_matrix_name(name, self._metric)
             batch_error = loss_fn(
                 {name: prediction},
                 {name: target},
@@ -193,7 +200,7 @@ class DensityErrorEvalHooks(NullEvalHooks):
 
     def finalize(self) -> Dict[str, float]:
         return {
-            f"{name} density RMSE (per atom)": math.sqrt(
+            f"{name} density RMSE ({self._metric}, per atom)": math.sqrt(
                 error_sum / self._atom_counts[name]
             )
             for name, error_sum in self._error_sums.items()
@@ -235,4 +242,6 @@ def get_eval_hooks(
     target_to_aux_basis = {
         name: resolve_ri_aux_basis(name, aux_basis) for name in atomic_basis_targets
     }
-    return DensityErrorEvalHooks(target_to_aux_basis, target_infos)
+    return DensityErrorEvalHooks(
+        target_to_aux_basis, target_infos, metric=density_error.get("metric", "overlap")
+    )

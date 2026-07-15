@@ -136,7 +136,9 @@ def test_density_error_rmse_math():
 
     metrics = hooks.finalize()
     expected = math.sqrt((12.0 + 4.0) / 3)
-    assert metrics == {f"{TARGET} density RMSE (per atom)": pytest.approx(expected)}
+    assert metrics == {
+        f"{TARGET} density RMSE (overlap, per atom)": pytest.approx(expected)
+    }
 
 
 def test_density_error_skips_batches_without_target():
@@ -144,3 +146,38 @@ def test_density_error_skips_batches_without_target():
     hooks = DensityErrorEvalHooks({TARGET: "unused"}, infos)
     hooks.update([_make_system(1)], {"energy": None}, {"energy": None}, {})
     assert hooks.finalize() == {}
+
+
+def test_get_eval_hooks_metric_selection():
+    infos = {TARGET: SimpleNamespace(is_atomic_basis=True, layout=_dense_layout())}
+    hooks = get_eval_hooks({"aux_basis": "def2-svp-jkfit", "metric": "coulomb"}, infos)
+    assert hooks._metric == "coulomb"
+    assert hooks._loss_fns[TARGET].metric == "coulomb"
+    # default stays overlap
+    hooks = get_eval_hooks({"aux_basis": "def2-svp-jkfit"}, infos)
+    assert hooks._metric == "overlap"
+
+
+def test_density_error_coulomb_metric_math():
+    from metatrain.utils.atomic_basis.pyscf import coulomb_matrix_name
+
+    infos = {TARGET: SimpleNamespace(is_atomic_basis=True, layout=_dense_layout())}
+    hooks = DensityErrorEvalHooks({TARGET: "unused"}, infos, metric="coulomb")
+
+    # one 1-atom system, delta = [2], J = [[5]] -> error 20
+    extra = {
+        coulomb_matrix_name(TARGET): RaggedMetricMatrices.from_matrices(
+            [torch.tensor([[5.0]], dtype=torch.float64)]
+        )
+    }
+    hooks.update(
+        [_make_system(1)],
+        {TARGET: _make_l0_map([[3.0]])},
+        {TARGET: _make_l0_map([[1.0]])},
+        extra,
+    )
+    metrics = hooks.finalize()
+    expected = math.sqrt(20.0 / 1)
+    assert metrics == {
+        f"{TARGET} density RMSE (coulomb, per atom)": pytest.approx(expected)
+    }
