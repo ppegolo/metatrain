@@ -1,11 +1,14 @@
+import zipfile
 from typing import Dict, List, Tuple
 
 import metatensor.torch as mts
+import metatomic.torch as mta
 import pytest
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import ModelCapabilities, ModelOutput, System
 
+from metatrain.utils.data.dataset import DiskDataset
 from metatrain.utils.data.readers.ase import read
 from metatrain.utils.data.writers import (
     ASEWriter,
@@ -13,6 +16,15 @@ from metatrain.utils.data.writers import (
     MetatensorWriter,
     get_writer,
 )
+
+
+def _make_system(n_atoms: int) -> System:
+    return System(
+        positions=torch.zeros((n_atoms, 3), dtype=torch.float64),
+        types=torch.ones(n_atoms, dtype=torch.int32),
+        cell=torch.zeros((3, 3), dtype=torch.float64),
+        pbc=torch.zeros(3, dtype=torch.bool),
+    )
 
 
 def systems_capabilities_predictions(
@@ -388,3 +400,241 @@ def test_disk_dataset_writer_multi_batch_strain_gradients(monkeypatch, tmp_path)
     writer.write(systems, predictions)
     writer.write(systems, predictions)
     writer.finish()
+
+
+def test_disk_dataset_writer_append_continues_indices(monkeypatch, tmp_path):
+    """append=True must continue indexing after the existing entries.
+
+    Regression test: the writer used to always start at index 0 regardless of
+    ``append``, so a second session silently overwrote ("0/", "1/", ...) the
+    first session's entries instead of adding new ones.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_append.zip")
+    writer.write([_make_system(2)], {})
+    writer.write([_make_system(5)], {})
+    writer.write([_make_system(3)], {})
+    writer.finish()
+
+    writer = DiskDatasetWriter("test_append.zip", append=True)
+    writer.write([_make_system(8)], {})
+    writer.write([_make_system(4)], {})
+    writer.finish()
+
+    with zipfile.ZipFile("test_append.zip", "r") as zf:
+        names = zf.namelist()
+    for i in range(5):
+        assert f"{i}/system.mta" in names, f"missing entry {i}, index did not continue"
+
+    dataset = DiskDataset("test_append.zip", fields=[])
+    assert len(dataset) == 5
+    # original entries must be untouched, not overwritten by the append session
+    assert len(dataset[0].system) == 2
+    assert len(dataset[1].system) == 5
+    assert len(dataset[2].system) == 3
+    assert len(dataset[3].system) == 8
+    assert len(dataset[4].system) == 4
+
+
+def test_disk_dataset_writer_append_extends_atom_counts(monkeypatch, tmp_path):
+    """The atom-count file must stay complete and correct across appends."""
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_append_atom_counts.zip")
+    writer.write([_make_system(2)], {})
+    writer.write([_make_system(5)], {})
+    writer.finish()
+
+    writer = DiskDatasetWriter("test_append_atom_counts.zip", append=True)
+    writer.write([_make_system(8)], {})
+    writer.finish()
+
+    dataset = DiskDataset("test_append_atom_counts.zip", fields=[])
+    # The repo's pytest config turns warnings into errors; if the file were
+    # incomplete this would raise via the "no atom-counts file, backfilling"
+    # warning instead of just returning the (wrong) answer.
+    counts = dataset.get_all_atom_counts()
+    assert counts.tolist() == [2, 5, 8]
+
+
+def test_disk_dataset_writer_append_chain_extends_atom_counts_repeatedly(
+    monkeypatch, tmp_path
+):
+    """Three chained append sessions must each extend the atom counts correctly.
+
+    Also checks that the (expected) duplicate ``_atom_counts.npy`` zip entries
+    this produces resolve to the last (complete) one on read.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_append_chain.zip")
+    writer.write([_make_system(1)], {})
+    writer.write([_make_system(2)], {})
+    writer.finish()
+
+    writer = DiskDatasetWriter("test_append_chain.zip", append=True)
+    writer.write([_make_system(3)], {})
+    writer.finish()
+
+    writer = DiskDatasetWriter("test_append_chain.zip", append=True)
+    writer.write([_make_system(4)], {})
+    writer.write([_make_system(5)], {})
+    writer.finish()
+
+    with zipfile.ZipFile("test_append_chain.zip", "r") as zf:
+        n_atom_counts_entries = zf.namelist().count("_atom_counts.npy")
+    assert n_atom_counts_entries == 3
+
+    dataset = DiskDataset("test_append_chain.zip", fields=[])
+    assert len(dataset) == 5
+    assert dataset.get_all_atom_counts().tolist() == [1, 2, 3, 4, 5]
+
+
+def test_disk_dataset_writer_append_without_prior_atom_counts(monkeypatch, tmp_path):
+    """Appending onto a dataset with no atom-count file must not create a wrong one.
+
+    The writer has no way to know the atom counts of entries it didn't write,
+    so it must skip the file entirely rather than write one that only covers
+    the new entries -- the reader's own backfill (from the systems themselves)
+    is what produces a correct answer in this case.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    with zipfile.ZipFile("test_append_no_atom_counts.zip", "w") as zf:
+        for i, n in enumerate([6, 7]):
+            with zf.open(f"{i}/system.mta", "w") as f:
+                mta.save(f, _make_system(n))
+
+    writer = DiskDatasetWriter("test_append_no_atom_counts.zip", append=True)
+    writer.write([_make_system(9)], {})
+    writer.finish()
+
+    with zipfile.ZipFile("test_append_no_atom_counts.zip", "r") as zf:
+        names = zf.namelist()
+    assert "2/system.mta" in names, "index did not continue past the pre-existing 2"
+    assert "_atom_counts.npy" not in names
+
+    dataset = DiskDataset("test_append_no_atom_counts.zip", fields=[])
+    assert len(dataset) == 3
+    with pytest.warns(UserWarning, match="no '_atom_counts.npy' file"):
+        counts = dataset.get_all_atom_counts()
+    assert counts.tolist() == [6, 7, 9]
+
+
+def test_disk_dataset_writer_append_continues_past_gaps(monkeypatch, tmp_path):
+    """Appending to a zip with gaps must continue after the highest entry
+    number, not the entry count (which would collide with existing entries)."""
+    monkeypatch.chdir(tmp_path)
+
+    with zipfile.ZipFile("test_append_gaps.zip", "w") as zf:
+        for i, n in zip([0, 2], [6, 7], strict=True):  # gap at entry 1
+            with zf.open(f"{i}/system.mta", "w") as f:
+                mta.save(f, _make_system(n))
+
+    writer = DiskDatasetWriter("test_append_gaps.zip", append=True)
+    writer.write([_make_system(9)], {})
+    writer.finish()
+
+    with zipfile.ZipFile("test_append_gaps.zip", "r") as zf:
+        names = zf.namelist()
+    assert "3/system.mta" in names, "index did not continue past the gap"
+
+    dataset = DiskDataset("test_append_gaps.zip", fields=[])
+    assert len(dataset) == 3
+    with pytest.warns(UserWarning, match="no '_atom_counts.npy' file"):
+        counts = dataset.get_all_atom_counts()
+    assert counts.tolist() == [6, 7, 9]
+
+
+def test_disk_dataset_rejects_duplicate_entries(monkeypatch, tmp_path):
+    """A zip with duplicate entry numbers (produced by the old, buggy append
+    mode) must be rejected loudly instead of silently returning the
+    last-written copy of each duplicated entry."""
+    monkeypatch.chdir(tmp_path)
+
+    # writing the duplicated entry itself warns; that's the very situation
+    # this guard exists for
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile("test_duplicates.zip", "w") as zf:
+            for i, n in zip([0, 1, 0], [2, 3, 5], strict=True):
+                with zf.open(f"{i}/system.mta", "w") as f:
+                    mta.save(f, _make_system(n))
+
+    with pytest.raises(ValueError, match="Duplicate entries"):
+        DiskDataset("test_duplicates.zip", fields=[])
+
+
+def test_disk_dataset_reads_bypass_central_directory(monkeypatch, tmp_path):
+    """After construction, reading samples must never re-open zipfile.ZipFile.
+
+    DiskDataset indexes member offsets once at construction; __getitem__ reads
+    by direct seek. Re-parsing the central directory per process is what made
+    dataloader workers OOM on large datasets (~10 GB RSS per open for a
+    13M-member zip), so a read path that silently falls back to zipfile would
+    reintroduce that.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_no_cd.zip")
+    writer.write([_make_system(2)], {})
+    writer.write([_make_system(4)], {})
+    writer.finish()
+
+    dataset = DiskDataset("test_no_cd.zip", fields=[])
+
+    def _no_zipfile(*args, **kwargs):
+        raise AssertionError("sample reads must not construct zipfile.ZipFile")
+
+    monkeypatch.setattr(zipfile, "ZipFile", _no_zipfile)
+    assert len(dataset[0].system) == 2
+    assert len(dataset[1].system) == 4
+
+
+def test_disk_dataset_reads_deflated_members(monkeypatch, tmp_path):
+    """Externally-produced zips may be DEFLATE-compressed (our writer uses
+    STORED); the direct-seek read path must decompress those too."""
+    monkeypatch.chdir(tmp_path)
+
+    writer = DiskDatasetWriter("test_stored.zip")
+    writer.write([_make_system(3)], {})
+    writer.finish()
+
+    with (
+        zipfile.ZipFile("test_stored.zip", "r") as src,
+        zipfile.ZipFile("test_deflated.zip", "w", zipfile.ZIP_DEFLATED) as dst,
+    ):
+        for info in src.infolist():
+            dst.writestr(info.filename, src.read(info.filename))
+
+    dataset = DiskDataset("test_deflated.zip", fields=[])
+    assert len(dataset[0].system) == 3
+
+
+def test_disk_dataset_atom_counts_survive_unsupported_locks(monkeypatch, tmp_path):
+    """Atom-count backfill must fall back to in-memory counts when the
+    filesystem rejects file locks (e.g. Lustre mounted with noflock), not
+    crash and not leak the lock handle."""
+    monkeypatch.chdir(tmp_path)
+
+    with zipfile.ZipFile("test_nolock.zip", "w") as zf:
+        for i, n in zip([0, 1], [2, 3], strict=True):
+            with zf.open(f"{i}/system.mta", "w") as f:
+                mta.save(f, _make_system(n))
+
+    import metatrain.utils.data.dataset as dataset_module
+
+    def _no_locks(lock_file):
+        raise OSError("No locks available")
+
+    monkeypatch.setattr(dataset_module, "_lock_exclusive", _no_locks)
+
+    dataset = DiskDataset("test_nolock.zip", fields=[])
+    # two warnings fire: the lock fallback and the one-time backfill scan
+    with pytest.warns(UserWarning) as record:
+        counts = dataset.get_all_atom_counts()
+    assert any("Could not lock" in str(w.message) for w in record)
+    assert counts.tolist() == [2, 3]
+    # nothing persisted without the lock
+    with zipfile.ZipFile("test_nolock.zip", "r") as zf:
+        assert "_atom_counts.npy" not in zf.namelist()

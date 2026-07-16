@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ...utils.readouts import LinearReadout, Readout, build_readout
 from ..documentation import ModelHypers
 from .conditioning import SystemConditioningEmbedding
 from .structures import compute_batch_tensors
@@ -35,6 +36,7 @@ class PETBackend(torch.nn.Module):
         super().__init__()
 
         # Cache frequently accessed hyperparameters
+        self.nl_is_strict = bool(hypers["long_range"]["enable"])
         self.cutoff = float(hypers["cutoff"])
         self.cutoff_function = hypers["cutoff_function"]
         self.cutoff_width = float(hypers["cutoff_width"])
@@ -56,8 +58,11 @@ class PETBackend(torch.nn.Module):
         self.attention_temperature = hypers["attention_temperature"]
         self.transformer_type = hypers["transformer_type"]
         self.featurizer_type = hypers["featurizer_type"]
+        self.readout_type = hypers["readout_type"]
+        self.geometry_embedding_lmax = hypers["geometry_embedding_lmax"]
 
         num_atomic_species = len(atomic_types)
+        self.n_species = num_atomic_species
 
         # ``species_to_species_index`` is registered first so that it remains the first
         # entry of the ``state_dict`` (an integer buffer), which the checkpoint dtype
@@ -85,6 +90,7 @@ class PETBackend(torch.nn.Module):
                     self.transformer_type,
                     num_atomic_species,
                     layer_index == 0,  # is first layer
+                    self.geometry_embedding_lmax,
                 )
                 for layer_index in range(self.num_gnn_layers)
             ]
@@ -133,6 +139,10 @@ class PETBackend(torch.nn.Module):
         self.edge_heads = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
+        # Targets whose last layers are purely linear ("linear" = shared
+        # LinearReadout, "zc" = single-layer species-conditioned Readout) can
+        # take the batched eager fast path in _calculate_atomic_predictions.
+        self._fast_readout_mode: Dict[str, str] = {}
 
         # ===== BEGIN DIAGNOSTIC-RELATED ATTRIBUTES
         # These are used to capture the node and edge features from each GNN layer post
@@ -153,7 +163,48 @@ class PETBackend(torch.nn.Module):
         )
         # ===== END DIAGNOSTIC-RELATED ATTRIBUTES
 
-    def add_output(self, target_name: str, output_shapes: Dict[str, List[int]]) -> None:
+    def _make_readout(
+        self,
+        in_features: int,
+        out_features: int,
+        is_atomic_basis: bool,
+    ) -> torch.nn.Module:
+        """
+        Factory: return the readout module for one output block.
+
+        Non-atomic-basis targets (or ``readout_type: null``) get a plain shared
+        linear layer (:class:`~metatrain.utils.readouts.LinearReadout`, a
+        ``torch.nn.Linear`` with checkpoint-compatible parameter names).
+        Atomic-basis targets with ``readout_type`` set are dispatched through
+        :func:`~metatrain.utils.readouts.build_readout`; all readouts share
+        ``forward(features, species_idx)``, so they are drop-in replaceable in
+        the model's ``ModuleDict`` containers.
+
+        :param in_features: Input feature dimension (``d_head``).
+        :param out_features: Output dimension for this block.
+        :param is_atomic_basis: Whether the target is an atomic-basis target.
+        :return: The readout module.
+        """
+        if not is_atomic_basis or self.readout_type is None:
+            # Vanilla shared linear — same for all species, no Z-conditioning.
+            # Parameter names/shapes identical to the previous plain
+            # torch.nn.Linear last layers, so old checkpoints keep loading.
+            return LinearReadout(in_features, out_features, bias=True)
+
+        return build_readout(
+            name=self.readout_type.get("name", "ZConditioned"),
+            args=dict(self.readout_type.get("args", {})),
+            in_features=in_features,
+            out_features=out_features,
+            n_species=self.n_species,
+        )
+
+    def add_output(
+        self,
+        target_name: str,
+        output_shapes: Dict[str, List[int]],
+        is_atomic_basis: bool,
+    ) -> None:
         """
         Create the node/edge heads and last layers for a new output target.
 
@@ -166,6 +217,9 @@ class PETBackend(torch.nn.Module):
         :param output_shapes: Mapping from per-block key to the block's shape (the
             component sizes followed by the number of properties), as computed by
             :meth:`metatrain.pet.model.PET._add_output`.
+        :param is_atomic_basis: Whether this target is an atomic-basis target. Only
+            such targets use ``readout_type``-selected readouts; other targets always
+            get a plain shared linear layer.
         """
         self.node_heads[target_name] = torch.nn.ModuleList(
             [
@@ -195,7 +249,9 @@ class PETBackend(torch.nn.Module):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(self.d_head, prod(shape), bias=True)
+                        key: self._make_readout(
+                            self.d_head, prod(shape), is_atomic_basis
+                        )
                         for key, shape in output_shapes.items()
                     }
                 )
@@ -207,13 +263,34 @@ class PETBackend(torch.nn.Module):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(self.d_head, prod(shape), bias=True)
+                        key: self._make_readout(
+                            self.d_head, prod(shape), is_atomic_basis
+                        )
                         for key, shape in output_shapes.items()
                     }
                 )
                 for _ in range(self.num_readout_layers)
             ]
         )
+
+        all_modules = [
+            module
+            for layers in (
+                self.node_last_layers[target_name],
+                self.edge_last_layers[target_name],
+            )
+            for layer in layers
+            for module in layer.values()
+        ]
+        if all(isinstance(module, LinearReadout) for module in all_modules):
+            self._fast_readout_mode[target_name] = "linear"
+        elif all(
+            isinstance(module, Readout)
+            and module.z_conditioned
+            and len(module.weights) == 1
+            for module in all_modules
+        ):
+            self._fast_readout_mode[target_name] = "zc"
 
     def preprocess(
         self,
@@ -302,6 +379,7 @@ class PETBackend(torch.nn.Module):
             self.num_neighbors_adaptive,
             self.adaptive_cutoff_method,
             cutoff_width_adaptive,
+            self.nl_is_strict,
         )
 
         batch_data: Dict[str, torch.Tensor] = {
@@ -428,6 +506,7 @@ class PETBackend(torch.nn.Module):
         """
         padding_mask = batch_data["padding_mask"]
         cutoff_factors = batch_data["cutoff_factors"]
+        element_indices_nodes = batch_data["element_indices_nodes"]
 
         node_ll_features, edge_ll_features = self._calculate_last_layer_features(
             node_features_list,
@@ -441,6 +520,7 @@ class PETBackend(torch.nn.Module):
                 padding_mask,
                 cutoff_factors,
                 requested_output_names,
+                element_indices_nodes,
             )
         )
 
@@ -672,6 +752,7 @@ class PETBackend(torch.nn.Module):
         padding_mask: torch.Tensor,
         cutoff_factors: torch.Tensor,
         requested_output_names: List[str],
+        element_indices_nodes: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -689,12 +770,24 @@ class PETBackend(torch.nn.Module):
         :param cutoff_factors: Tensor of cutoff factors for edge distances
             [n_atoms, max_num_neighbors].
         :param requested_output_names: Names of the target outputs to compute.
+        :param element_indices_nodes: Tensor of node species indices [n_atoms].
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
             - Dictionary mapping output names to lists of lists of edge atomic
               prediction tensors (one list per GNN layer, one tensor per block)
         """
+        if not torch.jit.is_scripting():
+            fast_result = self._fast_atomic_predictions(
+                node_last_layer_features_dict,
+                edge_last_layer_features_dict,
+                cutoff_factors,
+                requested_output_names,
+                element_indices_nodes,
+            )
+            if fast_result is not None:
+                return fast_result
+
         node_atomic_predictions_dict: Dict[str, List[List[torch.Tensor]]] = {}
         edge_atomic_predictions_dict: Dict[str, List[List[torch.Tensor]]] = {}
 
@@ -714,7 +807,10 @@ class PETBackend(torch.nn.Module):
                     node_atomic_predictions_by_block: List[torch.Tensor] = []
                     for node_last_layer_by_block in node_last_layer.values():
                         node_atomic_predictions_by_block.append(
-                            node_last_layer_by_block(node_last_layer_features)
+                            node_last_layer_by_block(
+                                node_last_layer_features,
+                                element_indices_nodes,
+                            )
                         )
                     node_atomic_predictions_dict[output_name].append(
                         node_atomic_predictions_by_block
@@ -736,14 +832,12 @@ class PETBackend(torch.nn.Module):
                     edge_atomic_predictions_by_block: List[torch.Tensor] = []
                     for edge_last_layer_by_block in edge_last_layer.values():
                         edge_atomic_predictions = edge_last_layer_by_block(
-                            edge_last_layer_features
+                            edge_last_layer_features,
+                            element_indices_nodes,
                         )
-                        expanded_padding_mask = padding_mask[..., None].repeat(
-                            1, 1, edge_atomic_predictions.shape[2]
-                        )
-                        edge_atomic_predictions = torch.where(
-                            ~expanded_padding_mask, 0.0, edge_atomic_predictions
-                        )
+                        # no padding mask needed: cutoff_factors are zero-filled
+                        # at padded neighbor slots (see edge_array_to_nef), so
+                        # the weighted sum already discards padded predictions
                         edge_atomic_predictions_by_block.append(
                             (edge_atomic_predictions * cutoff_factors[:, :, None]).sum(
                                 dim=1
@@ -754,6 +848,136 @@ class PETBackend(torch.nn.Module):
                     )
 
         return node_atomic_predictions_dict, edge_atomic_predictions_dict
+
+    @torch.jit.unused
+    def _fast_atomic_predictions(
+        self,
+        node_last_layer_features_dict: Dict[str, List[torch.Tensor]],
+        edge_last_layer_features_dict: Dict[str, List[torch.Tensor]],
+        cutoff_factors: torch.Tensor,
+        requested_output_names: List[str],
+        element_indices_nodes: torch.Tensor,
+    ) -> Optional[
+        Tuple[Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]]
+    ]:
+        """Batched last-layer evaluation for purely linear readouts.
+
+        For LinearReadout / single-layer species-conditioned Readout targets:
+
+        - the per-species grouping (sort + counts) is computed once per batch
+          instead of once per readout call;
+        - each block's weights are concatenated so every present species gets
+          one GEMM covering all blocks of a target/layer/kind;
+        - edge predictions exploit that the cutoff-weighted neighbor sum
+          commutes with a linear layer, so the GEMM runs on ``n_atoms`` rows
+          instead of ``n_atoms x max_num_neighbors``.
+
+        Eager-only (pruned from TorchScript); returns ``None`` when any
+        requested target uses a readout the fast path does not cover, in which
+        case the caller falls back to the general implementation.
+
+        :param node_last_layer_features_dict: as in
+            ``_calculate_atomic_predictions``.
+        :param edge_last_layer_features_dict: as in
+            ``_calculate_atomic_predictions``.
+        :param cutoff_factors: cutoff factors, zero at padded neighbor slots.
+        :param requested_output_names: targets to compute.
+        :param element_indices_nodes: per-atom species indices.
+        :return: the two per-target prediction dictionaries, or ``None``.
+        """
+        if not all(name in self._fast_readout_mode for name in requested_output_names):
+            return None
+
+        needs_grouping = any(
+            self._fast_readout_mode[name] == "zc" for name in requested_output_names
+        )
+        order = inverse_order = None
+        counts: List[int] = []
+        if needs_grouping:
+            order = torch.argsort(element_indices_nodes)
+            inverse_order = torch.argsort(order)
+            counts = torch.bincount(
+                element_indices_nodes, minlength=self.n_species
+            ).tolist()
+
+        def grouped_linear(
+            features: torch.Tensor, weights: torch.Tensor, biases: torch.Tensor
+        ) -> torch.Tensor:
+            assert order is not None and inverse_order is not None
+            x = features.index_select(0, order)
+            pieces: List[torch.Tensor] = []
+            start = 0
+            for s in range(self.n_species):
+                count = counts[s]
+                if count > 0:
+                    pieces.append(
+                        torch.nn.functional.linear(
+                            x[start : start + count], weights[s], biases[s]
+                        )
+                    )
+                start += count
+            if len(pieces) == 0:
+                return torch.zeros(
+                    0, weights.shape[1], dtype=features.dtype, device=features.device
+                )
+            return torch.cat(pieces, dim=0).index_select(0, inverse_order)
+
+        node_out: Dict[str, List[List[torch.Tensor]]] = {}
+        edge_out: Dict[str, List[List[torch.Tensor]]] = {}
+        cutoff_sums = cutoff_factors.sum(dim=1, keepdim=True)  # (n_atoms, 1)
+
+        for name in self.node_last_layers.keys():
+            if name not in requested_output_names:
+                continue
+            mode = self._fast_readout_mode[name]
+            node_out[name] = []
+            edge_out[name] = []
+            for i, (node_layer, edge_layer) in enumerate(
+                zip(
+                    self.node_last_layers[name],
+                    self.edge_last_layers[name],
+                    strict=True,
+                )
+            ):
+                node_features = node_last_layer_features_dict[name][i]
+                edge_features = edge_last_layer_features_dict[name][i]
+                # cutoff-weighted neighbor sum first: linear layers commute
+                # with it (bias handled via the cutoff sum below)
+                edge_summed = (edge_features * cutoff_factors[:, :, None]).sum(dim=1)
+
+                node_modules = list(node_layer.values())
+                edge_modules = list(edge_layer.values())
+                if mode == "linear":
+                    sizes = [m.weight.shape[0] for m in node_modules]
+                    node_full = torch.nn.functional.linear(
+                        node_features,
+                        torch.cat([m.weight for m in node_modules], dim=0),
+                        torch.cat([m.bias for m in node_modules], dim=0),
+                    )
+                    edge_full = torch.nn.functional.linear(
+                        edge_summed,
+                        torch.cat([m.weight for m in edge_modules], dim=0),
+                    ) + cutoff_sums * torch.cat([m.bias for m in edge_modules], dim=0)
+                else:  # "zc"
+                    sizes = [m.weights[0].shape[1] for m in node_modules]
+                    node_full = grouped_linear(
+                        node_features,
+                        torch.cat([m.weights[0] for m in node_modules], dim=1),
+                        torch.cat([m.biases[0] for m in node_modules], dim=1),
+                    )
+                    edge_bias = torch.cat([m.biases[0] for m in edge_modules], dim=1)
+                    edge_full = (
+                        grouped_linear(
+                            edge_summed,
+                            torch.cat([m.weights[0] for m in edge_modules], dim=1),
+                            torch.zeros_like(edge_bias),
+                        )
+                        + cutoff_sums * edge_bias[element_indices_nodes]
+                    )
+                node_out[name].append(list(torch.split(node_full, sizes, dim=-1)))
+                edge_out[name].append(list(torch.split(edge_full, sizes, dim=-1)))
+
+        return node_out, edge_out
 
 
 def process_non_conservative_stress(

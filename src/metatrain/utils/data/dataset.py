@@ -1,10 +1,15 @@
+import functools
+import io
 import math
 import multiprocessing
 import os
+import sys
 import warnings
 import zipfile
+import zlib
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import IO, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -16,17 +21,15 @@ from metatensor.torch import (
     TensorMap,
     load_buffer,
     make_contiguous,
-    make_contiguous_block,
     save_buffer,
 )
 from metatomic.torch import (
     ModelCapabilities,
     ModelOutput,
+    NeighborListOptions,
     System,
     load_system,
-    load_system_buffer,
 )
-from metatomic.torch import save_buffer as save_system_buffer
 from omegaconf import DictConfig
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import Subset
@@ -42,6 +45,61 @@ from metatrain.utils.data.target_info import (
 )
 from metatrain.utils.external_naming import to_external_name
 from metatrain.utils.units import get_gradient_units
+
+
+class RawExtraPayload:
+    """Marker base class for non-TensorMap extra-data payloads.
+
+    Entries in a batch's ``extra`` dictionary that subclass this are carried
+    RAW through the dataloader worker boundary (as plain tensors via shared
+    memory) instead of being serialised with ``save_buffer``. Subclasses must
+    implement ``to(dtype=..., device=..., non_blocking=...)`` so the trainer
+    can move them alongside the rest of the batch.
+    """
+
+
+def _lock_exclusive(lock_file: IO[str]) -> None:
+    """Acquire an exclusive, blocking lock on ``lock_file`` (POSIX and Windows).
+
+    :param lock_file: Open file handle to lock.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        lock_file.write("0")
+        lock_file.flush()
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+
+def _unlock(lock_file: IO[str]) -> None:
+    """Release a lock acquired with :func:`_lock_exclusive`.
+
+    :param lock_file: Open file handle to unlock.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _is_writing_rank() -> bool:
+    """Whether this process is allowed to mutate shared dataset files.
+
+    :return: ``True`` outside distributed runs, else only on global rank 0.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
 
 
 def _set(values: List[int]) -> List[int]:
@@ -375,6 +433,150 @@ def get_all_targets(datasets: Union[Dataset, List[Dataset]]) -> List[str]:
     return sorted(set(target_names))
 
 
+@dataclass
+class _PackedSystems:
+    """Raw-tensor transport of a batch of ``System`` objects.
+
+    ``save_buffer``/``load_buffer`` round-trips cost ~150 MB/s on the
+    neighbor-list-dominated payload and the load half runs serially in the
+    main process; plain tensors instead cross the dataloader worker boundary
+    through shared memory at memcpy speed. Only the (small, rare) extra data
+    blocks keep the buffer encoding.
+
+    :param n_atoms: Atoms per system.
+    :param positions: Concatenated positions, ``(sum(n_atoms), 3)``.
+    :param types: Concatenated atomic types, ``(sum(n_atoms),)``.
+    :param cells: Stacked cells, ``(n_systems, 3, 3)``.
+    :param pbc: Stacked periodic-boundary flags, ``(n_systems, 3)``.
+    :param nl_options: One ``(cutoff, full_list, strict)`` per neighbor list.
+    :param nl_samples: Per neighbor list, concatenated samples
+        ``(sum(pairs), 5)``.
+    :param nl_values: Per neighbor list, concatenated distance vectors
+        ``(sum(pairs), 3, 1)``.
+    :param nl_counts: Per neighbor list, pairs per system.
+    :param data_names: Names of per-system extra data blocks.
+    :param data_buffers: ``save_buffer`` blobs, one list per data name with one
+        entry per system.
+    """
+
+    n_atoms: List[int]
+    positions: torch.Tensor
+    types: torch.Tensor
+    cells: torch.Tensor
+    pbc: torch.Tensor
+    nl_options: List[Tuple[float, bool, bool]]
+    nl_samples: List[torch.Tensor]
+    nl_values: List[torch.Tensor]
+    nl_counts: List[List[int]]
+    data_names: List[str]
+    data_buffers: List[List[torch.Tensor]]
+
+
+_NL_SAMPLE_NAMES = [
+    "first_atom",
+    "second_atom",
+    "cell_shift_a",
+    "cell_shift_b",
+    "cell_shift_c",
+]
+
+
+def _pack_systems(systems: List[System]) -> _PackedSystems:
+    """Pack systems (with their neighbor lists and data) into raw tensors.
+
+    :param systems: Systems of one batch.
+    :return: The packed representation.
+    """
+    nl_options_objects = systems[0].known_neighbor_lists()
+    nl_options = [(o.cutoff, o.full_list, o.strict) for o in nl_options_objects]
+    nl_samples = []
+    nl_values = []
+    nl_counts = []
+    for options in nl_options_objects:
+        samples = []
+        values = []
+        counts = []
+        for system in systems:
+            nl = system.get_neighbor_list(options)
+            samples.append(nl.samples.values)
+            values.append(nl.values)
+            counts.append(nl.values.shape[0])
+        nl_samples.append(torch.cat(samples).contiguous())
+        nl_values.append(torch.cat(values).contiguous())
+        nl_counts.append(counts)
+
+    data_names = list(systems[0].known_data())
+    data_buffers = [
+        [save_buffer(make_contiguous(system.get_data(name))) for system in systems]
+        for name in data_names
+    ]
+
+    return _PackedSystems(
+        n_atoms=[len(system) for system in systems],
+        positions=torch.cat([system.positions for system in systems]).contiguous(),
+        types=torch.cat([system.types for system in systems]).contiguous(),
+        cells=torch.stack([system.cell for system in systems]).contiguous(),
+        pbc=torch.stack([system.pbc for system in systems]).contiguous(),
+        nl_options=nl_options,
+        nl_samples=nl_samples,
+        nl_values=nl_values,
+        nl_counts=nl_counts,
+        data_names=data_names,
+        data_buffers=data_buffers,
+    )
+
+
+def _unpack_systems(packed: _PackedSystems) -> List[System]:
+    """Rebuild the ``System`` objects from their packed representation.
+
+    :param packed: The packed batch.
+    :return: The rebuilt systems.
+    """
+    positions = torch.split(packed.positions, packed.n_atoms)
+    types = torch.split(packed.types, packed.n_atoms)
+    systems = [
+        System(
+            positions=p,
+            types=t,
+            cell=packed.cells[i],
+            pbc=packed.pbc[i],
+        )
+        for i, (p, t) in enumerate(zip(positions, types, strict=True))
+    ]
+
+    xyz = Labels(["xyz"], torch.tensor([[0], [1], [2]], dtype=torch.int32))
+    distance = Labels(["distance"], torch.tensor([[0]], dtype=torch.int32))
+    for (cutoff, full_list, strict), samples, values, counts in zip(
+        packed.nl_options,
+        packed.nl_samples,
+        packed.nl_values,
+        packed.nl_counts,
+        strict=True,
+    ):
+        options = NeighborListOptions(cutoff=cutoff, full_list=full_list, strict=strict)
+        for system, s, v in zip(
+            systems,
+            torch.split(samples, counts),
+            torch.split(values, counts),
+            strict=True,
+        ):
+            system.add_neighbor_list(
+                options,
+                TensorBlock(
+                    values=v,
+                    samples=Labels(_NL_SAMPLE_NAMES, s),
+                    components=[xyz],
+                    properties=distance,
+                ),
+            )
+
+    for name, buffers in zip(packed.data_names, packed.data_buffers, strict=True):
+        for system, buffer in zip(systems, buffers, strict=True):
+            system.add_data(name, load_buffer(buffer))
+
+    return systems
+
+
 class CollateFn:
     def __init__(
         self,
@@ -426,17 +628,27 @@ class CollateFn:
         self,
         batch: List[Dict[str, Any]],
     ) -> Optional[
-        Tuple[torch.Tensor, List[int], List[str], List[int], List[str], List[int]]
+        Tuple[
+            torch.Tensor,
+            "_PackedSystems",
+            List[str],
+            List[int],
+            List[str],
+            List[int],
+            Dict[str, Any],
+        ]
     ]:
         """
         :param batch: A batch
         :return: A tuple containing:
-            - a single tensor containing all systems, targets and extra data
+            - a single tensor containing all systems, targets and serialised extra data
             - a list with the sizes of each system buffer
             - a list with the names of each target
             - a list with the sizes of each target buffer
-            - a list with the names of each extra data
-            - a list with the sizes of each extra data buffer
+            - a list with the names of each serialised extra data
+            - a list with the sizes of each serialised extra data buffer
+            - a dict of raw (non-serialised) extra entries, e.g. ragged metric matrices,
+              carried alongside the blob and reattached by ``unpack_batch``
 
             Returns None if the batch is outside the specified atom count bounds.
         """
@@ -476,11 +688,20 @@ class CollateFn:
             systems, targets, extra = callable(systems, targets, extra)
 
         target_names = list(targets.keys())
-        extra_names = list(extra.keys())
+        # Partition extra data. TensorMaps are serialised into the blob via
+        # save_buffer (float64 only). RawExtraPayload entries (e.g. the ragged
+        # metric matrices and per-batch rotation info used by density losses)
+        # are carried RAW alongside the blob: this avoids save_buffer's
+        # float64-only constraint and the padding/extra copy, and lets them
+        # ride through the worker boundary as plain tensors.
+        raw_extra = {
+            name: value
+            for name, value in extra.items()
+            if isinstance(value, RawExtraPayload)
+        }
+        extra_names = [name for name in extra if name not in raw_extra]
 
-        system_buffers = [
-            save_system_buffer(_make_system_contiguous(s)) for s in systems
-        ]
+        packed_systems = _pack_systems(systems)
         target_buffers = [
             save_buffer(make_contiguous(targets[name])) for name in target_names
         ]
@@ -488,13 +709,26 @@ class CollateFn:
             save_buffer(make_contiguous(extra[name])) for name in extra_names
         ]
 
-        system_sizes = [len(b) for b in system_buffers]
         target_sizes = [len(b) for b in target_buffers]
         extra_sizes = [len(b) for b in extra_buffers]
 
-        blob = torch.concatenate(system_buffers + target_buffers + extra_buffers)
+        all_buffers = target_buffers + extra_buffers
+        # e.g. evaluation without targets: nothing to serialise
+        blob = (
+            torch.concatenate(all_buffers)
+            if all_buffers
+            else torch.zeros(0, dtype=torch.uint8)
+        )
 
-        return blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes
+        return (
+            blob,
+            packed_systems,
+            target_names,
+            target_sizes,
+            extra_names,
+            extra_sizes,
+            raw_extra,
+        )
 
 
 def unpack_batch(
@@ -506,15 +740,23 @@ def unpack_batch(
     :param batch: The batch to unpack.
     :return: A tuple with the unpacked batch
     """
-    blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes = batch
+    (
+        blob,
+        packed_systems,
+        target_names,
+        target_sizes,
+        extra_names,
+        extra_sizes,
+        raw_extra,
+    ) = batch
 
-    all_buffers = torch.split(blob, system_sizes + target_sizes + extra_sizes)
-    systems = all_buffers[: len(system_sizes)]
+    systems = _unpack_systems(packed_systems)
+    all_buffers = torch.split(blob, target_sizes + extra_sizes)
     targets = {
         name: buf
         for name, buf in zip(
             target_names,
-            all_buffers[len(system_sizes) : len(system_sizes) + len(target_names)],
+            all_buffers[: len(target_names)],
             strict=True,
         )
     }
@@ -522,14 +764,15 @@ def unpack_batch(
         name: buf
         for name, buf in zip(
             extra_names,
-            all_buffers[len(system_sizes) + len(target_names) :],
+            all_buffers[len(target_names) :],
             strict=True,
         )
     }
 
-    systems = list(load_system_buffer(s) for s in systems)
     targets = {key: load_buffer(t) for key, t in targets.items()}
     extra_data = {key: load_buffer(t) for key, t in extra_data.items()}
+    # Reattach raw (non-serialised) extra entries, e.g. ragged metric matrices.
+    extra_data.update(raw_extra)
     return systems, targets, extra_data
 
 
@@ -676,7 +919,10 @@ class DiskDataset(torch.utils.data.Dataset):
     directory. The directory's name is the index of the sample (e.g. ``0/``), and the
     files in the directory are the system (``system.mta``) and the targets (each named
     ``<target_name>.mts``). These are ``metatomic.torch.System`` and
-    ``metatensor.torch.TensorMap`` objects, respectively.
+    ``metatensor.torch.TensorMap`` objects, respectively. Extra data fields (e.g.
+    ``charge.mts`` and ``spin_multiplicity.mts`` for charge and spin conditioning)
+    can be stored in the same way and are read when the corresponding names appear
+    in the ``extra_data`` section of the options file.
 
     Such a dataset can be created conveniently using the :py:class:`DiskDatasetWriter`
     class.
@@ -699,19 +945,87 @@ class DiskDataset(torch.utils.data.Dataset):
             fields = {options.get("key", key): key for key, options in fields.items()}
 
         self._field_names = ["system"]
-        # check that we have at least one sample:
+        # Parse the zip's central directory ONCE, into compact numpy arrays of
+        # member locations. Keeping a zipfile.ZipFile per process instead is
+        # prohibitive for large datasets: every open re-parses the whole
+        # central directory into per-member Python objects (measured ~10 GB
+        # RSS and ~80 s for a 13M-member zip), and each dataloader worker
+        # process would pay it again. __getitem__ reads members by direct
+        # seek+decompress using these offsets instead.
         with zipfile.ZipFile(path, "r") as zip_file:
-            namelist = zip_file.namelist()
-            if "0/system.mta" not in namelist:
+            infos = zip_file.infolist()
+            n_members = len(infos)
+            member_entries = np.full(n_members, -1, dtype=np.int64)
+            member_offsets = np.empty(n_members, dtype=np.int64)
+            member_csizes = np.empty(n_members, dtype=np.int64)
+            member_methods = np.empty(n_members, dtype=np.int64)
+            member_field_ids = np.full(n_members, -1, dtype=np.int64)
+            field_ids: Dict[str, int] = {}
+            has_atom_counts = False
+            for i, info in enumerate(infos):
+                name = info.filename
+                if name == "_atom_counts.npy":
+                    has_atom_counts = True
+                    continue
+                slash = name.find("/")
+                if slash <= 0 or not name[:slash].isdigit():
+                    continue
+                field = name[slash + 1 :]
+                if field == "system.mta":
+                    field = "system"
+                elif field.endswith(".mts"):
+                    field = field[:-4]
+                else:
+                    continue
+                member_entries[i] = int(name[:slash])
+                member_offsets[i] = info.header_offset
+                member_csizes[i] = info.compress_size
+                member_methods[i] = info.compress_type
+                member_field_ids[i] = field_ids.setdefault(field, len(field_ids))
+            self._field_names += [f for f in field_ids if f != "system"]
+
+            # Build an explicit mapping position→zip_entry so that positional
+            # indices 0..N-1 always land on a valid entry even when the zip has
+            # gaps (missing entries due to failed structure processing).
+            system_field_id = field_ids.get("system", -1)
+            entry_numbers = member_entries[member_field_ids == system_field_id]
+            unique_entries, entry_counts = np.unique(entry_numbers, return_counts=True)
+            if len(unique_entries) != len(entry_numbers):
+                duplicates = unique_entries[entry_counts > 1].tolist()
                 raise ValueError(
-                    "Could not find `0/system.mta` in the zip file. "
+                    f"Duplicate entries {duplicates[:10]} found in this DiskDataset "
+                    "zip file. Reading such a file would silently return the "
+                    "last-written copy of each duplicated entry. It was likely "
+                    "produced by appending with an older, buggy DiskDatasetWriter "
+                    "that restarted indexing at 0; re-write the dataset."
+                )
+            self._valid_entry_indices: np.ndarray = unique_entries  # sorted
+            if len(self._valid_entry_indices) == 0:
+                raise ValueError(
+                    "Could not find any `<N>/system.mta` entries in the zip file. "
                     "The dataset format might be wrong, or the dataset might be empty. "
                     "Empty disk datasets are not supported."
                 )
-            for file_name in namelist:
-                if file_name.startswith("0/") and file_name.endswith(".mts"):
-                    self._field_names.append(file_name[2:-4])
-            self._len = len([f for f in namelist if f.endswith(".mta")])
+            self._len = len(self._valid_entry_indices)
+
+            # Optional atom-count file (written by DiskDatasetWriter), keyed by
+            # zip entry number. Lets get_num_atoms()/get_all_atom_counts() below
+            # answer without opening/deserializing every system, which is what makes
+            # this dataset usable with MaxAtomDistributedBatchSampler.
+            self._atom_counts: Optional[np.ndarray] = None
+            if has_atom_counts:
+                with zip_file.open("_atom_counts.npy", "r") as f:
+                    atom_counts = np.load(f)
+                if len(atom_counts) > self._valid_entry_indices[-1]:
+                    self._atom_counts = atom_counts
+                else:
+                    warnings.warn(
+                        "Ignoring '_atom_counts.npy' in this DiskDataset: it has "
+                        f"{len(atom_counts)} entries, too few for the highest zip "
+                        f"entry number found ({self._valid_entry_indices[-1]}). It "
+                        "is likely stale.",
+                        stacklevel=2,
+                    )
 
         # Determine which fields are going to be read
         if fields is None:
@@ -730,46 +1044,251 @@ class DiskDataset(torch.utils.data.Dataset):
 
         self._fields_to_read.append("mtt::aux::system_index")
 
-        fields_map = fields if isinstance(fields, dict) else {}
-        self._sample_class = namedtuple(
-            "Sample", [fields_map.get(field, field) for field in self._fields_to_read]
-        )
+        # Per-(entry, field) member locations for the fields we read:
+        # (header_offset, compress_size, compress_type), -1 where a member is
+        # missing. This is the only zip metadata workers need to read samples.
+        zip_fields = [f for f in self._fields_to_read if f != "mtt::aux::system_index"]
+        self._member_cols: Dict[str, int] = {f: c for c, f in enumerate(zip_fields)}
+        locs = np.full((self._len, len(zip_fields), 3), -1, dtype=np.int64)
+        for field_name, col in self._member_cols.items():
+            mask = member_field_ids == field_ids[field_name]
+            rows = np.searchsorted(self._valid_entry_indices, member_entries[mask])
+            # entries carrying this field but no system.mta are gaps: drop them
+            in_range = rows < self._len
+            ok = np.zeros(len(rows), dtype=bool)
+            ok[in_range] = (
+                self._valid_entry_indices[rows[in_range]]
+                == member_entries[mask][in_range]
+            )
+            rows = rows[ok]
+            sel = np.flatnonzero(mask)[ok]
+            locs[rows, col, 0] = member_offsets[sel]
+            locs[rows, col, 1] = member_csizes[sel]
+            locs[rows, col, 2] = member_methods[sel]
+        self._member_locs = locs
+
+        # target-config dicts remap dataset field names to target names
+        self._fields_map: Dict[str, str] = fields if isinstance(fields, dict) else {}
 
         # Do not open file in the main process and start sub-processes with None
-        self.zip_file: Optional[zipfile.ZipFile] = None
+        self.zip_file: Optional[IO[bytes]] = None
         self._zip_file_pid: Optional[int] = None
+
+    @functools.cached_property
+    def _sample_class(self) -> Any:
+        return namedtuple(
+            "Sample",
+            [self._fields_map.get(field, field) for field in self._fields_to_read],
+        )
+
+    def __getstate__(self) -> dict:
+        # zip_file is a BufferedReader — not picklable, must be re-opened per-process.
+        # _sample_class is a cached_property stored in __dict__ after first access; drop
+        # it so workers recreate it lazily rather than unpickling a dynamic class.
+        state = self.__dict__.copy()
+        state.pop("_sample_class", None)
+        state["zip_file"] = None
+        state["_zip_file_pid"] = None
+        return state
 
     def _open_zip_once(self) -> None:
         pid = os.getpid()
         if self._zip_file_pid != pid:
             if self.zip_file is not None:
                 self.zip_file.close()
-            self.zip_file = zipfile.ZipFile(self.zip_file_path, "r")
+            # A plain handle, NOT zipfile.ZipFile: members are read via the
+            # offsets indexed at construction, so per-process opens stay O(1)
+            # in memory and time regardless of how many members the zip has.
+            self.zip_file = open(self.zip_file_path, "rb")
             self._zip_file_pid = pid
+
+    def _read_member(self, index: int, field_name: str) -> io.BytesIO:
+        """Read one zip member by its indexed offset, bypassing the central
+        directory.
+
+        Sizes and compression method come from the construction-time index;
+        the member's local header is only parsed for its variable-length name
+        and extra fields. CRC is not re-verified.
+
+        :param index: Positional dataset index (row in the member index).
+        :param field_name: Field to read ("system" or a target/extra field).
+        :return: Decompressed member contents.
+        """
+        offset, csize, method = self._member_locs[index, self._member_cols[field_name]]
+        if offset < 0:
+            entry = int(self._valid_entry_indices[index])
+            raise KeyError(
+                f"There is no item named '{entry}/{field_name}' in the archive"
+            )
+        assert self.zip_file is not None
+        self.zip_file.seek(int(offset))
+        header = self.zip_file.read(30)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            raise zipfile.BadZipFile(
+                f"Bad local file header at offset {int(offset)} in "
+                f"'{self.zip_file_path}'"
+            )
+        name_len = int.from_bytes(header[26:28], "little")
+        extra_len = int.from_bytes(header[28:30], "little")
+        self.zip_file.seek(int(offset) + 30 + name_len + extra_len)
+        data = self.zip_file.read(int(csize))
+        if method == zipfile.ZIP_DEFLATED:
+            decompressor = zlib.decompressobj(-15)
+            data = decompressor.decompress(data) + decompressor.flush()
+        elif method != zipfile.ZIP_STORED:
+            raise NotImplementedError(
+                f"Unsupported zip compression method {int(method)} in "
+                f"'{self.zip_file_path}'"
+            )
+        return io.BytesIO(data)
 
     def __len__(self) -> int:
         return self._len
+
+    def _backfill_atom_counts(self) -> np.ndarray:
+        """
+        Compute atom counts for every entry by reading each system directly (not
+        the full sample, so targets/extra fields are skipped), then append them to
+        the zip as ``_atom_counts.npy`` so future opens of this dataset don't pay
+        this cost again. The array is indexed by zip entry number; entries missing
+        from the zip (gaps) hold zeros and are never read.
+
+        :return: Atom counts indexed by zip entry number.
+        """
+        # Guarded by an exclusive lock so concurrent callers (e.g. the ranks of a
+        # distributed job all opening a dataset that lacks this file) don't each
+        # pay the full scan or append a duplicate copy: the first caller computes
+        # and writes the file while the others wait, then simply load it. This
+        # does not protect against an unrelated, unlocked *reader* observing the
+        # file mid-append; that's a narrow window (only until the file exists)
+        # accepted here for simplicity.
+        lock_path = f"{self.zip_file_path}.lock"
+        try:
+            lock_file: Optional[IO[str]] = open(lock_path, "w")
+        except OSError as e:
+            # Read-only dataset location: no lock and no write-back possible.
+            # Fall back to computing the counts in memory for this process.
+            warnings.warn(
+                f"Could not create lock file '{lock_path}' ({e}); computing "
+                "atom counts in memory without persisting them to the zip.",
+                stacklevel=3,
+            )
+            lock_file = None
+
+        if lock_file is not None:
+            try:
+                _lock_exclusive(lock_file)
+            except OSError as e:
+                # Filesystems without lock support (e.g. Lustre mounted with
+                # noflock): same fallback as an unwritable lock file.
+                warnings.warn(
+                    f"Could not lock '{lock_path}' ({e}); computing atom "
+                    "counts in memory without persisting them to the zip.",
+                    stacklevel=3,
+                )
+                lock_file.close()
+                lock_file = None
+        try:
+            with zipfile.ZipFile(self.zip_file_path, "r") as zip_file:
+                # Another process may have just written the file while we were
+                # waiting for the lock: load it instead of re-scanning.
+                if "_atom_counts.npy" in zip_file.namelist():
+                    with zip_file.open("_atom_counts.npy", "r") as f:
+                        atom_counts = np.load(f)
+                    if len(atom_counts) > self._valid_entry_indices[-1]:
+                        self._atom_counts = atom_counts
+                        return atom_counts
+
+                warnings.warn(
+                    f"'{self.zip_file_path}' has no '_atom_counts.npy' file. "
+                    "Computing it now by reading every system once (one-time "
+                    "cost per dataset file).",
+                    stacklevel=3,
+                )
+                atom_counts = np.zeros(
+                    self._valid_entry_indices[-1] + 1, dtype=np.int64
+                )
+                for entry in self._valid_entry_indices:
+                    with zip_file.open(f"{entry}/system.mta", "r") as f:
+                        atom_counts[entry] = len(load_system(f))
+            self._atom_counts = atom_counts
+
+            # Only one process may mutate the shared dataset zip: file locks
+            # are not reliable across nodes on some parallel filesystems
+            # (e.g. Lustre mounted with noflock), so in distributed runs the
+            # write-back is restricted to rank 0. Other ranks keep their
+            # in-memory copy; the file is picked up on the next open.
+            if lock_file is not None and _is_writing_rank():
+                try:
+                    with zipfile.ZipFile(self.zip_file_path, "a") as zip_file:
+                        with zip_file.open("_atom_counts.npy", "w") as f:
+                            np.save(f, atom_counts)
+                except OSError as e:
+                    warnings.warn(
+                        f"Could not write '_atom_counts.npy' back to "
+                        f"'{self.zip_file_path}' ({e}); atom counts will be "
+                        "recomputed the next time this dataset is opened.",
+                        stacklevel=3,
+                    )
+        finally:
+            if lock_file is not None:
+                _unlock(lock_file)
+                lock_file.close()
+
+        return atom_counts
+
+    def get_num_atoms(self, i: int) -> int:
+        """
+        Return the atom count for positional index ``i``, using the
+        ``_atom_counts.npy`` file (computed and cached into the zip on first use
+        if missing). Enables use with
+        :class:`~metatrain.utils.data.samplers.MaxAtomDistributedBatchSampler`.
+
+        :param i: Positional dataset index.
+        :return: Number of atoms in sample ``i``.
+        """
+        atom_counts = self._atom_counts
+        if atom_counts is None:
+            atom_counts = self._backfill_atom_counts()
+        return int(atom_counts[self._valid_entry_indices[i]])
+
+    def get_all_atom_counts(self) -> np.ndarray:
+        """
+        Return atom counts for all positional indices in one vectorised call, using
+        the ``_atom_counts.npy`` file (computed and cached into the zip on first
+        use if missing).
+
+        :return: Atom counts for all samples, in dataset order.
+        """
+        atom_counts = self._atom_counts
+        if atom_counts is None:
+            atom_counts = self._backfill_atom_counts()
+        return atom_counts[self._valid_entry_indices].astype(np.int64)
 
     def __getitem__(self, index: int) -> Any:
         self._open_zip_once()
         assert self.zip_file is not None
 
+        # Translate positional index → actual zip entry number.
+        # _valid_entry_indices covers only entries that have system.mta, so
+        # we never hit gaps left by failed structure processing in the zip.
+        zip_entry = int(self._valid_entry_indices[index])
+
         system_and_targets = []
         for field_name in self._fields_to_read:
             if field_name == "system":
-                with self.zip_file.open(f"{index}/system.mta", "r") as file:
-                    system = load_system(file)
-                    system_and_targets.append(system)
+                system = load_system(self._read_member(index, field_name))
+                system_and_targets.append(system)
             elif field_name == "mtt::aux::system_index":
                 tensor_map = TensorMap(
                     keys=Labels(["_"], torch.tensor([[0]])),
                     blocks=[
                         TensorBlock(
                             # Integer values are not supported (coming soon)
-                            values=torch.tensor([[index]]).to(torch.float64),
+                            values=torch.tensor([[zip_entry]]).to(torch.float64),
                             samples=Labels(
                                 names=["system"],
-                                values=torch.tensor([[index]]),
+                                values=torch.tensor([[zip_entry]]),
                             ),
                             components=[],
                             properties=Labels(["_"], torch.tensor([[0]])),
@@ -778,11 +1297,10 @@ class DiskDataset(torch.utils.data.Dataset):
                 )
                 system_and_targets.append(tensor_map)
             else:
-                with self.zip_file.open(f"{index}/{field_name}.mts", "r") as file:
-                    numpy_buffer = np.load(file)
-                    tensor_buffer = torch.from_numpy(numpy_buffer)
-                    tensor_map = load_buffer(tensor_buffer)
-                    system_and_targets.append(tensor_map)
+                numpy_buffer = np.load(self._read_member(index, field_name))
+                tensor_buffer = torch.from_numpy(numpy_buffer)
+                tensor_map = load_buffer(tensor_buffer)
+                system_and_targets.append(tensor_map)
         return self._sample_class(*system_and_targets)
 
     def __iter__(self) -> Any:
@@ -960,31 +1478,6 @@ def validate_num_workers(num_workers: int) -> None:
             "'fork' (this is likely because you are on macOS or Windows). "
             "In this case, num_workers must be set to 0."
         )
-
-
-def _make_system_contiguous(system: System) -> System:
-    """
-    Return a copy of a ``System`` object with contiguous arrays.
-
-    :param system: The system to make contiguous.
-    :return: A copy of the system with contiguous arrays.
-    """
-    new_system = System(
-        positions=system.positions.contiguous(),
-        types=system.types.contiguous(),
-        cell=system.cell.contiguous(),
-        pbc=system.pbc.contiguous(),
-    )
-    for nl_options in system.known_neighbor_lists():
-        nl = system.get_neighbor_list(nl_options)
-        new_system.add_neighbor_list(
-            nl_options,
-            make_contiguous_block(nl),
-        )
-    for key in system.known_data():
-        data = system.get_data(key)
-        new_system.add_data(key, make_contiguous(data))
-    return new_system
 
 
 class MemmapArray:

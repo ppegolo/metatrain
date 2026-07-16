@@ -1,3 +1,4 @@
+import functools
 import warnings
 from typing import Callable, Dict, List, Tuple
 
@@ -27,6 +28,46 @@ def remove_additive(
     :param target_info_dict: Dictionary containing information about the targets.
     :return: The updated targets, with the additive contribution removed.
     """
+    return _apply_additive(
+        systems, targets, additive_model, target_info_dict, sign=-1.0
+    )
+
+
+def add_additive(
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    additive_model: torch.nn.Module,
+    target_info_dict: Dict[str, TargetInfo],
+) -> Dict[str, TensorMap]:
+    """Add an additive contribution onto ``targets`` (inverse of
+    :func:`remove_additive`), e.g. to reconstruct full RI coefficients
+    ``c = (c - CM) + CM`` from CM-removed predictions.
+
+    :param systems: List of systems.
+    :param targets: Dictionary containing the (contribution-removed) tensors.
+    :param additive_model: The model used to calculate the additive contribution.
+    :param target_info_dict: Dictionary containing information about the targets.
+    :return: The updated targets, with the additive contribution added back.
+    """
+    return _apply_additive(systems, targets, additive_model, target_info_dict, sign=1.0)
+
+
+def _apply_additive(
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    additive_model: torch.nn.Module,
+    target_info_dict: Dict[str, TargetInfo],
+    sign: float,
+) -> Dict[str, TensorMap]:
+    """Add ``sign`` times the additive-model contribution to ``targets``.
+
+    :param systems: List of systems.
+    :param targets: Dictionary containing the targets corresponding to the systems.
+    :param additive_model: The model used to calculate the additive contribution.
+    :param target_info_dict: Dictionary containing information about the targets.
+    :param sign: ``-1.0`` to remove the contribution, ``1.0`` to add it back.
+    :return: The updated targets.
+    """
     warnings.filterwarnings(
         "ignore",
         category=RuntimeWarning,
@@ -35,16 +76,17 @@ def remove_additive(
             "require grad and does not have a grad_fn"
         ),
     )
-    additive_contribution = evaluate_model(
-        additive_model,
-        systems,
-        {
-            key: target_info_dict[key]
-            for key in targets.keys()
-            if key in additive_model.outputs
-        },
-        is_training=False,  # we don't need any gradients w.r.t. any parameters
-    )
+    with torch.no_grad():
+        additive_contribution = evaluate_model(
+            additive_model,
+            systems,
+            {
+                key: target_info_dict[key]
+                for key in targets.keys()
+                if key in additive_model.outputs
+            },
+            is_training=False,  # we don't need any gradients w.r.t. any parameters
+        )
 
     for target_key in additive_contribution.keys():
         # note that we loop over the keys of additive_contribution, not targets,
@@ -69,9 +111,12 @@ def remove_additive(
                     )
                 continue
             key_vals.append(block_key.values)
-            device = targets[target_key].block(block_key).values.device
+            target_values = targets[target_key].block(block_key).values
+            device = target_values.device
             block = mts.TensorBlock(
-                values=old_block.values.detach().to(device=device),
+                values=old_block.values.detach().to(
+                    device=device, dtype=target_values.dtype
+                ),
                 samples=targets[target_key].block(block_key).samples,
                 components=[c.to(device=device) for c in old_block.components],
                 properties=old_block.properties.to(device=device),
@@ -110,7 +155,7 @@ def remove_additive(
                         block,
                         _multiply_block_constant(
                             additive_contribution[target_key].block(key),
-                            -1.0,
+                            sign,
                         ),
                     )
                 )
@@ -126,6 +171,18 @@ def remove_additive(
     return targets
 
 
+def _remove_additive_transform_impl(
+    additive_models: List[torch.nn.Module],
+    target_info_dict: Dict[str, TargetInfo],
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    extra: Dict[str, TensorMap],
+) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+    for additive_model in additive_models:
+        targets = remove_additive(systems, targets, additive_model, target_info_dict)
+    return systems, targets, extra
+
+
 def get_remove_additive_transform(
     additive_models: List[torch.nn.Module],
     target_info_dict: Dict[str, TargetInfo],
@@ -139,27 +196,6 @@ def get_remove_additive_transform(
     :return: A function that takes in systems, targets and extra data, and returns
         the systems, updated targets and extra data.
     """
-
-    def transform(
-        systems: List[System],
-        targets: Dict[str, TensorMap],
-        extra: Dict[str, TensorMap],
-    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-        """
-        Transform function that removes the additive contributions from the targets.
-
-        :param systems: List of systems.
-        :param targets: Dictionary containing the targets corresponding to the systems.
-        :param extra: Dictionary containing any extra data.
-        :return: The systems, updated targets and extra data.
-        """
-        for additive_model in additive_models:
-            targets = remove_additive(
-                systems,
-                targets,
-                additive_model,
-                target_info_dict,
-            )
-        return systems, targets, extra
-
-    return transform
+    return functools.partial(
+        _remove_additive_transform_impl, additive_models, target_info_dict
+    )

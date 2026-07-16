@@ -4,7 +4,7 @@
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Type
 
 import metatensor.torch as mts
 import torch
@@ -15,6 +15,10 @@ from torch.nn.modules.loss import _Loss
 from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
+
+
+if TYPE_CHECKING:
+    from metatrain.utils.atomic_basis.pyscf import BatchRotations
 
 
 @with_config(ConfigDict(extra="allow"))
@@ -442,6 +446,471 @@ class TensorMapMaskedHuberLoss(MaskedTensorMapLoss):
             reduction,
             loss_fn=torch.nn.HuberLoss(reduction=reduction, delta=delta),
         )
+
+
+########################################################################################
+# RI-coefficient helper functions (PySCF ordering)
+
+########################################################################################
+# RI coefficient helpers (PySCF basis ordering)
+########################################################################################
+
+
+def _ri_coefficients_delta_pyscf_order(
+    tensor_map_pred: TensorMap,
+    tensor_map_targ: TensorMap,
+) -> list[torch.Tensor]:
+    """
+    Flatten RI coefficient deltas directly in the PySCF basis order.
+
+    :param tensor_map_pred: Predicted RI coefficients.
+    :param tensor_map_targ: Target RI coefficients.
+    :return: One 1D tensor per system in PySCF coefficient order.
+    """
+    return [
+        pred - targ
+        for pred, targ in _ri_coefficients_pyscf_order_aligned(
+            tensor_map_pred, tensor_map_targ
+        )
+    ]
+
+
+def _ri_coefficients_pyscf_order(tensor_map: TensorMap) -> list[torch.Tensor]:
+    """Flatten RI coefficients in the PySCF basis order.
+
+    :param tensor_map: RI coefficients to flatten.
+    :return: One 1D tensor per system in PySCF coefficient order.
+    """
+    return [item[0] for item in _ri_coefficients_pyscf_order_aligned(tensor_map)]
+
+
+def _ri_coefficients_pyscf_order_aligned(
+    *tensor_maps: TensorMap,
+) -> list[tuple[torch.Tensor, ...]]:
+    """
+    Flatten several RI TensorMaps with a shared NaN mask (union across maps).
+
+    :param *tensor_maps: RI TensorMaps with identical keys and samples.
+    :return: One tuple per system with one flat tensor per input map, all of
+        equal length per system, in PySCF coefficient order.
+    """
+    if len(tensor_maps) == 0:
+        return []
+
+    first_map = tensor_maps[0]
+    # fetch all blocks once per map: repeated .block(key) lookups cost ~100 us
+    # of metatensor dispatch each, right in the loss hot path
+    key_order = sorted(
+        range(len(first_map.keys)),
+        key=lambda i: int(first_map.keys.values[i, 0]),
+    )
+    if len(key_order) == 0:
+        return []
+
+    ordered_lambdas = [int(first_map.keys.values[i, 0]) for i in key_order]
+    per_map_blocks = [
+        [tensor_map.blocks()[i] for i in key_order] for tensor_map in tensor_maps
+    ]
+
+    first_block = per_map_blocks[0][0]
+    if len(first_block.samples) == 0:
+        return []
+
+    system_indices = first_block.samples.values[:, 0]
+    _, sample_counts = torch.unique_consecutive(system_indices, return_counts=True)
+
+    # Flatten each map to one (n_samples, total_features) matrix with the blocks
+    # concatenated in o3_lambda order, so that row-major flattening yields the
+    # PySCF element order: atom-major, then block, then feature. This keeps the
+    # whole selection to a handful of large kernels instead of one tiny
+    # masked-index per (atom, block, map) in the loss hot path.
+    per_map_flat: list[torch.Tensor] = []
+    union_invalid: Optional[torch.Tensor] = None
+    for blocks in per_map_blocks:
+        per_block = []
+        for ell, block in zip(ordered_lambdas, blocks, strict=True):
+            values = block.values
+            if ell == 1:
+                values = values[:, [2, 0, 1], :]
+            per_block.append(values.transpose(1, 2).reshape(values.shape[0], -1))
+        flat = torch.cat(per_block, dim=1)
+        per_map_flat.append(flat)
+        invalid = torch.isnan(flat)
+        union_invalid = invalid if union_invalid is None else (union_invalid | invalid)
+    assert union_invalid is not None
+    valid = ~union_invalid
+
+    # Retained elements per system: valid entries per sample, segment-summed
+    # over each system's consecutive samples — one device sync for the whole
+    # batch instead of one per system.
+    per_sample_counts = valid.sum(dim=1)
+    system_positions = torch.repeat_interleave(
+        torch.arange(len(sample_counts), device=per_sample_counts.device),
+        sample_counts.to(per_sample_counts.device),
+    )
+    per_system_counts_t = torch.zeros(
+        len(sample_counts),
+        dtype=per_sample_counts.dtype,
+        device=per_sample_counts.device,
+    ).scatter_add_(0, system_positions, per_sample_counts)
+    per_system_counts = per_system_counts_t.tolist()
+
+    flat_mask = valid.reshape(-1)
+    per_map_split = [
+        torch.split(flat.reshape(-1)[flat_mask], per_system_counts)
+        for flat in per_map_flat
+    ]
+
+    return [
+        tuple(split[i_system] for split in per_map_split)
+        for i_system in range(len(per_system_counts))
+    ]
+
+
+########################################################################################
+# RI density losses
+########################################################################################
+
+
+def _unrotate_spherical_map(
+    tensor_map: TensorMap, rotations: "BatchRotations"
+) -> TensorMap:
+    """Undo the per-system rotational augmentation of a spherical TensorMap.
+
+    The augmenter applies ``v' = parity * D_l v`` along the ``o3_mu`` component
+    dimension (``parity = (-1)^l * sigma`` for inverted systems); this applies
+    the exact inverse, so quantities compared against *unrotated* references
+    (e.g. metric matrices cached on unrotated geometries) stay consistent:
+    ``Δc'ᵀ (D M Dᵀ) Δc' == (Dᵀ Δc')ᵀ M (Dᵀ Δc')``.
+
+    :param tensor_map: Densified spherical map with rows grouped consecutively
+        per system, in batch order.
+    :param rotations: The batch's rotation info, as stashed by the augmenter.
+    :return: The un-rotated map.
+    """
+    new_blocks = []
+    for key, block in tensor_map.items():
+        ell, sigma = int(key[0]), int(key[1])
+        values = block.values  # (rows, 2l+1, properties)
+        _, counts = torch.unique_consecutive(
+            block.samples.values[:, 0], return_counts=True
+        )
+        wigner = rotations.wigner[ell].to(dtype=values.dtype, device=values.device)
+        # inverse of v' = D v along the component dimension is Dᵀ v'
+        wigner_rows = torch.repeat_interleave(wigner, counts, dim=0)
+        new_values = torch.bmm(wigner_rows.transpose(1, 2), values)
+        parity = torch.where(
+            rotations.inverted.to(values.device),
+            float((-1) ** ell * sigma),
+            1.0,
+        ).to(values.dtype)
+        new_values = new_values * torch.repeat_interleave(parity, counts).reshape(
+            -1, 1, 1
+        )
+        new_blocks.append(
+            TensorBlock(
+                values=new_values,
+                samples=block.samples,
+                components=block.components,
+                properties=block.properties,
+            )
+        )
+    return TensorMap(tensor_map.keys, new_blocks)
+
+
+def _validate_coefficient_sizes(
+    coefficient_sizes: list[int], basis_sizes: list[int]
+) -> None:
+    """Check flattened RI coefficient sizes against the metric-matrix sizes.
+
+    :param coefficient_sizes: Per-system flattened coefficient lengths.
+    :param basis_sizes: Per-system auxiliary-basis sizes of the metric matrices.
+    """
+    if len(basis_sizes) != len(coefficient_sizes):
+        raise ValueError(
+            "The number of packed metric matrices does not match the number of systems."
+        )
+    for coeff_size, basis_size in zip(coefficient_sizes, basis_sizes, strict=True):
+        if coeff_size != basis_size:
+            raise ValueError(
+                "The RI target size does not match the configured auxiliary basis. "
+                "Check that 'ri_aux_basis' matches the RI coefficients stored in "
+                "the dataset."
+            )
+
+
+def _reduce(loss_values: torch.Tensor, reduction: str) -> torch.Tensor:
+    """Apply a ``"mean"``/``"sum"``/``"none"`` reduction to per-system loss values.
+
+    :param loss_values: Per-system loss values.
+    :param reduction: Reduction mode.
+    :return: Reduced loss.
+    """
+    if reduction == "mean":
+        return loss_values.mean()
+    elif reduction == "sum":
+        return loss_values.sum()
+    elif reduction == "none":
+        return loss_values
+    else:
+        raise ValueError(f"Unknown reduction '{reduction}'")
+
+
+class DensityMSELossViaC(LossInterface):
+    """
+    Quadratic density loss using the coefficient residual: ``L = Δc^T · M · Δc``.
+
+    This is the L2 loss on the real-space electron density for metric ``M``:
+
+    - ``metric="overlap"``: ``M = S`` (two-centre overlap) — the true
+      :math:`\\int |\\rho_{ML}(r) - \\rho_{RI}(r)|^2\\,dr` for the RI expansion.
+    - ``metric="coulomb"``: ``M = J`` (two-centre Coulomb ERI) — the electrostatic
+      self-energy of the density residual.
+
+    Predictions and targets must be passed at the same physical scale (CM
+    subtracted, no per-coefficient normalisation applied), because per-property
+    scales cannot be factored out of the quadratic form.  The trainer is
+    responsible for rescaling before calling :meth:`compute`.
+
+    :param name: key of the RI-coefficient target.
+    :param gradient: not supported; must be ``None``.
+    :param weight: loss weight in the aggregated loss.
+    :param reduction: ``"mean"`` or ``"sum"``.
+    :param metric: two-centre metric to use — ``"overlap"`` (default) or ``"coulomb"``.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        metric: str = "overlap",
+    ):
+        super().__init__(name, gradient, weight, reduction)
+        self.metric = metric
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        if self.gradient is not None:
+            raise NotImplementedError(
+                "DensityMSELossViaC does not support gradients of RI targets."
+            )
+        assert extra_data is not None, (
+            "DensityMSELossViaC requires extra_data with the packed metric matrix."
+        )
+        # Lazy import: the atomic-basis machinery must not load for users
+        # who never configure a density loss.
+        from metatrain.utils.atomic_basis.pyscf import (
+            BATCH_ROTATIONS_NAME,
+            metric_matrix_name,
+        )
+
+        mat_name = metric_matrix_name(self.target, self.metric)
+        assert mat_name in extra_data, (
+            f"DensityMSELossViaC requires '{mat_name}' in extra_data"
+        )
+
+        tensor_map_pred = predictions[self.target]
+        tensor_map_targ = targets[self.target]
+        rotations = extra_data.get(BATCH_ROTATIONS_NAME)
+        if rotations is not None:
+            # Training batches are rotationally augmented, but the metric
+            # matrices are cached on the unrotated geometries: un-rotate the
+            # coefficients so the quadratic form is evaluated consistently.
+            tensor_map_pred = _unrotate_spherical_map(tensor_map_pred, rotations)
+            tensor_map_targ = _unrotate_spherical_map(tensor_map_targ, rotations)
+        delta_coefficients = _ri_coefficients_delta_pyscf_order(
+            tensor_map_pred, tensor_map_targ
+        )
+
+        if len(delta_coefficients) == 0:
+            first_block = tensor_map_pred.block(tensor_map_pred.keys[0])
+            return torch.zeros(
+                (), dtype=first_block.values.dtype, device=first_block.values.device
+            )
+
+        ragged_matrix = extra_data[mat_name]
+        basis_sizes = ragged_matrix.sizes
+        matrices = ragged_matrix.matrices()
+        _validate_coefficient_sizes([len(d) for d in delta_coefficients], basis_sizes)
+
+        # L_i = Δc_i^T M_i Δc_i, evaluated per system on the ragged matrices (no
+        # padding, no batch-max blow-up). The quadratic form runs in the matrix dtype
+        # (= model dtype in training); the cast is a no-op when they already match and
+        # reproduces the old padded path, which placed Δc in a matrix-dtype buffer.
+        per_system = []
+        for delta, matrix in zip(delta_coefficients, matrices, strict=True):
+            delta = delta.to(matrix.dtype)
+            # dot(mv(...)) is the same contraction as the previous einsum but
+            # ~3x cheaper: no dispatch/reshape overhead and a leaner backward
+            per_system.append(torch.dot(delta, torch.mv(matrix, delta)))
+        loss_values = torch.stack(per_system)
+
+        return _reduce(loss_values, self.reduction)
+
+
+class DensityMSELossViaW(LossInterface):
+    """
+    Density-fit loss using projection vectors as reference data.
+
+    Implements ``L = c_ML^T M c_ML - 2 c_ML^T w`` per system, where ``w = M c_RI``
+    are the projections of the reference density coefficients under the chosen metric
+    ``M``.  Adding the pre-computed per-system constant ``c_RI^T w`` (stored in
+    ``extra_data`` by the collate transform) makes the loss bounded below at zero;
+    this constant has no gradient w.r.t. model parameters.
+
+    - ``metric="overlap"``: ``M = S`` (two-centre overlap). Avoids computing
+      ``c_RI = S⁻¹ w_S`` entirely, circumventing the ill-conditioning of ``S``.
+    - ``metric="coulomb"``: ``M = J`` (two-centre Coulomb ERI). Minimises the
+      electrostatic self-energy of the prediction error in coefficient space.
+
+    Predictions must be fully reconstructed RI coefficients — composition-model
+    contributions added back and all scales applied — because the projections and
+    constant are in the same physical units.  The trainer handles this before
+    calling :meth:`compute`.
+
+    :param name: key of the RI-coefficient target.
+    :param gradient: not supported; must be ``None``.
+    :param weight: loss weight in the aggregated loss.
+    :param reduction: ``"mean"`` or ``"sum"``.
+    :param metric: two-centre metric to use — ``"overlap"`` (default) or ``"coulomb"``.
+    :param projections_key: ``extra_data`` key for the projection vectors
+        ``w = M c_RI``.  Defaults to ``<target_name>_projections`` when ``None``.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        metric: str = "overlap",
+        projections_key: Optional[str] = None,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+        from metatrain.utils.atomic_basis.pyscf import ri_projections_name
+
+        self.metric = metric
+        self.projections_key = (
+            projections_key
+            if projections_key is not None
+            else ri_projections_name(name)
+        )
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        if self.gradient is not None:
+            raise NotImplementedError(
+                "DensityMSELossViaW does not support gradients of RI targets."
+            )
+        assert extra_data is not None, (
+            "DensityMSELossViaW requires extra_data with the packed metric matrix "
+            "and RI projections."
+        )
+        # Lazy import: the atomic-basis machinery must not load for users
+        # who never configure a density loss.
+        from metatrain.utils.atomic_basis.pyscf import (
+            BATCH_ROTATIONS_NAME,
+            metric_matrix_name,
+            ri_density_fit_constant_name,
+        )
+
+        mat_name = metric_matrix_name(self.target, self.metric)
+        projection_name = self.projections_key
+        assert mat_name in extra_data, (
+            f"DensityMSELossViaW requires '{mat_name}' in extra_data"
+        )
+        assert projection_name in extra_data, (
+            f"DensityMSELossViaW requires '{projection_name}' in extra_data"
+        )
+
+        tensor_map_pred = predictions[self.target]
+        projection_map = extra_data[projection_name]
+        rotations = extra_data.get(BATCH_ROTATIONS_NAME)
+        if rotations is not None:
+            # See DensityMSELossViaC: metric matrices are cached unrotated, so
+            # both the coefficients and the projections are rotated back (the
+            # linear term is invariant under the shared rotation, the
+            # pre-computed constant needs no change).
+            tensor_map_pred = _unrotate_spherical_map(tensor_map_pred, rotations)
+            projection_map = _unrotate_spherical_map(projection_map, rotations)
+
+        # Align predictions and projections under a shared NaN mask so both
+        # flat vectors are the same length per system.
+        aligned = _ri_coefficients_pyscf_order_aligned(tensor_map_pred, projection_map)
+        coefficients = [item[0] for item in aligned]
+        projections = [item[1] for item in aligned]
+
+        if len(coefficients) == 0:
+            first_block = tensor_map_pred.block(tensor_map_pred.keys[0])
+            return torch.zeros(
+                (), dtype=first_block.values.dtype, device=first_block.values.device
+            )
+
+        ragged_matrix = extra_data[mat_name]
+        basis_sizes = ragged_matrix.sizes
+        matrices = ragged_matrix.matrices()
+        _validate_coefficient_sizes([len(c) for c in coefficients], basis_sizes)
+
+        # Per system (ragged, no padding):
+        #   quadratic_i = c_i^T M_i c_i ;  linear_i = c_i^T w_i
+        # Run in the matrix dtype (= model dtype in training); the cast is a no-op when
+        # dtypes already match and reproduces the old matrix-dtype padded buffers.
+        mdtype = ragged_matrix.values.dtype
+        quad_parts = []
+        lin_parts = []
+        for c, p, matrix in zip(coefficients, projections, matrices, strict=True):
+            c = c.to(mdtype)
+            quad_parts.append(torch.dot(c, torch.mv(matrix, c)))
+            lin_parts.append(torch.dot(c, p.to(mdtype)))
+        quadratic = torch.stack(quad_parts)
+        linear = torch.stack(lin_parts)
+        # L_i = c_ML^T M c_ML - 2 c_ML^T w
+        loss_values = quadratic - 2.0 * linear
+
+        # Add the pre-computed per-system constant c_RI^T w (no gradient).
+        # The constants are labelled by native system id (sorted); loss_values is
+        # ordered by appearance in the samples, so match by id instead of assuming
+        # the two orders coincide. The ids must come from the projections map:
+        # model predictions carry batch-local system ids (0..B-1), while the
+        # projections (like all dataloader-provided maps) keep native ids, with
+        # rows positionally aligned to the predictions.
+        constant_name = ri_density_fit_constant_name(self.target)
+        if constant_name in extra_data:
+            ordered_keys = sorted(projection_map.keys, key=lambda key: int(key[0]))
+            system_ids = torch.unique_consecutive(
+                projection_map.block(ordered_keys[0]).samples.values[:, 0]
+            )
+            const_block = extra_data[constant_name].block()
+            const_ids = const_block.samples.values[:, 0].to(
+                device=system_ids.device, dtype=system_ids.dtype
+            )
+            positions = torch.searchsorted(const_ids, system_ids).clamp(
+                max=len(const_ids) - 1
+            )
+            if len(system_ids) != len(loss_values) or not torch.equal(
+                const_ids[positions], system_ids
+            ):
+                raise ValueError(
+                    "The per-system density-fit constants do not match the systems "
+                    f"in the '{self.target}' predictions."
+                )
+            constants_all = const_block.values.squeeze(-1)
+            constants = constants_all[positions.to(constants_all.device)]
+            loss_values = loss_values + constants.to(
+                dtype=loss_values.dtype, device=loss_values.device
+            )
+
+        return _reduce(loss_values, self.reduction)
 
 
 class ShiftAgnosticMSE(LossInterface):
@@ -1203,6 +1672,8 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    DENSITY_MSE_VIA_C = ("density_mse_via_c", DensityMSELossViaC)
+    DENSITY_MSE_VIA_W = ("density_mse_via_w", DensityMSELossViaW)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key

@@ -18,11 +18,11 @@ from metatomic.torch import (
 
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL, CompositionModel
-from metatrain.utils.data import DatasetInfo, TargetInfo
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )
+from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.finetuning import apply_finetuning_strategy
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
@@ -30,6 +30,7 @@ from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler
 from metatrain.utils.sum_over_atoms import sum_over_atoms
 
+from ..utils.readouts import LinearReadout
 from . import checkpoints
 from .documentation import ModelHypers
 from .modules.backend import PETBackend
@@ -58,7 +59,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 16
+    __checkpoint_version__ = 17
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -89,10 +90,11 @@ class PET(ModelInterface[ModelHypers]):
         self.featurizer_type = self.hypers["featurizer_type"]
 
         self.atomic_types = dataset_info.atomic_types
+        nl_is_strict = bool(self.hypers["long_range"]["enable"])
         self.requested_nl = NeighborListOptions(
             cutoff=self.cutoff,
             full_list=True,
-            strict=True,
+            strict=nl_is_strict,
         )
         if self.featurizer_type not in AVAILABLE_FEATURIZERS:
             raise ValueError(
@@ -126,6 +128,10 @@ class PET(ModelInterface[ModelHypers]):
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
+        self.is_atomic_basis_target: Dict[str, bool] = {
+            target_name: target_info.is_atomic_basis
+            for target_name, target_info in dataset_info.targets.items()
+        }
         train_dataset_info = self._train_dataset_info(dataset_info)
 
         self.output_shapes: Dict[str, Dict[str, List[int]]] = {}
@@ -228,8 +234,11 @@ class PET(ModelInterface[ModelHypers]):
         train_dataset_info = self._train_dataset_info(dataset_info)
 
         # register new outputs as new last layers
-        for target_name in new_targets:
+        for target_name, raw_target_info in new_targets.items():
             self.target_names.append(target_name)
+            # Like in __init__, the flag must come from the raw (pre-densify)
+            # TargetInfo; _add_output reads it via self.is_atomic_basis_target.
+            self.is_atomic_basis_target[target_name] = raw_target_info.is_atomic_basis
             self._add_output(target_name, train_dataset_info.targets[target_name])
 
         self.dataset_info = merged_info
@@ -1035,19 +1044,32 @@ class PET(ModelInterface[ModelHypers]):
         )
 
         # The learnable heads and last layers live on the pure-PyTorch backend.
-        self.backend.add_output(target_name, self.output_shapes[target_name])
+        self.backend.add_output(
+            target_name,
+            self.output_shapes[target_name],
+            self.is_atomic_basis_target[target_name],
+        )
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).
+        # Only plain LinearReadout weights are registered: LLPR consumes these
+        # names as 2-D ``(n_properties, ll_features)`` linear weights, which the
+        # species-conditioned readouts (3-D per-species weights, MoE routers,
+        # FiLM parameters, ...) do not provide. Targets using such readouts get
+        # an empty list, so LLPR fails loudly instead of sampling garbage.
         self.last_layer_parameter_names[target_name] = []
         for layer_index in range(self.num_readout_layers):
             for key in self.output_shapes[target_name].keys():
-                self.last_layer_parameter_names[target_name].append(
-                    f"backend.node_last_layers.{target_name}.{layer_index}.{key}.weight"
-                )
-                self.last_layer_parameter_names[target_name].append(
-                    f"backend.edge_last_layers.{target_name}.{layer_index}.{key}.weight"
-                )
+                for prefix, last_layers in (
+                    ("node", self.backend.node_last_layers),
+                    ("edge", self.backend.edge_last_layers),
+                ):
+                    module = last_layers[target_name][layer_index][key]
+                    if isinstance(module, LinearReadout):
+                        self.last_layer_parameter_names[target_name].append(
+                            f"backend.{prefix}_last_layers.{target_name}."
+                            f"{layer_index}.{key}.weight"
+                        )
 
         ll_features_name = get_last_layer_features_name(target_name)
         self.outputs[ll_features_name] = ModelOutput(
@@ -1129,31 +1151,47 @@ def _extract_charge_spin_multiplicity(
     :return: ``(charges, spin_multiplicities)`` tensors of shape ``[n_systems]``,
         ``dtype=torch.long``.
     """
-    n_systems = len(systems)
-    charges = torch.zeros(n_systems, dtype=torch.long, device=device)
-    spin_multiplicities = torch.ones(n_systems, dtype=torch.long, device=device)
-    for i, system in enumerate(systems):
+    # Gather all per-system values first and validate them in one fused check:
+    # per-system torch.equal calls are host-device syncs that serialize the
+    # forward pass with the CPU (two per system per step).
+    charge_values: List[torch.Tensor] = []
+    spin_values: List[torch.Tensor] = []
+    for system in systems:
         if "charge" in system.known_data():
-            raw_charge = system.get_data("charge").block().values
-            if not torch.equal(raw_charge.round(), raw_charge):
-                raise ValueError(
-                    "charge must be an integer value, got "
-                    + str(raw_charge.item())
-                    + " for system "
-                    + str(i)
-                )
-            charges[i] = raw_charge.long().squeeze()
+            charge_values.append(
+                system.get_data("charge").block().values.reshape(-1)[:1].float()
+            )
+        else:
+            charge_values.append(torch.zeros(1, device=device))
         if "spin_multiplicity" in system.known_data():
-            raw_spin_multiplicity = system.get_data("spin_multiplicity").block().values
-            if not torch.equal(raw_spin_multiplicity.round(), raw_spin_multiplicity):
-                raise ValueError(
-                    "spin_multiplicity must be an integer value, got "
-                    + str(raw_spin_multiplicity.item())
-                    + " for system "
-                    + str(i)
-                )
-            spin_multiplicities[i] = raw_spin_multiplicity.long().squeeze()
-    return charges, spin_multiplicities
+            spin_values.append(
+                system.get_data("spin_multiplicity")
+                .block()
+                .values.reshape(-1)[:1]
+                .float()
+            )
+        else:
+            spin_values.append(torch.ones(1, device=device))
+
+    raw_charges = torch.cat(charge_values).to(device)
+    raw_spins = torch.cat(spin_values).to(device)
+    if not torch.equal(raw_charges.round(), raw_charges):
+        bad = int(torch.nonzero(raw_charges.round() != raw_charges)[0])
+        raise ValueError(
+            "charge must be an integer value, got "
+            + str(raw_charges[bad].item())
+            + " for system "
+            + str(bad)
+        )
+    if not torch.equal(raw_spins.round(), raw_spins):
+        bad = int(torch.nonzero(raw_spins.round() != raw_spins)[0])
+        raise ValueError(
+            "spin_multiplicity must be an integer value, got "
+            + str(raw_spins[bad].item())
+            + " for system "
+            + str(bad)
+        )
+    return raw_charges.long(), raw_spins.long()
 
 
 def get_last_layer_features_name(target_name: str) -> str:

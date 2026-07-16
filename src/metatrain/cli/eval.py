@@ -4,8 +4,13 @@ import itertools
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+
+if TYPE_CHECKING:
+    from metatrain.utils.atomic_basis import NullEvalHooks
+
+import metatensor.torch as mts
 import numpy as np
 import torch
 import tqdm
@@ -24,6 +29,7 @@ from metatrain.utils.data import (
     read_systems,
     unpack_batch,
 )
+from metatrain.utils.data.dataset import RawExtraPayload
 from metatrain.utils.data.readers import read_extra_data
 from metatrain.utils.data.target_info import DEPRECATED_METATOMIC_OUTPUT_NAMES
 from metatrain.utils.data.writers import (
@@ -144,6 +150,42 @@ def _prepare_eval_model_args(args: argparse.Namespace) -> None:
     )
 
 
+def _system_split_selections(
+    fields: Dict[str, TensorMap], n_systems: int
+) -> List[Labels]:
+    """Per-system sample selections for a batch of collated TensorMaps.
+
+    Collated maps carry the samples' original ``"system"`` values, so the ids
+    are recovered by order of first appearance across the fields' blocks
+    (collation concatenates per-sample rows in batch order).
+
+    :param fields: Collated TensorMaps of the batch.
+    :param n_systems: Number of systems in the batch.
+    :return: One ``Labels`` selection per system, in batch order.
+    """
+    ids_in_order: List[int] = []
+    seen = set()
+    device = torch.device("cpu")
+    for tensor_map in fields.values():
+        for block in tensor_map.blocks():
+            device = block.values.device
+            for system_id in block.samples.column("system").tolist():
+                if system_id not in seen:
+                    seen.add(system_id)
+                    ids_in_order.append(system_id)
+        if len(ids_in_order) == n_systems:
+            break
+    if len(ids_in_order) != n_systems:
+        raise ValueError(
+            f"Could not recover the {n_systems} per-system sample ids of this "
+            f"batch from its targets (found {ids_in_order})."
+        )
+    return [
+        Labels("system", torch.tensor([[system_id]], device=device))
+        for system_id in ids_in_order
+    ]
+
+
 def _eval_targets(
     model: Union[AtomisticModel, torch.jit.RecursiveScriptModule],
     dataset: Dataset,
@@ -152,6 +194,8 @@ def _eval_targets(
     check_consistency: bool = False,
     writer: Optional[Writer] = None,
     warm_up: bool = True,
+    eval_hooks: Optional["NullEvalHooks"] = None,
+    dump_writer: Optional[Writer] = None,
 ) -> None:
     """
     Evaluate `model` on `dataset`, accumulate RMSE/MAE, and (if `writer` is provided)
@@ -164,6 +208,11 @@ def _eval_targets(
     :param check_consistency: Whether to run consistency checks during model evaluation.
     :param writer: Optional writer to write out per-sample predictions.
     :param warm_up: Whether to do a warm-up of the model before evaluation.
+    :param eval_hooks: Optional target-type-specific hooks contributing collate
+        transforms and extra metrics (e.g. the density error for atomic-basis
+        targets).
+    :param dump_writer: Optional writer that streams out the evaluated dataset
+        itself (systems, reference targets and extra data) as it is consumed.
     """
     # Disable static fusion. Besides the fact that atomistic batches have variable
     # sizes, statically fused CUDA kernels cannot allocate new tensors at runtime,
@@ -207,6 +256,8 @@ def _eval_targets(
     ]
     if requested_inputs:
         callables.append(get_system_data_transform(requested_inputs))
+    if eval_hooks is not None:
+        callables.extend(eval_hooks.collate_transforms(dtype))
     collate_fn = CollateFn(target_keys, callables=callables)
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False
@@ -238,9 +289,23 @@ def _eval_targets(
     # Main evaluation loop
     for batch in tqdm.tqdm(dataloader, ncols=100):
         systems, batch_targets, batch_extra_data = unpack_batch(batch)
+        # Raw payloads (e.g. the ragged overlap matrices attached by the
+        # density-error hooks) implement .to() themselves but cannot pass
+        # through the TorchScript-typed batch_to.
+        raw_extra = {
+            key: value.to(dtype=dtype, device=device)
+            for key, value in batch_extra_data.items()
+            if isinstance(value, RawExtraPayload)
+        }
+        batch_extra_data = {
+            key: value
+            for key, value in batch_extra_data.items()
+            if not isinstance(value, RawExtraPayload)
+        }
         systems, batch_targets, batch_extra_data = batch_to(
             systems, batch_targets, batch_extra_data, dtype=dtype, device=device
         )
+        batch_extra_data.update(raw_extra)
 
         start_time = time.time()
         batch_predictions = evaluate_model(
@@ -264,23 +329,58 @@ def _eval_targets(
         rmse_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
         mae_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
 
+        if eval_hooks is not None:
+            eval_hooks.update(
+                systems, batch_predictions, batch_targets, batch_extra_data
+            )
+
         # Write out each sample if a writer is configured
         if writer:
             writer.write(systems, batch_predictions)
+
+        # Stream out the evaluated dataset itself if requested. The system
+        # index is excluded (DiskDataset synthesizes its own on read), as are
+        # non-TensorMap payloads (e.g. metric matrices attached by hooks).
+        if dump_writer:
+            dump_fields = dict(batch_targets)
+            dump_fields.update(
+                {
+                    key: value
+                    for key, value in batch_extra_data.items()
+                    if not isinstance(value, RawExtraPayload)
+                    and key != "mtt::aux::system_index"
+                }
+            )
+            # Collated targets keep their original "system" sample values (not
+            # batch-local 0..B-1), so split by the ids actually present, in
+            # batch order, and write one system at a time.
+            for system, selection in zip(
+                systems,
+                _system_split_selections(dump_fields, len(systems)),
+                strict=True,
+            ):
+                per_system_fields = {
+                    key: mts.split(value, "samples", [selection])[0]
+                    for key, value in dump_fields.items()
+                }
+                dump_writer.write([system], per_system_fields)
 
         # Timing
         time_taken = end_time - start_time
         total_time += time_taken
         timings_per_atom.append(time_taken / sum(len(system) for system in systems))
 
-    # Finish writer
+    # Finish writers
     if writer:
         writer.finish()
+    if dump_writer:
+        dump_writer.finish()
 
     # Finalize metrics and log
     rmse_vals = rmse_acc.finalize(not_per_atom=["positions_gradients"])
     mae_vals = mae_acc.finalize(not_per_atom=["positions_gradients"])
-    metrics = {**rmse_vals, **mae_vals}
+    hook_vals = eval_hooks.finalize() if eval_hooks is not None else {}
+    metrics = {**rmse_vals, **mae_vals, **hook_vals}
     metric_logger = MetricLogger(
         log_obj=logger, dataset_info=model.capabilities(), initial_metrics=metrics
     )
@@ -377,6 +477,31 @@ def eval_model(
                 eval_indices = load_indices(eval_indices)
             eval_dataset = Subset(eval_dataset, eval_indices)
 
+        eval_hooks = None
+        if options.get("density_error"):
+            if not hasattr(options, "targets"):
+                raise ValueError(
+                    "`density_error` requires a `targets` section in the "
+                    "evaluation options."
+                )
+            # Deferred import: only density-error evaluations pay for the
+            # atomic-basis machinery.
+            from metatrain.utils.atomic_basis import get_eval_hooks
+
+            eval_hooks = get_eval_hooks(options["density_error"], eval_info_dict)
+
+        dump_writer = None
+        if "dump_dataset" in options:
+            if not hasattr(options, "targets"):
+                raise ValueError(
+                    "`dump_dataset` requires a `targets` section in the "
+                    "evaluation options."
+                )
+            dump_path = Path(options["dump_dataset"])
+            dump_writer = DiskDatasetWriter(
+                f"{dump_path.parent / dump_path.stem}{idx_suffix}{dump_path.suffix}"
+            )
+
         # run evaluation & writing
         try:
             # we always let the writer handle I/O, so we never need return_predictions
@@ -389,6 +514,8 @@ def eval_model(
                 check_consistency=check_consistency,
                 writer=writer,
                 warm_up=warm_up,
+                eval_hooks=eval_hooks,
+                dump_writer=dump_writer,
             )
         except Exception as e:
             raise ArchitectureError(e)

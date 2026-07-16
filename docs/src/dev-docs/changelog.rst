@@ -34,6 +34,7 @@ Added
 - Optional per-system charge and spin-multiplicity conditioning for PET. Enabled via the
   ``system_conditioning`` model hyperparameter, with per-system ``charge`` and
   ``spin_multiplicity`` provided as ``extra_data``.
+- MACE architecture now supports multi-headed MACE models through the ``mace_head_name`` hyperparameter.
 
 Changed
 #######
@@ -42,6 +43,7 @@ Changed
   in the dataset, instead of looking for the target name).
 - Avoid reindexing of spherical atomic basis targets during densification and
   padding of atomic types.
+- PET requests a non-strict neighbor list and filters out-of-cutoff pairs internally.
 
 Removed
 #######
