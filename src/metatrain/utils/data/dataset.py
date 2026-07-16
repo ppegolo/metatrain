@@ -1176,7 +1176,18 @@ class DiskDataset(torch.utils.data.Dataset):
             lock_file = None
 
         if lock_file is not None:
-            _lock_exclusive(lock_file)
+            try:
+                _lock_exclusive(lock_file)
+            except OSError as e:
+                # Filesystems without lock support (e.g. Lustre mounted with
+                # noflock): same fallback as an unwritable lock file.
+                warnings.warn(
+                    f"Could not lock '{lock_path}' ({e}); computing atom "
+                    "counts in memory without persisting them to the zip.",
+                    stacklevel=3,
+                )
+                lock_file.close()
+                lock_file = None
         try:
             with zipfile.ZipFile(self.zip_file_path, "r") as zip_file:
                 # Another process may have just written the file while we were
