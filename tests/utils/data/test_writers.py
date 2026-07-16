@@ -780,3 +780,32 @@ def test_disk_dataset_reads_deflated_members(monkeypatch, tmp_path):
 
     dataset = DiskDataset("test_deflated.zip", fields=[])
     assert len(dataset[0].system) == 3
+
+
+def test_disk_dataset_atom_counts_survive_unsupported_locks(monkeypatch, tmp_path):
+    """Atom-count backfill must fall back to in-memory counts when the
+    filesystem rejects file locks (e.g. Lustre mounted with noflock), not
+    crash and not leak the lock handle."""
+    monkeypatch.chdir(tmp_path)
+
+    with zipfile.ZipFile("test_nolock.zip", "w") as zf:
+        for i, n in zip([0, 1], [2, 3], strict=True):
+            with zf.open(f"{i}/system.mta", "w") as f:
+                mta.save(f, _make_system(n))
+
+    import metatrain.utils.data.dataset as dataset_module
+
+    def _no_locks(lock_file):
+        raise OSError("No locks available")
+
+    monkeypatch.setattr(dataset_module, "_lock_exclusive", _no_locks)
+
+    dataset = DiskDataset("test_nolock.zip", fields=[])
+    # two warnings fire: the lock fallback and the one-time backfill scan
+    with pytest.warns(UserWarning) as record:
+        counts = dataset.get_all_atom_counts()
+    assert any("Could not lock" in str(w.message) for w in record)
+    assert counts.tolist() == [2, 3]
+    # nothing persisted without the lock
+    with zipfile.ZipFile("test_nolock.zip", "r") as zf:
+        assert "_atom_counts.npy" not in zf.namelist()
