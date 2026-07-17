@@ -1,3 +1,4 @@
+import gc
 import itertools
 import logging
 from typing import Callable, Dict, List, Optional, Sequence, Union
@@ -76,6 +77,7 @@ class Scaler(torch.nn.Module):
         batch_size: int,
         is_distributed: bool,
         initial_transforms: Sequence[Callable],
+        num_workers: int = 0,
     ) -> DataLoader:
         """
         Create a DataLoader for the provided datasets. As the dataloader is only used to
@@ -90,6 +92,9 @@ class Scaler(torch.nn.Module):
         :param initial_transforms: A list of callables to be included in
             the collate function. The callables passed here will be
             applied before the other callables set by the scaler.
+        :param num_workers: Number of worker processes for data loading. Defaults to 0
+            (synchronous loading in the main process), which can be very slow when
+            fitting on large (e.g. disk-based) datasets.
         :return: The created DataLoader.
         """
         # Create the collate function
@@ -139,6 +144,8 @@ class Scaler(torch.nn.Module):
                     shuffle=None if sampler else False,
                     drop_last=False,
                     collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    persistent_workers=False,
                 )
             )
 
@@ -153,6 +160,7 @@ class Scaler(torch.nn.Module):
         fixed_weights: Optional[FixedScalerWeights] = None,
         initial_transforms: Sequence[Callable] = (),
         per_structure_targets: Optional[List[str]] = None,
+        num_workers: int = 0,
     ) -> None:
         """
         Train the scaler model by accumulating the necessary quantities from the
@@ -179,6 +187,9 @@ class Scaler(torch.nn.Module):
             applied before the other callables set by the scaler.
         :param per_structure_targets: Target names that should be treated as
             per-structure quantities and therefore not divided by the number of atoms.
+        :param num_workers: Number of worker processes for data loading. Defaults to 0
+            (synchronous loading in the main process), which can be very slow when
+            fitting on large (e.g. disk-based) datasets.
         """
         if not isinstance(datasets, list):
             datasets = [datasets]
@@ -226,6 +237,7 @@ class Scaler(torch.nn.Module):
                     *initial_transforms,
                     get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 ],
+                num_workers=num_workers,
             )
 
             # accumulate
@@ -365,6 +377,15 @@ class Scaler(torch.nn.Module):
                         )
                     ).to(device),
                 )
+
+        if not skip_accumulation:
+            # Force this pass' worker processes to be reaped now rather than whenever
+            # the garbage collector gets around to the DataLoader's reference cycles:
+            # they would otherwise stay alive alongside the main training loop's own
+            # workers, for no benefit.
+            del dataloader
+            if num_workers > 0:
+                gc.collect()
 
     def restart(self, dataset_info: DatasetInfo) -> "Scaler":
         """
