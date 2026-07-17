@@ -11,6 +11,7 @@ from metatomic.torch.o3 import (
 )
 
 from .data import TargetInfo
+from .data.dataset import RawExtraPayload
 
 
 class O3Augmenter:
@@ -124,7 +125,12 @@ class O3Augmenter:
         new_extra_data: Dict[str, TensorMap] = {}
         if extra_data is not None:
             for name, tmap in extra_data.items():
-                if name.endswith("_mask"):
+                if isinstance(tmap, RawExtraPayload):
+                    # raw (non-TensorMap) payloads — e.g. metric matrices cached
+                    # on the unrotated geometries — are carried around the
+                    # augmentation untouched
+                    new_extra_data[name] = tmap
+                elif name.endswith("_mask"):
                     # loss masks are not physical quantities and must not be rotated
                     new_extra_data[name] = tmap
                 else:
