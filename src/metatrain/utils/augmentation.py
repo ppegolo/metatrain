@@ -44,6 +44,12 @@ class O3Augmenter:
         self._max_angular_momentum = _max_angular_momentum(
             target_info_dict, extra_data_info_dict
         )
+        self._has_spherical = any(
+            info.is_spherical
+            for info_dict in (target_info_dict, extra_data_info_dict)
+            for name, info in info_dict.items()
+            if not name.endswith("_mask")
+        )
 
     def apply_random_augmentations(
         self,
@@ -135,6 +141,22 @@ class O3Augmenter:
                     new_extra_data[name] = tmap
                 else:
                     new_extra_data[name] = _transform(tmap)
+
+        if self._has_spherical:
+            # Stash the per-system rotation info for downstream consumers (the
+            # density losses un-rotate their residuals with it, which keeps
+            # metric matrices cached on the unrotated geometries valid).
+            # Lazy import: only spherical-target training ever stashes this,
+            # and the atomic-basis package must not load for MLIP runs.
+            from .atomic_basis.pyscf import BATCH_ROTATIONS_NAME, BatchRotations
+
+            new_extra_data[BATCH_ROTATIONS_NAME] = BatchRotations(
+                wigner={
+                    ell: torch.stack([t.wigner_D_matrix(ell) for t in transformations])
+                    for ell in range(self._max_angular_momentum + 1)
+                },
+                inverted=torch.tensor([t.is_inverted for t in transformations]),
+            )
 
         return new_systems, new_targets, new_extra_data
 
