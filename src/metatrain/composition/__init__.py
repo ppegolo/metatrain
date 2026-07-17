@@ -34,6 +34,7 @@ def train_or_load_composition_model(
     batch_size: int,
     is_distributed: bool,
     checkpoint_dir: str = "",
+    num_workers: int = 0,
 ) -> None:
     """
     Train the composition model from data or load pre-trained weights.
@@ -49,6 +50,7 @@ def train_or_load_composition_model(
     :param batch_size: Batch size for data loading
     :param is_distributed: Whether training is distributed
     :param checkpoint_dir: Directory to save the composition model checkpoint
+    :param num_workers: Number of dataloader workers for the fitting pass
     """
     if isinstance(atomic_baseline, str):
         logging.info(f"Loading composition model from {atomic_baseline}")
@@ -96,6 +98,7 @@ def train_or_load_composition_model(
         hypers["atomic_baseline"] = atomic_baseline
         hypers["batch_size"] = batch_size
         hypers["distributed"] = is_distributed
+        hypers["num_workers"] = num_workers
         trainer = Trainer(hypers=hypers)
         trainer._additive_models = other_additive_models
         # The trainer fits on devices[0]; pass the model's current device so
