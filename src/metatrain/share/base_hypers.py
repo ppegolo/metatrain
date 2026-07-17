@@ -396,6 +396,22 @@ ValOrTestSetSpec = Annotated[
 
 
 @with_config(ConfigDict(extra="forbid", strict=True))
+class DensityErrorHypers(TypedDict):
+    aux_basis: str | dict[str, str]
+    """Auxiliary basis for the metric matrices of the density error.
+
+    Either a single PySCF basis name applied to every atomic-basis target, or
+    a per-target-name dictionary.
+    """
+    metric: NotRequired[Literal["overlap", "coulomb"]]
+    """Two-centre metric for the quadratic form (default: ``"overlap"``).
+
+    ``"overlap"`` gives the real-space L2 error of the density;
+    ``"coulomb"`` gives the electrostatic self-energy of the density error.
+    """
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
 class EvalDatasetDictHypers(TypedDict):
     systems: str | SystemsHypers
     """Path to the dataset file or a dictionary specifying the dataset."""
@@ -411,6 +427,20 @@ class EvalDatasetDictHypers(TypedDict):
     Can be either a list of integers (e.g., ``[0, 1, 5, 10]``) or a path to a
     text file containing one index per line. When specified, only the structures
     at these indices will be used from the dataset.
+    """
+    dump_dataset: NotRequired[str]
+    """Path of a DiskDataset zip to write the evaluated dataset to.
+
+    Streams the exact systems, targets and extra data that were evaluated
+    (after ``indices`` selection, in evaluation order) into a self-contained
+    dataset file that can be reused as a training or evaluation input.
+    """
+    density_error: NotRequired[DensityErrorHypers]
+    """Compute the real-space density RMSE for atomic-basis targets.
+
+    Reports ``sqrt(Σ Δc^T S Δc / Σ N_atoms)`` per RI target, with ``S`` the
+    two-centre overlap matrix of the configured auxiliary basis. Requires the
+    ``targets`` section.
     """
 
 

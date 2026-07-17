@@ -18,6 +18,8 @@ def build_train_dataloaders(
     max_atoms_per_batch: Optional[int],
     min_atoms_per_batch: int,
     num_workers: int,
+    multiprocessing_context: Optional[str] = None,
+    persistent_workers: bool = False,
 ) -> Tuple[List[DataLoader], List[Any]]:
     """Build one ``DataLoader`` per training dataset.
 
@@ -39,6 +41,10 @@ def build_train_dataloaders(
     :param min_atoms_per_batch: Minimum total atom count for a packed batch to be
         kept. Only used when ``max_atoms_per_batch`` is set.
     :param num_workers: Number of ``DataLoader`` workers.
+    :param multiprocessing_context: Worker start method (e.g. ``"spawn"``), or
+        ``None`` for the PyTorch default.
+    :param persistent_workers: Keep workers alive between epochs. Only meaningful
+        when ``num_workers > 0``.
     :return: A tuple ``(dataloaders, epoch_samplers)``. ``epoch_samplers`` contains
         every sampler (``DistributedSampler`` or ``MaxAtomDistributedBatchSampler``)
         that must have ``set_epoch()`` called on it before each epoch.
@@ -67,6 +73,8 @@ def build_train_dataloaders(
                     batch_sampler=batch_sampler,
                     collate_fn=collate_fn_train,
                     num_workers=num_workers,
+                    multiprocessing_context=multiprocessing_context,
+                    persistent_workers=persistent_workers,
                 )
             )
         else:
@@ -88,6 +96,8 @@ def build_train_dataloaders(
                     drop_last=(train_sampler is None),
                     collate_fn=collate_fn_train,
                     num_workers=num_workers,
+                    multiprocessing_context=multiprocessing_context,
+                    persistent_workers=persistent_workers,
                 )
             )
     return dataloaders, epoch_samplers
@@ -100,6 +110,8 @@ def build_val_dataloaders(
     batch_size: int,
     max_atoms_per_batch: Optional[int],
     num_workers: int,
+    multiprocessing_context: Optional[str] = None,
+    persistent_workers: bool = False,
 ) -> List[DataLoader]:
     """Build one ``DataLoader`` per validation dataset.
 
@@ -120,6 +132,10 @@ def build_val_dataloaders(
     :param max_atoms_per_batch: If set, pack batches by atom count instead of by a
         fixed number of structures.
     :param num_workers: Number of ``DataLoader`` workers.
+    :param multiprocessing_context: Worker start method (e.g. ``"spawn"``), or
+        ``None`` for the PyTorch default.
+    :param persistent_workers: Keep workers alive between epochs. Only meaningful
+        when ``num_workers > 0``.
     :return: One ``DataLoader`` per dataset in ``val_datasets``.
     """
     dataloaders: List[DataLoader] = []
@@ -142,6 +158,8 @@ def build_val_dataloaders(
                     batch_sampler=batch_sampler,
                     collate_fn=collate_fn_val,
                     num_workers=num_workers,
+                    multiprocessing_context=multiprocessing_context,
+                    persistent_workers=persistent_workers,
                 )
             )
         else:
@@ -154,6 +172,8 @@ def build_val_dataloaders(
                     drop_last=False,
                     collate_fn=collate_fn_val,
                     num_workers=num_workers,
+                    multiprocessing_context=multiprocessing_context,
+                    persistent_workers=persistent_workers,
                 )
             )
     return dataloaders
