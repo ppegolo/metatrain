@@ -46,6 +46,26 @@ from metatrain.utils.external_naming import to_external_name
 from metatrain.utils.units import get_gradient_units
 
 
+class RawExtraPayload:
+    """Marker base class for non-TensorMap extra-data payloads.
+
+    Entries in a batch's ``extra`` dictionary that subclass this are carried
+    RAW through the dataloader worker boundary (as plain tensors via shared
+    memory) instead of being serialised with ``save_buffer``. Subclasses must
+    implement ``to(dtype=..., device=..., non_blocking=...)`` so the trainer
+    can move them alongside the rest of the batch.
+    """
+
+    def to(self, *args: Any, **kwargs: Any) -> "RawExtraPayload":
+        """Move the payload's tensors to a dtype/device; subclasses override.
+
+        :param *args: Forwarded to the tensors' ``to()``.
+        :param **kwargs: Forwarded to the tensors' ``to()``.
+        :return: The moved payload.
+        """
+        raise NotImplementedError
+
+
 def _set(values: List[int]) -> List[int]:
     """This function just does `list(set(values))`.
 
@@ -542,16 +562,19 @@ class CollateFn:
         List[int],
         List[str],
         List[int],
+        Dict[str, Any],
     ]:
         """
         :param batch: A batch
         :return: A tuple containing:
-            - a single tensor containing all targets and extra data
-            - the packed representation of the batch's systems
+            - a single tensor containing all systems, targets and serialised extra data
+            - a list with the sizes of each system buffer
             - a list with the names of each target
             - a list with the sizes of each target buffer
-            - a list with the names of each extra data
-            - a list with the sizes of each extra data buffer
+            - a list with the names of each serialised extra data
+            - a list with the sizes of each serialised extra data buffer
+            - a dict of raw (non-serialised) extra entries, e.g. ragged metric matrices,
+              carried alongside the blob and reattached by ``unpack_batch``
         """
         # group & join
         collated = group_and_join(batch, join_kwargs=self.join_kwargs)
@@ -574,7 +597,18 @@ class CollateFn:
             systems, targets, extra = callable(systems, targets, extra)
 
         target_names = list(targets.keys())
-        extra_names = list(extra.keys())
+        # Partition extra data. TensorMaps are serialised into the blob via
+        # save_buffer (float64 only). RawExtraPayload entries (e.g. the ragged
+        # metric matrices and per-batch rotation info used by density losses)
+        # are carried RAW alongside the blob: this avoids save_buffer's
+        # float64-only constraint and the padding/extra copy, and lets them
+        # ride through the worker boundary as plain tensors.
+        raw_extra = {
+            name: value
+            for name, value in extra.items()
+            if isinstance(value, RawExtraPayload)
+        }
+        extra_names = [name for name in extra if name not in raw_extra]
 
         packed_systems = _pack_systems(systems)
         target_buffers = [
@@ -602,6 +636,7 @@ class CollateFn:
             target_sizes,
             extra_names,
             extra_sizes,
+            raw_extra,
         )
 
 
@@ -621,6 +656,7 @@ def unpack_batch(
         target_sizes,
         extra_names,
         extra_sizes,
+        raw_extra,
     ) = batch
 
     systems = _unpack_systems(packed_systems)
@@ -644,6 +680,8 @@ def unpack_batch(
 
     targets = {key: load_buffer(t) for key, t in targets.items()}
     extra_data = {key: load_buffer(t) for key, t in extra_data.items()}
+    # Reattach raw (non-serialised) extra entries, e.g. ragged metric matrices.
+    extra_data.update(raw_extra)
     return systems, targets, extra_data
 
 
