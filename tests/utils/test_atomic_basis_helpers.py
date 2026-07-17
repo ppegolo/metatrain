@@ -3,7 +3,7 @@ import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     densify_atomic_basis_target,
     get_per_atom_sample_labels,
     get_prepare_atomic_basis_targets_transform,

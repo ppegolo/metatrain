@@ -26,7 +26,7 @@ from metatrain.experimental.phace.modules.cg_coefficients import ClebschGordanRe
 from metatrain.experimental.phace.utils import systems_to_batch
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )
