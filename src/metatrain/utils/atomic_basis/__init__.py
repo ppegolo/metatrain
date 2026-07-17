@@ -15,3 +15,8 @@ from .helpers import (  # noqa: F401
     prepare_atomic_basis_targets,
     sparsify_atomic_basis_target,
 )
+from .trainer_hooks import (  # noqa: F401
+    AtomicBasisTrainerHooks,
+    NullTrainerHooks,
+    get_trainer_hooks,
+)
