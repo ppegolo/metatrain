@@ -4,12 +4,12 @@
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, Type
+from typing import Any, Dict, List, Literal, Optional, Type
 
 import metatensor.torch as mts
 import torch
 import torch.nn.functional as F
-from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatensor.torch import TensorBlock, TensorMap
 from pydantic import ConfigDict, with_config
 from torch.nn.modules.loss import _Loss
 from typing_extensions import NotRequired, TypedDict
@@ -613,6 +613,30 @@ class ShiftAgnosticMSE(LossInterface):
         return loss + gradient_loss + int_MSE
 
 
+def _split_ensemble_members(
+    ensemble_values: torch.Tensor, n_properties: int
+) -> torch.Tensor:
+    """
+    Recover the ensemble axis of an LLPR ensemble block.
+
+    The ensemble members are stacked into the property dimension of the ensemble
+    block, with the ensemble index varying slowest. Any component dimensions (e.g.
+    "xyz" for a vector target such as ``non_conservative_forces``) sit between the
+    samples and the properties, so the ensemble axis must be recovered from the *last*
+    dimension rather than from dimension 1.
+
+    :param ensemble_values: values of an ensemble block, of shape
+        ``(samples, *components, n_ens * n_properties)``.
+    :param n_properties: number of properties of the corresponding target block.
+    :return: the same values reshaped to ``(samples, *components, n_ens,
+        n_properties)``.
+    """
+    n_ens = ensemble_values.shape[-1] // n_properties
+    return ensemble_values.reshape(
+        list(ensemble_values.shape[:-1]) + [n_ens, n_properties]
+    )
+
+
 class TensorMapEnsembleLoss(BaseTensorMapLoss):
     """
     Loss for ensembles based on :py:class:`TensorMap` entries.
@@ -727,47 +751,42 @@ class TensorMapEnsembleLoss(BaseTensorMapLoss):
         tmap_pred_ens = predictions[ens_name]
         tmap_targ = targets[self.target]
 
-        # number of ensembles extracted from TensorMaps
-        n_ens = (
-            tmap_pred_ens.block(0).values.shape[1]
-            // tmap_pred_orig.block(0).values.shape[1]
-        )
+        mean_blocks: List[TensorBlock] = []
+        var_blocks: List[TensorBlock] = []
+        for key in tmap_targ.keys:
+            block_targ = tmap_targ.block(key)
+            ens_pred_values = _split_ensemble_members(
+                tmap_pred_ens.block(key).values,
+                tmap_pred_orig.block(key).values.shape[-1],
+            )  # shape: (samples, *components, n_ens, n_prop)
 
-        ens_pred_values = tmap_pred_ens.block().values  # shape: samples, properties
+            n_ens = ens_pred_values.shape[-2]
+            if n_ens < 2:
+                raise ValueError(
+                    f"Cannot compute an ensemble loss for '{self.target}' from "
+                    f"{n_ens} ensemble member(s): the ensemble variance is undefined. "
+                    "Please check the `num_ensemble_members` setting of the LLPR model."
+                )
 
-        ens_pred_values = ens_pred_values.reshape(ens_pred_values.shape[0], n_ens, -1)
-        ens_pred_mean = ens_pred_values.mean(dim=1)
-        ens_pred_var = ens_pred_values.var(dim=1, unbiased=True)
-
-        tmap_pred_mean = TensorMap(
-            keys=Labels(
-                names=["_"],
-                values=torch.tensor([[0]], device=tmap_targ.block().values.device),
-            ),
-            blocks=[
+            mean_blocks.append(
                 TensorBlock(
-                    values=ens_pred_mean,
-                    samples=tmap_targ.block().samples,
-                    components=tmap_targ.block().components,
-                    properties=tmap_targ.block().properties,
-                ),
-            ],
-        )
-
-        tmap_pred_var = TensorMap(
-            keys=Labels(
-                names=["_"],
-                values=torch.tensor([[0]], device=tmap_targ.block().values.device),
-            ),
-            blocks=[
+                    values=ens_pred_values.mean(dim=-2),
+                    samples=block_targ.samples,
+                    components=block_targ.components,
+                    properties=block_targ.properties,
+                )
+            )
+            var_blocks.append(
                 TensorBlock(
-                    values=ens_pred_var,
-                    samples=tmap_targ.block().samples,
-                    components=tmap_targ.block().components,
-                    properties=tmap_targ.block().properties,
-                ),
-            ],
-        )
+                    values=ens_pred_values.var(dim=-2, unbiased=True),
+                    samples=block_targ.samples,
+                    components=block_targ.components,
+                    properties=block_targ.properties,
+                )
+            )
+
+        tmap_pred_mean = TensorMap(keys=tmap_targ.keys, blocks=mean_blocks)
+        tmap_pred_var = TensorMap(keys=tmap_targ.keys, blocks=var_blocks)
 
         # Note that we're ignoring all gradients for now. This can be extended later.
         return self.compute_flattened(tmap_pred_mean, tmap_targ, tmap_pred_var)
@@ -1011,26 +1030,26 @@ class TensorMapEmpiricalCRPSLoss(TensorMapEnsembleLoss):
         tmap_pred_ens = predictions[ens_name]
         tmap_targ = targets[self.target]
 
-        # number of ensembles extracted from TensorMaps
-        n_ens = (
-            tmap_pred_ens.block(0).values.shape[1]
-            // tmap_pred_orig.block(0).values.shape[1]
-        )
-
-        ens_pred_values = tmap_pred_ens.block().values  # shape: samples, properties
-        ens_pred_values = ens_pred_values.reshape(ens_pred_values.shape[0], n_ens, -1)
-
         # For empirical CRPS, we need the full ensemble predictions
-        target_values = tmap_targ.block().values  # (S, P)
+        y_ensemble_segments = []
+        y_target_segments = []
+        for key in tmap_targ.keys:
+            ens_pred_values = _split_ensemble_members(
+                tmap_pred_ens.block(key).values,
+                tmap_pred_orig.block(key).values.shape[-1],
+            )  # shape: (samples, *components, n_ens, n_prop)
+            n_ens = ens_pred_values.shape[-2]
 
-        S, M, P = ens_pred_values.shape
+            # move the ensemble axis last, so that the remaining axes flatten in the
+            # same order as the target's; y_ensemble: (B, n_ens), y_target: (B,)
+            y_ensemble_segments.append(
+                ens_pred_values.movedim(-2, -1).reshape(-1, n_ens)
+            )
+            y_target_segments.append(tmap_targ.block(key).values.reshape(-1))
 
-        # Reorder to (S, P, M) and then flatten S*P into B:
-        # y_ensemble: (B, M), y_target: (B,)
-        y_ensemble = ens_pred_values.permute(0, 2, 1).reshape(-1, M)
-        y_target = target_values.reshape(-1)
-
-        return self.torch_loss(y_ensemble, y_target)
+        return self.torch_loss(
+            torch.cat(y_ensemble_segments), torch.cat(y_target_segments)
+        )
 
 
 # --- aggregator -----------------------------------------------------------------------
