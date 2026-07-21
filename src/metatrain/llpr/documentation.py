@@ -1,4 +1,4 @@
-"""
+r"""
 LLPR
 ====
 
@@ -14,6 +14,29 @@ estimates. Gradients (e.g. forces and stresses) are not yet used.
 
 Note that the uncertainties computed with this implementation are returned as standard
 deviations, and not variances.
+
+Targets that carry components, such as the vector target ``non_conservative_force``, are
+supported. For these, the uncertainty is returned per component: for a Cartesian vector
+target it is the standard deviation of a single Cartesian component, *not* of the
+vector's magnitude. When the wrapped model produces last-layer features without
+components (as is the case for :ref:`arch-pet`), the last layer holds one independent
+weight row per component, so the resulting uncertainty is identical for all components
+of a given sample.
+
+Targets made of several blocks, such as a spherical target with more than one
+``o3_lambda``, are supported as well. The uncertainty mirrors the target's layout: it
+has the same keys, components and properties, one block per target block. Each block
+gets its own calibration factor :math:`\alpha`, fitted against that block's residuals,
+which for a wrapped model with component-free last-layer features is the only thing
+that can tell the uncertainty of one block from another's.
+
+Ensembles are more demanding than uncertainties: they are sampled in the weight space
+of the last layer, so they require every block of the target to be read directly off
+the last-layer features. This holds for all of :ref:`arch-pet`'s blocks, but among
+:ref:`arch-soap_bpnn`'s only for the scalar and ``o3_lambda=0`` ones: its other blocks
+are built by contracting invariant coefficients with a geometry-dependent tensor basis,
+which the last-layer weights alone do not determine. Requesting ensembles for such a
+target raises an error; its uncertainties remain available.
 
 Additional outputs
 ------------------
@@ -68,7 +91,8 @@ class TrainerHypers(TypedDict):
     If set to ``null``, the internal routine will determine the smallest regularizer
     value that guarantees numerical stability in matrix inversion. Having exposed the
     formula here, we also note to the user that the training routine of the LLPR
-    wrapper model finds the ideal global calibration factor :math:`\alpha`."""
+    wrapper model finds the ideal calibration factor :math:`\alpha`, one per block of
+    each target."""
 
     model_checkpoint: Optional[str] = None
     """This should provide the checkpoint to the model for which the

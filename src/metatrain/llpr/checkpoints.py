@@ -98,6 +98,77 @@ def model_update_v3_v4(checkpoint: dict) -> None:
     checkpoint["model_state_dict"] = new_state_dict
 
 
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update a v4 checkpoint to v5.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # The LLPR buffers and ensemble layers became per-block: the covariance and its
+    # Cholesky factor are keyed by last-layer feature block, the multiplier and the
+    # ensemble layers by target block. A v4 model could only wrap single-block
+    # targets, so every old buffer maps onto that single block.
+    from .model import _SINGLE_BLOCK, _block_key, _get_uncertainty_name
+
+    # The keys are taken from the *wrapped model's* targets, which is the source
+    # `set_wrapped_model` derives them from. The LLPR's own dataset info is not
+    # enough: it may cover fewer targets than the model exposes outputs for (PET-MAD
+    # is calibrated on `energy` alone, but the wrapped PET also predicts
+    # `non_conservative_forces` and `non_conservative_stress`, and buffers were
+    # registered for all three).
+    dataset_info = checkpoint["wrapped_model_checkpoint"]["model_data"]["dataset_info"]
+
+    block_keys = {
+        target_name: _block_key(target_name, target_info.layout.keys.entry(0))
+        for target_name, target_info in dataset_info.targets.items()
+    }
+    multiplier_block_keys = {
+        _get_uncertainty_name(target_name): block_key
+        for target_name, block_key in block_keys.items()
+    }
+
+    def rename(state_dict: dict) -> dict:
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("covariance_") or key.startswith("cholesky_"):
+                # the covariance is a property of the last-layer features, which are
+                # a single invariant block for any model a v4 LLPR could wrap
+                new_state_dict[f"{key}_{_SINGLE_BLOCK}"] = value
+            elif key.startswith("multiplier_"):
+                uncertainty_name = key[len("multiplier_") :]
+                if uncertainty_name not in multiplier_block_keys:
+                    raise RuntimeError(
+                        f"Unable to upgrade the checkpoint: no target in the "
+                        f"wrapped model's dataset info corresponds to the buffer "
+                        f"'{key}'."
+                    )
+                new_key = f"{key}_{multiplier_block_keys[uncertainty_name]}"
+                new_state_dict[new_key] = value
+            elif key.startswith("llpr_ensemble_layers."):
+                target_name, parameter = key[len("llpr_ensemble_layers.") :].rsplit(
+                    ".", 1
+                )
+                if target_name not in block_keys:
+                    raise RuntimeError(
+                        f"Unable to upgrade the checkpoint: no target in the "
+                        f"wrapped model's dataset info corresponds to the ensemble "
+                        f"layer '{key}'."
+                    )
+                new_key = (
+                    f"llpr_ensemble_layers.{target_name}::"
+                    f"{block_keys[target_name]}.{parameter}"
+                )
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    for state_dict_name in ("model_state_dict", "best_model_state_dict"):
+        state_dict = checkpoint.get(state_dict_name)
+        if state_dict is not None:
+            checkpoint[state_dict_name] = rename(state_dict)
+
+
 def trainer_update_v1_v2(checkpoint: dict) -> None:
     """
     Update trainer checkpoint from version 1 to version 2.
