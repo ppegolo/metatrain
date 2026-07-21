@@ -370,7 +370,8 @@ class SoapBpnn(ModelInterface[ModelHypers]):
         self.key_labels: Dict[str, Labels] = {}
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.property_labels: Dict[str, List[Labels]] = {}
-        self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
+        # for LLPR: target name -> block key -> last-layer parameter names
+        self.last_layer_parameter_names: Dict[str, Dict[str, List[str]]] = {}
         self.cartesian_rank1_targets: List[str] = []
         self.cartesian_rank2_targets: List[str] = []
         for target_name, target in train_dataset_info.targets.items():
@@ -1175,6 +1176,7 @@ class SoapBpnn(ModelInterface[ModelHypers]):
 
         # last linear layers, one per block
         self.last_layers[target_name] = torch.nn.ModuleDict({})
+        self.last_layer_parameter_names[target_name] = {}
         for key, block in layout_for_layers.items():
             dict_key = target_name
             for n, k in zip(key.names, key.values, strict=True):
@@ -1213,11 +1215,20 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                 bias=False,
                 out_properties=out_properties_list,
             )
-            self.last_layer_parameter_names[target_name] = [
-                f"last_layers.{target_name}.{dict_key}." + n
-                for n in self.last_layers[target_name][dict_key].state_dict().keys()
-                if n.endswith("weight")
-            ]
+            # `last_layer_parameter_names` declares the blocks whose last layer reads
+            # directly off the last-layer features, which is what LLPR needs to sample
+            # ensemble weights. That only holds when the tensor basis has a single
+            # element: otherwise the block is a contraction of invariant coefficients
+            # with a geometry-dependent basis (see `forward`), and the weights alone
+            # do not determine the block. Note that a lambda=1 block has as many
+            # coefficients as components, so this cannot be told apart downstream from
+            # the shapes.
+            if basis_size == 1:
+                self.last_layer_parameter_names[target_name][dict_key] = [
+                    f"last_layers.{target_name}.{dict_key}." + n
+                    for n in self.last_layers[target_name][dict_key].state_dict().keys()
+                    if n.endswith("weight")
+                ]
 
         self.key_labels[target_name] = layout_for_layers.keys
         self.component_labels[target_name] = [

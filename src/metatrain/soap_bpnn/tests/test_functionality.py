@@ -147,6 +147,50 @@ def test_spherical_output(legacy, add_lambda_basis):
     assert tmap.block(0).values.shape == (1, 3, 1)
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+def test_last_layer_parameter_names_cover_direct_readout_blocks(legacy):
+    """Only the blocks whose last layer reads directly off the last-layer features
+    are registered, and every one of them must be: LLPR samples ensemble weights
+    from these tensors, so a block wrongly left out gives ensembles built on the
+    wrong weights, and a block wrongly included gives ensembles that ignore the
+    tensor basis. Both fail silently.
+
+    A lambda=0 block is a direct readout; a lambda>0 block is a contraction of
+    invariant coefficients with a geometry-dependent tensor basis, so its weights
+    alone do not determine it.
+    """
+    hypers = _make_hypers(legacy)
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom",
+        atomic_types=[6],
+        targets={
+            "spherical_target": get_generic_target_info(
+                "spherical_target",
+                {
+                    "quantity": "",
+                    "unit": "",
+                    "type": {
+                        "spherical": {
+                            "irreps": [
+                                {"o3_lambda": 0, "o3_sigma": 1},
+                                {"o3_lambda": 2, "o3_sigma": 1},
+                            ],
+                        }
+                    },
+                    "num_subtargets": 1,
+                    "sample_kind": "system",
+                },
+            )
+        },
+    )
+    model = SoapBpnn(hypers, dataset_info)
+
+    registered = model.last_layer_parameter_names["spherical_target"]
+    state_dict = model.state_dict()
+    assert all(name in state_dict for names in registered.values() for name in names)
+    assert list(registered.keys()) == ["spherical_target_o3_lambda_0_o3_sigma_1"]
+
+
 @pytest.mark.parametrize("add_lambda_basis", [True, False])
 def test_mlp_head(add_lambda_basis):
     """
