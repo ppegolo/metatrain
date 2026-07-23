@@ -672,11 +672,33 @@ class DensityMSELossViaC(LossInterface):
     scales cannot be factored out of the quadratic form.  The trainer is
     responsible for rescaling before calling :meth:`compute`.
 
+    Two optional terms refine the metric, both folded into ``M`` so they cost
+    nothing per step (the matrix is precomputed and cached by the collate
+    transform):
+
+    - ``omega > 0`` swaps the Coulomb kernel ``1/r`` for its long-range part
+      ``erf(omega r)/r`` and uses ``M = eps*J + J_lr``.  This damps the sharp
+      near-nuclear modes the plain Coulomb metric over-weights, relative to the
+      smooth valence/far-field content that sets the electrostatic potential
+      outside the molecule.  ``eps`` supplies a positive-definite floor: the
+      long-range term alone is numerically rank-deficient.
+    - ``charge_weight > 0`` adds the rank-1 term ``charge_weight * S_vec
+      S_vec^T``, i.e. ``charge_weight * (S_vec . dc)**2``, penalising the
+      predicted density's electron-count error.  Because both sides reach this
+      loss with the composition model removed, ``S_vec . dc`` is the predicted
+      count minus the RI reference's count, and the RI reference integrates to
+      the true electron count up to its own (small) fitting error.
+
     :param name: key of the RI-coefficient target.
     :param gradient: not supported; must be ``None``.
     :param weight: loss weight in the aggregated loss.
     :param reduction: ``"mean"`` or ``"sum"``.
     :param metric: two-centre metric to use — ``"overlap"`` (default) or ``"coulomb"``.
+    :param omega: range-separation parameter of the long-range Coulomb kernel;
+        ``0`` (default) keeps the plain kernel. Requires ``metric="coulomb"``.
+    :param eps: weight on the plain Coulomb term added to the long-range one;
+        ``None`` uses the package default. Ignored when ``omega == 0``.
+    :param charge_weight: weight on the electron-count penalty; ``0`` disables it.
     """
 
     def __init__(
@@ -686,9 +708,16 @@ class DensityMSELossViaC(LossInterface):
         weight: float,
         reduction: str,
         metric: str = "overlap",
+        omega: float = 0.0,
+        eps: Optional[float] = None,
+        charge_weight: float = 0.0,
     ):
         super().__init__(name, gradient, weight, reduction)
-        self.metric = metric
+        # Validate eagerly (and identically to the trainer-side spec build) so a
+        # bad config fails at construction rather than in the first batch.
+        from metatrain.utils.atomic_basis.pyscf import make_metric_spec
+
+        self.metric = make_metric_spec(metric, omega, eps, charge_weight)
 
     def compute(
         self,

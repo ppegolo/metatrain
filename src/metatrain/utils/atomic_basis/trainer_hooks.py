@@ -206,6 +206,7 @@ class AtomicBasisTrainerHooks(NullTrainerHooks):
         from .pyscf import (
             get_density_fit_constant_transform,
             get_metric_matrices_transform,
+            make_metric_spec,
             resolve_ri_aux_basis,
             ri_projections_name,
         )
@@ -241,7 +242,15 @@ class AtomicBasisTrainerHooks(NullTrainerHooks):
         density_fit_target_to_proj_key: dict[str, str] = {}
 
         for target_name, target_spec in ri_target_specs.items():
-            metric = cast(str, target_spec.get("metric", "overlap"))
+            # Must match DensityMSELossViaC.__init__ exactly: the spec is both
+            # the extra_data key and the cache key, so any divergence between
+            # the two sides silently loses the matrix the loss asks for.
+            metric = make_metric_spec(
+                cast(str, target_spec.get("metric", "overlap")),
+                cast(float, target_spec.get("omega", 0.0)),
+                cast("float | None", target_spec.get("eps")),
+                cast(float, target_spec.get("charge_weight", 0.0)),
+            )
             aux_basis = resolve_ri_aux_basis(
                 target_name,
                 cast(str, ri_aux_basis)

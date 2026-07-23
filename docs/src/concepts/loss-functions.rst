@@ -170,6 +170,37 @@ Both losses accept an optional ``metric`` parameter (default ``"overlap"``) that
           type: density_mse_via_c
           metric: overlap  # or coulomb
 
+    ``density_mse_via_c`` accepts two further options that refine ``M``.  Both are folded into the metric matrix, which the collate transform precomputes and caches, so neither costs anything per training step.
+
+    ``omega`` replaces the Coulomb kernel ``1/r`` with its long-range part ``erf(ωr)/r``, giving
+
+    .. math::
+
+       M = \varepsilon\, J + J_{\mathrm{lr}}(\omega)
+
+    In reciprocal space the long-range kernel is ``4π/k² · exp(-k²/4ω²)``, i.e. the Coulomb metric with short-wavelength (sharp, near-nuclear) modes exponentially damped, leaving the smooth valence and far-field content that determines the electrostatic potential outside the molecule.  ``1/ω`` is the length scale below which features are discounted.  ``omega`` requires ``metric: coulomb``.
+
+    ``eps`` weights the plain Coulomb term that supplies a positive-definite floor.  It matters: ``J_lr`` alone is numerically rank-deficient (condition number ~1e32 against ~1e5 for ``J``, because the damping annihilates the compact directions), which would leave the model unconstrained there.  Omitting ``eps`` uses the package default of ``0.01``, which restores conditioning to ~1e7.  Note that ``eps: 1.0`` — a plain ``J + J_lr`` — puts so much weight back on ``J`` that most of the reweighting is lost; the long-range term should dominate.
+
+    ``charge_weight`` adds the rank-1 term ``w · S_vec S_vecᵀ``, where ``S_vec_i = ∫χ_i(r)dr`` is nonzero only for ``l=0`` shells.  This contributes
+
+    .. math::
+
+       w \, (S_{\mathrm{vec}} \cdot \Delta c)^2
+
+    to the loss, penalising the predicted density's electron-count error while ignoring any redistribution of charge that conserves the total.  Because both sides reach the loss with the composition model removed, ``S_vec · Δc`` is the predicted electron count minus the RI reference's count; the RI reference integrates to the true electron count up to its own fitting error (typically ~1e-3 electrons).
+
+    .. code-block:: yaml
+
+      ri_aux_basis: def2-universal-jfit
+      loss:
+        mtt::ri_coeffs:
+          type: density_mse_via_c
+          metric: coulomb
+          omega: 0.15          # long-range kernel; 0 (default) disables it
+          eps: 0.01            # positive-definite floor, default 0.01
+          charge_weight: 1.0   # electron-count penalty; 0 (default) disables it
+
 **density_mse_via_w**
     An indirect loss that avoids computing ``c_{RI} = M^{-1} w_{RI}`` entirely.  Requires the projections ``w_{RI} = M c_{RI}`` (and optionally the pre-computed constant ``c_{RI}^T w_{RI}``) in ``extra_data``:
 
