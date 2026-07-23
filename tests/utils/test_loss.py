@@ -1485,3 +1485,231 @@ def test_tensormap_gaussian_crps_loss(ensemble_tensor_maps):
     result = loss_fn.compute(predictions, targets)
     assert torch.isfinite(result)
     assert result.item() >= 0.0  # CRPS should be non-negative
+
+
+# ── Range-separated metric and electron-count penalty ─────────────────────────
+
+
+def test_metric_spec_is_backward_compatible():
+    """Plain metrics must keep their exact spec string and extra_data key.
+
+    The spec doubles as the ``extra_data`` key and the metric-matrix cache key,
+    so any change here would silently invalidate existing configs and caches.
+    """
+    from metatrain.utils.atomic_basis.pyscf import (
+        coulomb_matrix_name,
+        make_metric_spec,
+        metric_matrix_name,
+    )
+
+    assert make_metric_spec("overlap") == "overlap"
+    assert make_metric_spec("coulomb") == "coulomb"
+    # explicitly-disabled options must not perturb the spec either
+    assert make_metric_spec("coulomb", omega=0.0, charge_weight=0.0) == "coulomb"
+    assert metric_matrix_name("mtt::ri", "overlap") == overlap_matrix_name("mtt::ri")
+    assert metric_matrix_name("mtt::ri", "coulomb") == coulomb_matrix_name("mtt::ri")
+
+
+def test_metric_spec_roundtrips_and_separates_keys():
+    """Different hyper-parameters must map to different keys.
+
+    A shared key would let a matrix built for one omega be served for another.
+    """
+    from metatrain.utils.atomic_basis.pyscf import (
+        make_metric_spec,
+        metric_matrix_name,
+        parse_metric_spec,
+    )
+
+    spec = make_metric_spec("coulomb", omega=0.15, eps=0.01, charge_weight=2.0)
+    assert parse_metric_spec(spec) == ("coulomb", 0.15, 0.01, 2.0)
+
+    other = make_metric_spec("coulomb", omega=0.30, eps=0.01, charge_weight=2.0)
+    assert metric_matrix_name("mtt::ri", spec) != metric_matrix_name("mtt::ri", other)
+
+
+def test_metric_spec_rejects_invalid_combinations():
+    from metatrain.utils.atomic_basis.pyscf import make_metric_spec
+
+    with pytest.raises(ValueError, match="Unknown RI metric"):
+        make_metric_spec("euclidean")
+    # the long-range kernel is a Coulomb option; silently ignoring it on the
+    # overlap metric would train against a different objective than configured
+    with pytest.raises(ValueError, match="Coulomb-metric option"):
+        make_metric_spec("overlap", omega=0.15)
+    with pytest.raises(ValueError, match="omega must be"):
+        make_metric_spec("coulomb", omega=-1.0)
+    with pytest.raises(ValueError, match="charge_weight must be"):
+        make_metric_spec("coulomb", charge_weight=-1.0)
+
+
+def test_long_range_metric_defaults_to_a_positive_definite_floor():
+    """omega>0 without an explicit eps must not yield a rank-deficient metric.
+
+    Pure erf(omega r)/r annihilates the compact directions (condition number
+    ~1e32), leaving the model unconstrained there; the default eps restores a
+    positive-definite floor.
+    """
+    from metatrain.utils.atomic_basis.pyscf import DEFAULT_LR_EPS, make_metric_spec
+
+    _, _, eps, _ = _parse(make_metric_spec("coulomb", omega=0.15))
+    assert eps == DEFAULT_LR_EPS > 0.0
+
+
+def _parse(spec):
+    from metatrain.utils.atomic_basis.pyscf import parse_metric_spec
+
+    return parse_metric_spec(spec)
+
+
+def test_charge_penalty_adds_exactly_the_electron_count_error():
+    """charge_weight must contribute w*(S.dc)^2 and nothing else.
+
+    S.dc is the predicted electron count minus the reference's, so this term
+    is what pushes the predicted density's integral to the known value.
+    """
+    target_name = "mtt::ri"
+    pred = _make_ri_tensor_map([3.0], [0.0, 0.0, 0.0])
+    targ = _make_ri_tensor_map([1.0], [0.0, 0.0, 0.0])
+    # delta in PySCF order is [2, 0, 0, 0]; put all the charge weight on the
+    # single s function so S.dc is exactly 2 * s_value
+    s_value = 5.0
+    s_vector = torch.tensor([s_value, 0.0, 0.0, 0.0], dtype=torch.float64)
+    charge_weight = 3.0
+    metric = torch.zeros((4, 4), dtype=torch.float64)
+    metric += charge_weight * torch.outer(s_vector, s_vector)
+
+    from metatrain.utils.atomic_basis.pyscf import make_metric_spec, metric_matrix_name
+
+    spec = make_metric_spec("coulomb", charge_weight=charge_weight)
+    extra_data = {metric_matrix_name(target_name, spec): _ragged_matrices([metric])}
+    loss = DensityMSELossViaC(
+        name=target_name,
+        gradient=None,
+        weight=1.0,
+        reduction="mean",
+        metric="coulomb",
+        charge_weight=charge_weight,
+    )
+    result = loss({target_name: pred}, {target_name: targ}, extra_data)
+    expected = charge_weight * (2.0 * s_value) ** 2
+    assert result.item() == pytest.approx(expected)
+
+
+def test_charge_penalty_ignores_errors_that_conserve_the_electron_count():
+    """An error orthogonal to S must cost nothing under the charge term alone.
+
+    This is what distinguishes a count penalty from a generic coefficient
+    penalty: redistributing charge at fixed total must not be penalised here.
+    """
+    target_name = "mtt::ri"
+    # identical s coefficients (so S.dc == 0), differing only in the l=1 block
+    pred = _make_ri_tensor_map([1.0], [7.0, 0.0, 0.0])
+    targ = _make_ri_tensor_map([1.0], [0.0, 0.0, 0.0])
+    s_vector = torch.tensor([5.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    metric = 3.0 * torch.outer(s_vector, s_vector)
+
+    from metatrain.utils.atomic_basis.pyscf import make_metric_spec, metric_matrix_name
+
+    spec = make_metric_spec("coulomb", charge_weight=3.0)
+    extra_data = {metric_matrix_name(target_name, spec): _ragged_matrices([metric])}
+    loss = DensityMSELossViaC(
+        name=target_name,
+        gradient=None,
+        weight=1.0,
+        reduction="mean",
+        metric="coulomb",
+        charge_weight=3.0,
+    )
+    result = loss({target_name: pred}, {target_name: targ}, extra_data)
+    assert result.item() == pytest.approx(0.0)
+
+
+def test_loss_and_trainer_hooks_agree_on_the_metric_key():
+    """The loss and the collate transform must derive an identical spec.
+
+    They compute it independently; if they ever diverge the transform attaches
+    a key the loss does not look up, and the loss fails (or worse, silently
+    finds a stale one).
+    """
+    from metatrain.utils.atomic_basis.pyscf import make_metric_spec
+
+    spec_config = {
+        "type": "density_mse_via_c",
+        "metric": "coulomb",
+        "omega": 0.15,
+        "eps": 0.01,
+        "charge_weight": 2.0,
+    }
+    # what trainer_hooks.collate_transforms builds
+    hook_side = make_metric_spec(
+        spec_config["metric"],
+        spec_config["omega"],
+        spec_config["eps"],
+        spec_config["charge_weight"],
+    )
+    # what the loss builds from the same config
+    loss = DensityMSELossViaC(
+        name="mtt::ri",
+        gradient=None,
+        weight=1.0,
+        reduction="mean",
+        metric=spec_config["metric"],
+        omega=spec_config["omega"],
+        eps=spec_config["eps"],
+        charge_weight=spec_config["charge_weight"],
+    )
+    assert loss.metric == hook_side
+
+
+def test_loss_aggregator_forwards_metric_options():
+    """The new options must survive the config -> create_loss path."""
+    from metatrain.utils.atomic_basis.pyscf import make_metric_spec
+
+    # A TargetInfo layout must carry zero samples, so build the blocks directly
+    # rather than through the sample-taking helper.
+    layout = TensorMap(
+        keys=Labels(
+            names=["o3_lambda", "o3_sigma"],
+            values=torch.tensor([[0, 1], [1, 1]], dtype=torch.int32),
+        ),
+        blocks=[
+            TensorBlock(
+                values=torch.zeros((0, 2 * ell + 1, 1), dtype=torch.float64),
+                samples=Labels(
+                    names=["system", "atom"],
+                    values=torch.zeros((0, 2), dtype=torch.int32),
+                ),
+                components=[
+                    Labels(
+                        names=["o3_mu"],
+                        values=torch.arange(-ell, ell + 1, dtype=torch.int32).reshape(
+                            -1, 1
+                        ),
+                    )
+                ],
+                properties=Labels(
+                    names=["n"], values=torch.zeros((1, 1), dtype=torch.int32)
+                ),
+            )
+            for ell in (0, 1)
+        ],
+    )
+    target_info = TargetInfo(quantity="", unit="", layout=layout)
+    aggregator = LossAggregator(
+        targets={"mtt::ri": target_info},
+        config={
+            "mtt::ri": {
+                "type": "density_mse_via_c",
+                "weight": 1.0,
+                "reduction": "mean",
+                "gradients": {},
+                "metric": "coulomb",
+                "omega": 0.2,
+                "charge_weight": 1.5,
+            }
+        },
+    )
+    assert aggregator.losses["mtt::ri"].metric == make_metric_spec(
+        "coulomb", omega=0.2, charge_weight=1.5
+    )
