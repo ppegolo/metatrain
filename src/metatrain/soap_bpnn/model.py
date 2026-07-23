@@ -19,11 +19,11 @@ from metatomic.torch import (
 from metatrain.composition import CompositionModel
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL
-from metatrain.utils.data import TargetInfo
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )
+from metatrain.utils.data import TargetInfo
 from metatrain.utils.data.dataset import DatasetInfo
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer

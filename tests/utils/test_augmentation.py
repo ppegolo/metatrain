@@ -10,11 +10,11 @@ from metatomic.torch.o3 import (
     transform_tensor,
 )
 
-from metatrain.utils.augmentation import O3Augmenter
-from metatrain.utils.data import DatasetInfo, DiskDataset
-from metatrain.utils.data.atomic_basis_helpers import (
+from metatrain.utils.atomic_basis.helpers import (
     get_prepare_atomic_basis_targets_transform,
 )
+from metatrain.utils.augmentation import O3Augmenter
+from metatrain.utils.data import DatasetInfo, DiskDataset
 from metatrain.utils.data.target_info import get_generic_target_info
 
 from ..conftest import RESOURCES_PATH

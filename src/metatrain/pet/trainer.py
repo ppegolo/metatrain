@@ -5,12 +5,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Union, cast
 
 import torch
+from metatensor.torch import TensorMap
+from metatomic.torch import System
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DistributedSampler
 
 from metatrain.composition import train_or_load_composition_model
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.atomic_basis import get_trainer_hooks
+from metatrain.utils.atomic_basis.helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.augmentation import O3Augmenter
 from metatrain.utils.data import (
     CollateFn,
@@ -22,9 +28,7 @@ from metatrain.utils.data import (
     unpack_batch,
     validate_num_workers,
 )
-from metatrain.utils.data.atomic_basis_helpers import (
-    get_prepare_atomic_basis_targets_transform,
-)
+from metatrain.utils.data.dataset import RawExtraPayload
 from metatrain.utils.distributed.distributed_data_parallel import (
     DistributedDataParallel,
 )
@@ -47,6 +51,35 @@ from . import checkpoints
 from .documentation import TrainerHypers
 from .model import PET
 from .modules.finetuning import apply_finetuning_strategy
+
+
+def _unpack_batch_to(
+    batch: Any, dtype: torch.dtype, device: torch.device
+) -> tuple[List[System], Dict[str, TensorMap], Dict[str, Any]]:
+    """Unpack a batch and move it to ``dtype``/``device``.
+
+    Raw payloads (:class:`~metatrain.utils.data.dataset.RawExtraPayload`, e.g.
+    ragged metric matrices) are popped out before :func:`batch_to`, which is
+    TorchScript-typed ``Dict[str, TensorMap]`` and cannot accept them, then
+    moved and reattached. No-op for batches without such entries.
+
+    :param batch: Collated batch as produced by the dataloader.
+    :param dtype: Target dtype.
+    :param device: Target device.
+    :return: ``(systems, targets, extra_data)`` on the requested dtype/device.
+    """
+    systems, targets, extra_data = unpack_batch(batch)
+    ragged = {
+        key: extra_data.pop(key)
+        for key in list(extra_data.keys())
+        if isinstance(extra_data[key], RawExtraPayload)
+    }
+    systems, targets, extra_data = batch_to(
+        systems, targets, extra_data, dtype=dtype, device=device
+    )
+    for key, value in ragged.items():
+        extra_data[key] = value.to(dtype=dtype, device=device)
+    return systems, targets, extra_data
 
 
 def get_scheduler(
@@ -80,6 +113,24 @@ def get_scheduler(
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     return scheduler
+
+
+def _clone_state_dict_to_cpu(state: Any) -> Any:
+    """Recursively clone a (possibly nested) state dict, moving tensors to CPU.
+
+    Keeps the "best" checkpoint off the training device instead of holding a second
+    copy of every model/optimizer tensor on GPU (as ``copy.deepcopy`` would).
+
+    :param state: State dict (or nested container/tensor) to clone.
+    :return: Clone of ``state`` with all tensors on CPU.
+    """
+    if isinstance(state, torch.Tensor):
+        return state.detach().cpu().clone()
+    if isinstance(state, dict):
+        return {k: _clone_state_dict_to_cpu(v) for k, v in state.items()}
+    if isinstance(state, list):
+        return [_clone_state_dict_to_cpu(v) for v in state]
+    return copy.deepcopy(state)
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
@@ -132,6 +183,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
             logging.info(f"Training on {world_size} devices with dtype {dtype}")
         else:
             logging.info(f"Training on device {device} with dtype {dtype}")
+
+        if self.hypers.get("compile", False):
+            # Opt-in torch.compile of the backbone's feature calculation: the
+            # collate/loss plumbing stays eager, but the launch-bound GNN math
+            # gets fused. dynamic=True avoids a recompile per batch shape.
+            # runs before the DDP wrap: ``model`` is still the raw PET here
+            model.backend.calculate_features = torch.compile(  # type: ignore[method-assign]
+                model.backend.calculate_features, dynamic=True
+            )
+            logging.info("torch.compile enabled for the PET backbone")
 
         # Apply fine-tuning strategy if provided
         if is_finetune:
@@ -188,6 +249,46 @@ class Trainer(TrainerInterface[TrainerHypers]):
         atomic_basis_transform, atomic_basis_reverse_transform = (
             get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
         )
+        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])
+
+        # Determined here (rather than down by the main data loaders) because the
+        # composition/scaler fitting below also reads through the training data and
+        # would otherwise default to synchronous, single-process loading, which is
+        # very slow on large (e.g. disk-based) datasets.
+        if self.hypers["num_workers"] is None:
+            num_workers = get_num_workers()
+            logging.info(
+                "Number of workers for data-loading not provided and chosen "
+                f"automatically. Using {num_workers} workers."
+            )
+        else:
+            num_workers = self.hypers["num_workers"]
+            validate_num_workers(num_workers)
+
+        # On CUDA (especially GH200 unified memory), forking after CUDA init causes
+        # workers to inherit GPU memory mappings, inflating per-worker RSS and
+        # OOM. Use 'spawn' to start workers as fresh processes instead.
+        mp_context = "spawn" if num_workers > 0 and device.type == "cuda" else None
+
+        if mp_context == "spawn":
+            # Some container setups (e.g. CSCS daint ml4es) restrict /dev/shm so
+            # that ftruncate() fails with EINVAL.  PyTorch's 'file_descriptor' sharing
+            # strategy creates POSIX shared-memory files in /dev/shm; switching to
+            # 'file_system' uses regular files in /tmp instead, which always works.
+            import torch.multiprocessing as _torch_mp
+
+            _torch_mp.set_sharing_strategy("file_system")
+
+        # The composition/scaler fitting dataloaders are short-lived (created once,
+        # used for a single pass, then torn down) rather than persistent like the main
+        # training loop's. On at least one observed container setup, spawning 8 workers
+        # for such a short-lived pool made a worker abort during shutdown and left the
+        # process's multiprocessing state unable to start a subsequent worker pool
+        # (i.e. the following composition/scaler/main-loop pool would hang forever).
+        # Capping at 4 avoided this in testing; the persistent main-loop pool below is
+        # unaffected and keeps using the full `num_workers`.
+        fitting_num_workers = min(num_workers, 4)
+        fitting_mp_context = mp_context if fitting_num_workers > 0 else None
 
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
@@ -197,6 +298,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             batch_size=self.hypers["batch_size"],
             is_distributed=is_distributed,
             checkpoint_dir=checkpoint_dir,
+            num_workers=fitting_num_workers,
+            multiprocessing_context=fitting_mp_context,
         )
 
         if self.hypers["scale_targets"]:
@@ -209,6 +312,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 self.hypers["fixed_scaling_weights"],
                 initial_transforms=[atomic_basis_transform],
                 per_structure_targets=self.hypers["per_structure_targets"],
+                num_workers=fitting_num_workers,
+                multiprocessing_context=fitting_mp_context,
             )
 
         logging.info("Setting up data loaders")
@@ -251,6 +356,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
         model.scaler.to(device)
         model.scaler.scales_to(device=device, dtype=torch.float64)
 
+        # Target-type-specific orchestration (currently: atomic-basis RI
+        # density training) is delegated to hooks; the no-op NullTrainerHooks
+        # is returned when nothing of the sort is configured.
+        target_hooks = get_trainer_hooks(
+            loss_hypers,
+            train_targets,
+            self.hypers["ri_aux_basis"],
+            bool(self.hypers.get("log_density_loss", False)),
+        )
+        ri_train_transforms, ri_val_transforms = target_hooks.collate_transforms(dtype)
+
         # Create collate functions
 
         conditioning_keys = list(model.requested_inputs().keys())
@@ -285,6 +401,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_keys=target_keys,
             callables=[
                 atomic_basis_transform,
+                # RI transforms run on the *unrotated* systems/targets: metric
+                # matrices are cached per system across epochs (the density
+                # losses un-rotate their residuals via the BatchRotations the
+                # augmenter stashes), and the density-fit constant is
+                # rotation-invariant.
+                *ri_train_transforms,
                 rotational_augmenter.apply_random_augmentations,
                 *base_callables,
             ],
@@ -293,21 +415,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_keys=target_keys,
             callables=[  # no augmentation for validation
                 atomic_basis_transform,
+                *ri_val_transforms,
                 *base_callables,
             ],
         )
 
-        if self.hypers["num_workers"] is None:
-            num_workers = get_num_workers()
-            logging.info(
-                "Number of workers for data-loading not provided and chosen "
-                f"automatically. Using {num_workers} workers."
-            )
-        else:
-            num_workers = self.hypers["num_workers"]
-            validate_num_workers(num_workers)
-
         # Create dataloader for the training datasets:
+        # (num_workers/mp_context were already computed above, before the
+        # composition/scaler fitting steps)
         train_dataloaders, epoch_samplers = build_train_dataloaders(
             train_datasets=train_datasets,
             train_distributed_samplers=train_samplers,
@@ -316,6 +431,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             max_atoms_per_batch=max_atoms,
             min_atoms_per_batch=self.hypers["min_atoms_per_batch"],
             num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=(num_workers > 0),
         )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
 
@@ -327,6 +444,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             batch_size=self.hypers["batch_size"],
             max_atoms_per_batch=max_atoms,
             num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=(num_workers > 0),
         )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
 
@@ -340,7 +459,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 outputs_list.append(f"{target_name}_{gradient_name}_gradients")
 
         # Create a loss function:
-        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
         loss_fn = LossAggregator(targets=train_targets, config=loss_hypers)
         logging.info("Using the following loss functions:")
         for name, info in loss_fn.metadata.items():
@@ -402,14 +520,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
                 val_mae_calculator = MAEAccumulator(self.hypers["log_separate_blocks"])
 
-            train_loss = 0.0
+            is_log_epoch = (
+                epoch == start_epoch or epoch % self.hypers["log_interval"] == 0
+            )
+            # Accumulate the loss as a device tensor: a per-batch .item() (and,
+            # when distributed, a per-batch all_reduce) drains the CUDA queue
+            # and serializes the Python-side batch preparation with the GPU.
+            train_loss_acc: Optional[torch.Tensor] = None
             for batch in train_dataloader:
                 optimizer.zero_grad()
 
-                systems, targets, extra_data = unpack_batch(batch)
-                systems, targets, extra_data = batch_to(
-                    systems, targets, extra_data, dtype=dtype, device=device
-                )
+                systems, targets, extra_data = _unpack_batch_to(batch, dtype, device)
                 predictions = evaluate_model(
                     model,
                     systems,
@@ -436,31 +557,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     use_per_property_scales=True,
                 )
 
-                train_loss_batch = loss_fn(predictions, targets, extra_data)
-
-                if is_distributed:
-                    # make sure all parameters contribute to the gradient calculation
-                    # to make torch DDP happy (e.g. when a target's head is kept in
-                    # the model but not part of the current run's targets)
-                    train_loss_batch += 0.0 * sum(
-                        p.sum() for p in model.parameters() if p.requires_grad
-                    )
-
-                train_loss_batch.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), self.hypers["grad_clip_norm"]
-                )
-                optimizer.step()
-                lr_scheduler.step()
-
-                if is_distributed:
-                    # sum the loss over all processes
-                    torch.distributed.all_reduce(train_loss_batch)
-                train_loss += train_loss_batch.item()
-
-                # Reapply scales and accumulate quantities for computing train metrics,
-                # but only if this is an epoch to log
-                if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+                # On log epochs, compute the per-target scaled maps once: they
+                # are needed for the metrics below and reused by the RI loss
+                # preparation.
+                scaled_predictions: Optional[Dict[str, Any]] = None
+                scaled_targets: Optional[Dict[str, Any]] = None
+                if is_log_epoch:
                     scaled_predictions = (
                         model.module if is_distributed else model
                     ).scaler(
@@ -478,6 +580,46 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         use_per_property_scales=False,
                     )
 
+                # Rescale predictions/targets to the physical units expected by
+                # the active RI loss type (density_mse_via_c / density_mse_via_w).
+                # For direct-c this is a no-op.
+                loss_predictions, loss_targets = target_hooks.prepare_for_loss(
+                    predictions,
+                    targets,
+                    systems,
+                    model.module if is_distributed else model,
+                    scaled_predictions=scaled_predictions,
+                    scaled_targets=scaled_targets,
+                )
+                train_loss_batch = loss_fn(loss_predictions, loss_targets, extra_data)
+
+                if is_distributed:
+                    # make sure all parameters contribute to the gradient calculation
+                    # to make torch DDP happy (e.g. when a target's head is kept in
+                    # the model but not part of the current run's targets)
+                    train_loss_batch += 0.0 * sum(
+                        p.sum() for p in model.parameters() if p.requires_grad
+                    )
+
+                train_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.hypers["grad_clip_norm"]
+                )
+                optimizer.step()
+                lr_scheduler.step()
+
+                detached_loss = train_loss_batch.detach()
+                train_loss_acc = (
+                    detached_loss
+                    if train_loss_acc is None
+                    else train_loss_acc + detached_loss
+                )
+
+                # Accumulate quantities for computing train metrics, but only if
+                # this is an epoch to log (scaled maps were computed above)
+                if is_log_epoch:
+                    assert scaled_predictions is not None
+                    assert scaled_targets is not None
                     if self.hypers["log_separate_blocks"]:
                         # if any atomic basis outputs are present and metrics are to be
                         # reported per-block, reverse the transform (i.e. sparsify)
@@ -499,8 +641,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             scaled_predictions, scaled_targets, extra_data
                         )
 
+            # One sync (and one distributed reduction) per epoch for the
+            # accumulated loss, instead of one per batch.
+            if train_loss_acc is None:
+                train_loss = 0.0
+            else:
+                if is_distributed:
+                    torch.distributed.all_reduce(train_loss_acc)
+                train_loss = train_loss_acc.item()
+
             # Compute train metrics if they are to be logged this epoch:
-            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+            if is_log_epoch:
                 finalized_train_info = train_rmse_calculator.finalize(
                     not_per_atom=["positions_gradients"] + per_structure_targets,
                     is_distributed=is_distributed,
@@ -519,11 +670,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
             with torch.set_grad_enabled(
                 any(target_info.gradients for target_info in train_targets.values())
             ):  # keep gradients on if any of the targets require them
-                val_loss = 0.0
+                val_loss_acc: Optional[torch.Tensor] = None
                 for batch in val_dataloader:
-                    systems, targets, extra_data = unpack_batch(batch)
-                    systems, targets, extra_data = batch_to(
-                        systems, targets, extra_data, dtype=dtype, device=device
+                    systems, targets, extra_data = _unpack_batch_to(
+                        batch, dtype, device
                     )
                     predictions = evaluate_model(
                         model,
@@ -553,16 +703,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         use_per_property_scales=True,
                     )
 
-                    val_loss_batch = loss_fn(predictions, targets, extra_data)
-
-                    if is_distributed:
-                        # sum the loss over all processes
-                        torch.distributed.all_reduce(val_loss_batch)
-                    val_loss += val_loss_batch.item()
-
-                    # Reapply scales and accumulate quantities for computing val
-                    # metrics. This is done for every epoch as validation metrics are
-                    # needed for model selection
+                    # Reapply per-target scales once; used for the val metrics
+                    # below and reused by the RI loss preparation, which needs
+                    # the same rescaling for its targets.
+                    # scaled_predictions = (c_ML - CM),  scaled_targets = (c_RI - CM).
                     scaled_predictions = (
                         model.module if is_distributed else model
                     ).scaler(
@@ -578,6 +722,30 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         remove=False,
                         use_per_target_scales=True,
                         use_per_property_scales=False,
+                    )
+
+                    loss_predictions, loss_targets = target_hooks.prepare_for_loss(
+                        predictions,
+                        targets,
+                        systems,
+                        model.module if is_distributed else model,
+                        scaled_predictions=scaled_predictions,
+                        scaled_targets=scaled_targets,
+                    )
+                    val_loss_batch = loss_fn(loss_predictions, loss_targets, extra_data)
+
+                    detached_loss = val_loss_batch.detach()
+                    val_loss_acc = (
+                        detached_loss
+                        if val_loss_acc is None
+                        else val_loss_acc + detached_loss
+                    )
+
+                    # Extra target-type metrics (e.g. the density L2 metric)
+                    # accumulate on the dense maps, i.e. before the
+                    # log_separate_blocks sparsification below.
+                    target_hooks.update_validation_metrics(
+                        scaled_predictions, scaled_targets, extra_data
                     )
 
                     if self.hypers["log_separate_blocks"]:
@@ -601,6 +769,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             scaled_predictions, scaled_targets, extra_data
                         )
 
+            # One sync (and one distributed reduction) per epoch for the
+            # accumulated validation scalars.
+            val_loss_total = (
+                val_loss_acc
+                if val_loss_acc is not None
+                else torch.zeros((), device=device)
+            )
+            if is_distributed:
+                torch.distributed.all_reduce(val_loss_total)
+            val_loss = float(val_loss_total.item())
+
             # Compute val metrics:
             finalized_val_info = val_rmse_calculator.finalize(
                 not_per_atom=["positions_gradients"] + per_structure_targets,
@@ -617,7 +796,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
             # Now we log the information:
-            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+            if is_log_epoch:
                 finalized_train_info = {
                     "loss": train_loss,
                     **finalized_train_info,
@@ -626,6 +805,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 "loss": val_loss,
                 **finalized_val_info,
             }
+            finalized_val_info.update(
+                target_hooks.finalize_validation_metrics(is_distributed, device)
+            )
 
             if epoch == start_epoch:
                 metric_logger = MetricLogger(
@@ -649,11 +831,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             )
             if val_metric < self.best_metric:
                 self.best_metric = val_metric
-                self.best_model_state_dict = copy.deepcopy(
+                self.best_model_state_dict = _clone_state_dict_to_cpu(
                     (model.module if is_distributed else model).state_dict()
                 )
                 self.best_epoch = epoch
-                self.best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
+                self.best_optimizer_state_dict = _clone_state_dict_to_cpu(
+                    optimizer.state_dict()
+                )
 
             if epoch % self.hypers["checkpoint_interval"] == 0:
                 if is_distributed:

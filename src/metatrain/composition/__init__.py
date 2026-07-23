@@ -1,5 +1,5 @@
 import logging
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import nn
@@ -33,6 +33,8 @@ def train_or_load_composition_model(
     batch_size: int,
     is_distributed: bool,
     checkpoint_dir: str = "",
+    num_workers: int = 0,
+    multiprocessing_context: Optional[str] = None,
 ) -> None:
     """
     Train the composition model from data or load pre-trained weights.
@@ -48,6 +50,9 @@ def train_or_load_composition_model(
     :param batch_size: Batch size for data loading
     :param is_distributed: Whether training is distributed
     :param checkpoint_dir: Directory to save the composition model checkpoint
+    :param num_workers: Number of dataloader workers for the fitting pass
+    :param multiprocessing_context: Multiprocessing start method for the
+        dataloader workers (e.g. ``"spawn"``), or ``None`` for the default
     """
     if isinstance(atomic_baseline, str):
         logging.info(f"Loading composition model from {atomic_baseline}")
@@ -94,6 +99,8 @@ def train_or_load_composition_model(
         )
         trainer._additive_models = other_additive_models
         trainer._is_distributed = is_distributed
+        trainer._num_workers = num_workers
+        trainer._multiprocessing_context = multiprocessing_context
         trainer.train(
             model=composition_model,
             dtype=torch.float64,

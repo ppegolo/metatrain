@@ -7,14 +7,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive.remove import remove_additive
+from metatrain.utils.atomic_basis.helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.data import (
     CollateFn,
     CombinedDataLoader,
     Dataset,
     unpack_batch,
-)
-from metatrain.utils.data.atomic_basis_helpers import (
-    get_prepare_atomic_basis_targets_transform,
 )
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists_transform
@@ -44,6 +44,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         additive_models = getattr(self, "_additive_models", [])
         is_distributed = getattr(self, "_is_distributed", False)
+        num_workers = getattr(self, "_num_workers", 0)
+        multiprocessing_context = getattr(self, "_multiprocessing_context", None)
         fixed_weights = self.hypers.get("atomic_baseline", None)
         batch_size = self.hypers.get("batch_size")
         if batch_size is None:
@@ -130,6 +132,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         shuffle=None if sampler else False,
                         drop_last=False,
                         collate_fn=collate_fn,
+                        num_workers=num_workers,
+                        multiprocessing_context=(
+                            multiprocessing_context if num_workers > 0 else None
+                        ),
                     )
                 )
 
