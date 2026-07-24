@@ -1,3 +1,4 @@
+import copy
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Union, cast
@@ -7,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
-from metatrain.utils.additive.remove import remove_additive
+from metatrain.utils.additive.remove import get_remove_additive_transform
 from metatrain.utils.data import (
     CollateFn,
     CombinedDataLoader,
@@ -108,9 +109,21 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 model.dataset_info.targets, model.dataset_info.extra_data
             )
 
+            # The additive contributions are removed inside the collate
+            # function: the neighbor lists they may need (e.g. ZBL) are
+            # attached there, and do not survive the transfer from dataloader
+            # worker processes to the training process. The transform gets CPU
+            # copies of the additive models, since the collate runs in the
+            # worker processes, where batches are on the CPU and CUDA cannot
+            # be used after fork.
+            cpu_additive_models = [
+                copy.deepcopy(additive_model).to(device="cpu", dtype=torch.float64)
+                for additive_model in additive_models
+            ]
             callables = [
                 atomic_basis_transform,
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
+                get_remove_additive_transform(cpu_additive_models, model.target_infos),
             ]
 
             collate_fn = CollateFn(
@@ -183,16 +196,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 if len(targets) == 0:
                     continue
 
-                for additive_model in additive_models:
-                    targets = remove_additive(
-                        systems,
-                        targets,
-                        additive_model,
-                        {
-                            target_name: model.target_infos[target_name]
-                            for target_name in targets
-                        },
-                    )
                 model.model.accumulate(systems, targets)
 
         if is_distributed:

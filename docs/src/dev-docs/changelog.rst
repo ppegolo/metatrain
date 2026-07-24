@@ -35,6 +35,9 @@ Fixed
 - The distributed composition fit no longer sees duplicated samples on shards of uneven
   size, which slightly biased the fitted weights whenever the dataset size was not
   divisible by the number of ranks.
+- The ``Scaler`` now attaches the neighbor lists required by the additive models
+  itself, instead of relying on a previous fit having attached them to the systems as
+  a side effect.
 - ``DiskDatasetWriter`` in append mode now continues the entry numbering of the
   existing zip instead of restarting from zero.
 
