@@ -81,8 +81,10 @@ class ModelHypers(TypedDict):
 class TrainerHypers(TypedDict):
     """Hyperparameters for the composition trainer."""
 
-    distributed: NotRequired[bool] = False
-    """Whether to use distributed training"""
+    distributed: NotRequired[Optional[bool]] = None
+    """Whether to use distributed training. When not set, distributed training
+    is enabled automatically when running under more than one SLURM task.
+    Setting this option explicitly is deprecated."""
     distributed_port: NotRequired[int] = 39591
     """Port for distributed communication among processes"""
     atomic_baseline: NotRequired[FixedCompositionWeights] = {}

@@ -20,7 +20,10 @@ from metatrain.utils.data import (
 from metatrain.utils.data.atomic_basis_helpers import (
     get_prepare_atomic_basis_targets_transform,
 )
-from metatrain.utils.distributed.slurm import initialize_slurm_nccl_process_group
+from metatrain.utils.distributed.slurm import (
+    initialize_slurm_nccl_process_group,
+    resolve_distributed,
+)
 from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists_transform
@@ -61,7 +64,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         assert isinstance(model, CompositionModel)
 
         additive_models = self._additive_models
-        is_distributed = self.hypers["distributed"]
+        is_distributed = resolve_distributed(self.hypers["distributed"])
         fixed_weights = self.hypers["atomic_baseline"]
         batch_size = self.hypers["batch_size"]
         if batch_size is None:
