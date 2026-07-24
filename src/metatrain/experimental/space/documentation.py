@@ -61,7 +61,7 @@ of importance) for the SPACE architecture:
 
 from typing import Literal, Optional
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from metatrain.composition.documentation import FixedCompositionWeights
 from metatrain.pet.modules.finetuning import FinetuneHypers, NoFinetuneHypers
@@ -194,8 +194,10 @@ class TrainerHypers(TypedDict):
     cutoffs.
     """
 
-    distributed: bool = False
-    """Whether to use distributed training."""
+    distributed: NotRequired[Optional[bool]] = None
+    """Whether to use distributed training. When not set, distributed training
+    is enabled automatically when running under more than one SLURM task.
+    Setting this option explicitly is deprecated."""
 
     distributed_port: int = 39591
     """Port for DDP communication."""

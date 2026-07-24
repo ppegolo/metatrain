@@ -2,11 +2,18 @@ import inspect
 import logging
 from typing import Annotated, Any, Literal, Union, cast
 
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, create_model
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    create_model,
+)
 from typing_extensions import NotRequired
 
 from ..share import base_hypers
-from ..share.base_hypers import BaseHypers, EvalHypers
+from ..share.base_hypers import BaseHypers, EvalHypers, sanitize_architecture_hypers
 from .hypers import init_with_defaults
 
 
@@ -152,6 +159,10 @@ class MetatrainArchitectureValidationError(MetatrainValidationError):
 
         :return: The formatted error string to display to the user.
         """
+        if len(error["loc"]) == 0:
+            # raised by a validator of the whole architecture options, e.g. the
+            # architecture hypers sanitizer: report the plain message
+            return error["msg"].removeprefix("Value error, ")
 
         hyper_type: Literal["model", "training"] = error["loc"][0]
         field = error["loc"][1]
@@ -198,10 +209,12 @@ class MetatrainArchitectureValidationError(MetatrainValidationError):
         """
         errors = self.errors
 
-        # Organize errors by their top-level location (model vs training)
-        error_dict: dict[Literal["model", "training"], list[dict]] = {}
+        # Organize errors by their top-level location (model vs training).
+        # Errors raised by validators of the whole architecture options (e.g.
+        # the architecture hypers sanitizer) have an empty location.
+        error_dict: dict[str, list[dict]] = {}
         for err in errors:
-            top_level = err["loc"][0]
+            top_level = str(err["loc"][0]) if len(err["loc"]) > 0 else ""
             if top_level not in error_dict:
                 error_dict[top_level] = []
             error_dict[top_level].append(err)
@@ -230,6 +243,10 @@ class MetatrainArchitectureValidationError(MetatrainValidationError):
                     f"\n---- [Error {i}] {self.get_loc_path(err['loc'])}"
                     f"\n\n  {self.get_error_string(err)}\n"
                 )
+        # Log errors without a location (whole-options validators)
+        if "" in error_dict:
+            for err in error_dict[""]:
+                error_str += f"\n{self.get_error_string(err)}\n"
 
         return error_str
 
@@ -282,8 +299,21 @@ def validate_architecture_options(
         options["atomic_types"] = []
         added_atomic_types = True
 
+    # Build the function that will sanitize the architecture options.
+    def _architecture_sanitizer(hypers: BaseModel) -> dict:
+        """Wrapper to sanitize architecture hypers for this particular architecture.
+
+        :param hypers: The hypers to sanitize.
+        :return: The sanitized hypers.
+        """
+        return sanitize_architecture_hypers(
+            architecture_name=architecture_name or "",
+            hypers=hypers.model_dump(),
+            trainer_hypers_cls=trainer_hypers,
+        )
+
     validated = validate(
-        ArchitectureOptions,
+        Annotated[ArchitectureOptions, AfterValidator(_architecture_sanitizer)],
         options,
         error_cls=MetatrainArchitectureValidationError.for_architecture(
             architecture_name

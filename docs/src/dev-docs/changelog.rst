@@ -33,6 +33,9 @@ Fixed
 Added
 #####
 
+- ``mtt train`` now fails early when launched with more than one SLURM task
+  while distributed training is disabled or not supported by the architecture,
+  instead of silently running one full copy of the training per task.
 - ``max_atoms_per_batch`` now works with ``DiskDataset``: ``DiskDatasetWriter``
   stores the number of atoms of every structure in a ``metadata/atom_counts.npy``
   file, which the sampler reads without opening every entry in the zip.
@@ -64,6 +67,9 @@ Changed
   ("Smooth Physical Architecture with Compact Equivariants"). The old name is gone:
   the ``phace`` optional dependency is now ``space``, and existing checkpoints, which
   record the old architecture name, will no longer load.
+- The ``distributed`` training option is now optional and deprecated: when it
+  is not set, distributed training is enabled exactly when the job runs under
+  more than one SLURM task.
 - ``DiskDataset`` reading now scales to zips with millions of files: the archive is
   indexed once at construction and dataloader workers read from the index, instead of
   each re-parsing the whole zip (which could take minutes and tens of GB of RAM). The
