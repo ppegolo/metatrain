@@ -1,5 +1,11 @@
 from .combine_dataloaders import CombinedDataLoader  # noqa: F401
-from .dataloaders import build_train_dataloaders, build_val_dataloaders  # noqa: F401
+from .dataloaders import (  # noqa: F401
+    build_train_dataloaders,
+    build_val_dataloaders,
+    datasets_are_disk_backed,
+    ensure_spawn_safe_sharing,
+    resolve_dataloader_workers,
+)
 from .dataset import (  # noqa: F401
     CollateFn,
     Dataset,

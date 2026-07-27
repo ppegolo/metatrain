@@ -1,3 +1,4 @@
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,7 @@ from metatrain.utils.data import (
     read_targets,
     unpack_batch,
 )
-from metatrain.utils.data.dataset import MemmapDataset
+from metatrain.utils.data.dataset import DiskDataset, MemmapDataset
 from metatrain.utils.data.writers import MemmapWriter
 
 
@@ -1370,3 +1371,15 @@ def test_memmap_masses_attached(tmp_path):
     # the atom label is local (0), not the global offset (1)
     assert block.samples.values.tolist() == [[1, 0]]
     assert block.values.squeeze(-1).tolist() == [12.0]
+
+
+def test_disk_dataset_is_picklable():
+    """DiskDataset must survive pickling: spawned dataloader workers receive
+    their dataset by pickle."""
+    dataset = DiskDataset(RESOURCES_PATH / "spherical_disk_dataset.zip")
+    sample = dataset[0]  # populate the cached sample class before pickling
+
+    reloaded = pickle.loads(pickle.dumps(dataset))
+    sample2 = reloaded[0]
+    assert sample2._fields == sample._fields
+    assert torch.equal(sample2.system.positions, sample.system.positions)
