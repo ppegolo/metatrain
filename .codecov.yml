@@ -39,6 +39,11 @@ component_management:
       paths:
         - "src/metatrain/pet/.*"
 
+    - component_id: gle
+      name: GLE
+      paths:
+        - "src/metatrain/gle/.*"
+
     - component_id: llpr
       name: LLPR
       paths:
