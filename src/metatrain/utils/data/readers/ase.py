@@ -84,6 +84,27 @@ def read_systems(filename: str) -> List[System]:
             )
             system.add_data("momentum", momentum)
 
+    # Add the per-frame time lag (for GLE) if available. The GLE transition loss
+    # propagates each frame's momenta over the lag that separates it from the
+    # frame its target momenta were taken from, so the lag is a per-system datum
+    # rather than a global hyperparameter.
+    if "time_lag" in ase_atoms[0].info:
+        for system, atoms in zip(systems, ase_atoms, strict=False):
+            time_lag = TensorMap(
+                keys=Labels(["_"], torch.tensor([[0]])),
+                blocks=[
+                    TensorBlock(
+                        values=torch.tensor(
+                            atoms.info["time_lag"], dtype=torch.float64
+                        ).reshape(1, 1),
+                        samples=Labels(["system"], torch.tensor([[0]])),
+                        components=[],
+                        properties=Labels("time_lag", torch.tensor([[0]])),
+                    )
+                ],
+            )
+            system.add_data("mtt::time_lag", time_lag)
+
     return systems
 
 
