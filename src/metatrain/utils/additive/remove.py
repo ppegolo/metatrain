@@ -6,7 +6,7 @@ import torch
 from metatensor.torch import Labels, TensorMap
 from metatensor.torch.operations._add import _add_block_block
 from metatensor.torch.operations._multiply import _multiply_block_constant
-from metatomic.torch import System
+from metatomic.torch import ModelOutput, System
 
 from ..data import TargetInfo
 from ..evaluate_model import evaluate_model
@@ -35,23 +35,44 @@ def remove_additive(
             "require grad and does not have a grad_fn"
         ),
     )
-    # The additive model's output layout follows its module mode (additive models
-    # predict atomic-basis targets in their dense layout in training mode, and
-    # sparsify them in eval mode). The subtraction below happens in dense space,
-    # against transform-densified targets, so force train mode for the evaluation.
-    was_training = additive_model.training
-    additive_model.train(True)
-    additive_contribution = evaluate_model(
-        additive_model,
-        systems,
-        {
-            key: target_info_dict[key]
-            for key in targets.keys()
-            if key in additive_model.outputs
-        },
-        is_training=False,  # we don't need any gradients w.r.t. any parameters
-    )
-    additive_model.train(was_training)
+    requested = {
+        key: target_info_dict[key]
+        for key in targets.keys()
+        if key in additive_model.outputs
+    }
+    if getattr(additive_model, "provides_analytic_position_gradient", False) and all(
+        info.gradients == ["positions"] or info.gradients == []
+        for info in requested.values()
+    ):
+        # Additive supplies exact position gradients (e.g. SoftCore): use them
+        # directly, avoiding torch.autograd in the (fork-based) DataLoader worker.
+        # Build the ModelOutput with the TARGET's sample_kind (per-system energy
+        # for force matching), matching what evaluate_model would request.
+        model_outputs = {
+            key: ModelOutput(
+                quantity=info.quantity,
+                unit=info.unit,
+                sample_kind=info.sample_kind,
+            )
+            for key, info in requested.items()
+        }
+        additive_contribution = additive_model.analytic_contribution(
+            systems, model_outputs
+        )
+    else:
+        # The additive model's output layout follows its module mode (additive models
+        # predict atomic-basis targets in their dense layout in training mode, and
+        # sparsify them in eval mode). The subtraction below happens in dense space,
+        # against transform-densified targets, so force train mode for the evaluation.
+        was_training = additive_model.training
+        additive_model.train(True)
+        additive_contribution = evaluate_model(
+            additive_model,
+            systems,
+            requested,
+            is_training=False,  # we don't need any gradients w.r.t. any parameters
+        )
+        additive_model.train(was_training)
 
     for target_key in additive_contribution.keys():
         if (
