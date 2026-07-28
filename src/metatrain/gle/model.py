@@ -1,0 +1,1073 @@
+import logging
+import typing
+import warnings
+from typing import Any, Dict, List, Literal, Optional
+
+import metatensor.torch as mts
+import torch
+from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatensor.torch.operations._add import _add_block_block
+from metatomic.torch import (
+    AtomisticModel,
+    ModelCapabilities,
+    ModelMetadata,
+    ModelOutput,
+    NeighborListOptions,
+    System,
+)
+
+from metatrain.composition import CompositionModel
+from metatrain.pet.model import (
+    _extract_charge_spin_multiplicity,
+    get_last_layer_features_name,
+    should_compute_last_layer_features,
+)
+from metatrain.pet.modules.backend import PETBackend
+from metatrain.pet.modules.finetuning import (
+    apply_finetuning_strategy,
+    compute_stale_targets,
+)
+from metatrain.pet.modules.structures import concatenate_structures
+from metatrain.utils.abc import ModelInterface
+from metatrain.utils.additive import ZBL
+from metatrain.utils.data import DatasetInfo, TargetInfo
+from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
+from metatrain.utils.data.atomic_basis_helpers import (
+    densify_atomic_basis_dataset_info,
+    sparsify_atomic_basis_target,
+)
+from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
+from metatrain.utils.metadata import merge_metadata
+from metatrain.utils.scaler import Scaler
+from metatrain.utils.sum_over_atoms import sum_over_atoms
+
+from . import checkpoints
+from .documentation import ModelHypers
+
+
+AVAILABLE_FEATURIZERS = typing.get_args(ModelHypers.__annotations__["featurizer_type"])
+
+
+def gle_target_info(n_gle_variables: int) -> TargetInfo:
+    """Target info of the ``mtt::A`` output: a flat per-atom vector of
+    ``n_gle_variables ** 2`` unconstrained drift-matrix parameters.
+
+    The trainer uses it to request ``mtt::A`` alongside the dataset's own targets,
+    so that the model and the loss agree on the output's layout.
+
+    :param n_gle_variables: Dimension of the drift matrix, ``3 + n_aux``.
+    :return: The ``TargetInfo`` describing the ``mtt::A`` output.
+    """
+    return TargetInfo(
+        layout=TensorMap(
+            keys=Labels.single(),
+            blocks=[
+                TensorBlock(
+                    values=torch.empty(0, n_gle_variables**2),
+                    samples=Labels(
+                        names=["system", "atom"],
+                        values=torch.empty((0, 2), dtype=torch.long),
+                    ),
+                    components=[],
+                    properties=Labels(
+                        names=["A"],
+                        values=torch.arange(
+                            n_gle_variables**2, dtype=torch.long
+                        ).unsqueeze(1),
+                    ),
+                )
+            ],
+        )
+    )
+
+
+class GLE(ModelInterface[ModelHypers]):
+    """
+    PET-based architecture for learning the local GLE drift matrix.
+
+    The PET backbone (:class:`metatrain.pet.modules.backend.PETBackend`) is reused
+    verbatim; GLE only adds a per-atom ``mtt::A`` output, whose values are the
+    unconstrained parametrization ``theta`` of a stable Ornstein-Uhlenbeck drift
+    matrix. :func:`metatrain.gle.trainer.make_A` maps ``theta`` to the drift matrix,
+    and the noise follows from the fluctuation-dissipation theorem.
+
+    The PET architecture was originally proposed in
+    https://arxiv.org/abs/2305.19302v3, and published in the `pet` package
+    (https://github.com/spozdn/pet).
+
+    :param hypers: Hyperparameters for the GLE model. See the documentation for details.
+    :param dataset_info: Information about the dataset, including atomic types and
+        targets.
+    """
+
+    __checkpoint_version__ = 17
+    __supported_devices__ = ["cuda", "cpu"]
+    __supported_dtypes__ = [torch.float32, torch.float64]
+    __default_metadata__ = ModelMetadata(
+        references={"architecture": ["https://arxiv.org/abs/2305.19302v3"]}
+    )
+    component_labels: Dict[str, List[List[Labels]]]
+    NUM_FEATURE_TYPES: int = 2  # node + edge features
+
+    def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
+        super().__init__(hypers, dataset_info, self.__default_metadata__)
+        check_no_atom_pair_targets(dataset_info.targets, self.__class__.__name__)
+
+        # Cache the hyperparameters that GLE itself (as opposed to the pure-PyTorch
+        # backend) needs. The remaining hyperparameters are cached on ``self.backend``.
+        self.cutoff = float(self.hypers["cutoff"])
+        self.cutoff_width_adaptive = float(self.hypers["cutoff_width_adaptive"])
+        self.d_head = self.hypers["d_head"]
+        self.num_gnn_layers = self.hypers["num_gnn_layers"]
+        self.featurizer_type = self.hypers["featurizer_type"]
+
+        self.atomic_types = dataset_info.atomic_types
+        nl_is_strict = bool(self.hypers["long_range"]["enable"])
+        self.requested_nl = NeighborListOptions(
+            cutoff=self.cutoff,
+            full_list=True,
+            strict=nl_is_strict,
+        )
+        if self.featurizer_type not in AVAILABLE_FEATURIZERS:
+            raise ValueError(
+                f"Unknown featurizer type: {self.featurizer_type}. "
+                f"Available options are: {AVAILABLE_FEATURIZERS}"
+            )
+
+        # Pure-PyTorch backend owning all the learnable submodules and the
+        # structure-preprocessing / featurization / prediction logic. It is shared
+        # verbatim with the PET architecture.
+        self.backend = PETBackend(self.hypers, self.atomic_types)
+        self.num_readout_layers = self.backend.num_readout_layers
+        self.system_conditioning = self.backend.system_conditioning
+        self.last_layer_feature_size = (
+            self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
+        )  # for LLPR
+
+        # the model is always capable of outputting the internal features
+        self.outputs = {
+            "feature": ModelOutput(sample_kind="atom", description="internal features"),
+            "mtt::aux::cutoff_stats": ModelOutput(
+                sample_kind="atom",
+                description=(
+                    "Per-atom adaptive-cutoff diagnostics: column 0 = atomic_cutoff, "
+                    "column 1 = num_neighbors. If requested per structure, "
+                    "averages across all atoms are returned."
+                ),
+            ),
+        }
+
+        # Modified dataset_info with the targets as they will be seen by GLE
+        # during training.
+        train_dataset_info = self._train_dataset_info(dataset_info)
+
+        self.output_shapes: Dict[str, Dict[str, List[int]]] = {}
+        self.key_labels: Dict[str, Labels] = {}
+        self.property_labels: Dict[str, List[Labels]] = {}
+        self.component_labels: Dict[str, List[List[Labels]]] = {}
+        self.target_names: List[str] = []
+        self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
+        for target_name, target_info in train_dataset_info.targets.items():
+            self.target_names.append(target_name)
+            self._add_output(target_name, target_info)
+
+        # The GLE drift matrix has dimension 3 (momentum) + the auxiliary momenta.
+        # It is registered as an extra per-atom output, regardless of which targets
+        # the dataset declares, and is computed whenever it is requested.
+        self.n_gle_variables = 3 + int(self.hypers["num_auxiliary_variables"])
+        self.target_names.append("mtt::A")
+        self._add_output("mtt::A", gle_target_info(self.n_gle_variables))
+
+        # Per-type frozen theta baseline (Delta-learning): the deployed drift is
+        # A = make_A(theta_net(Q) + theta_base[Z]). theta_base is fit offline to the
+        # per-type Volterra memory kernel (the "friction self-energy") and frozen; the
+        # PET network supplies the sign-free environment-dependent correction on top.
+        # Added to the raw mtt::A output in forward so the training loss and the
+        # exported deploy model see the same theta_total. Zeros by default => no
+        # baseline. Indexed by atomic number, persistent so it exports self-contained
+        # with the model.
+        theta_baseline = torch.zeros(
+            max(self.atomic_types) + 1, self.n_gle_variables**2
+        )
+        baseline_file = self.hypers.get("theta_baseline_file", None)
+        if baseline_file is not None:
+            import numpy as np
+
+            baseline_data = np.load(baseline_file)
+            for name in baseline_data.files:
+                z = int(name[1:])  # keys are "z<Z>", e.g. "z8"
+                vec = torch.tensor(baseline_data[name], dtype=theta_baseline.dtype)
+                if vec.shape[-1] != self.n_gle_variables**2:
+                    raise ValueError(
+                        f"theta_baseline_file entry {name} has length {vec.shape[-1]}, "
+                        f"expected {self.n_gle_variables**2} "
+                        f"(= (3 + num_auxiliary_variables)**2)"
+                    )
+                theta_baseline[z] = vec
+        self.register_buffer("theta_baseline", theta_baseline)
+
+        # Exact Delta-learning at init: zero the mtt::A readout so theta_net(Q) = 0
+        # and the initial drift is exactly make_A(theta_base[Z]). Loss-unconstrained
+        # directions then stay at the baseline instead of keeping random-init values.
+        if self.hypers.get("zero_init_readout", False):
+            for last_layers in (
+                self.backend.node_last_layers,
+                self.backend.edge_last_layers,
+            ):
+                if "mtt::A" in last_layers:
+                    for module_dict in last_layers["mtt::A"]:
+                        for linear in module_dict.values():
+                            torch.nn.init.zeros_(linear.weight)
+                            torch.nn.init.zeros_(linear.bias)
+
+        # long-range module
+        if self.hypers["long_range"]["enable"]:
+            self.long_range = True
+            if not self.hypers["long_range"]["use_ewald"]:
+                warnings.warn(
+                    "Training GLE with the LongRangeFeaturizer initialized "
+                    "with `use_ewald=False` causes instabilities during training. "
+                    "The `use_ewald` variable will be force-switched to `True`. "
+                    "during training.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self.long_range_featurizer = LongRangeFeaturizer(
+                hypers=self.hypers["long_range"],
+                feature_dim=self.hypers["d_node"],
+                neighbor_list_options=self.requested_nl,
+            )
+        else:
+            self.long_range = False
+            self.long_range_featurizer = DummyLongRangeFeaturizer()  # for torchscript
+
+        # additive models: these are handled by the trainer at training
+        # time, and they are added to the output at evaluation time
+        composition_model = CompositionModel.from_valid_targets(
+            dataset_info, self.atomic_types
+        )
+        additive_models = [composition_model]
+
+        # Adds the ZBL repulsion model if requested
+        if self.hypers["zbl"]:
+            zbl_targets = {
+                target_name: target_info
+                for target_name, target_info in train_dataset_info.targets.items()
+                if ZBL.is_valid_target(target_name, target_info)
+            }
+            additive_models.append(
+                ZBL(
+                    {},
+                    dataset_info=DatasetInfo(
+                        length_unit=train_dataset_info.length_unit,
+                        atomic_types=self.atomic_types,
+                        targets=zbl_targets,
+                    ),
+                )
+            )
+        self.additive_models = torch.nn.ModuleList(additive_models)
+
+        # scaler: this is also handled by the trainer at training time
+        self.scaler = Scaler(hypers={}, dataset_info=train_dataset_info)
+
+        self.single_label = Labels.single()
+
+        self.finetune_config: Dict[str, Any] = {}
+
+    def supported_outputs(self) -> Dict[str, ModelOutput]:
+        return self.outputs
+
+    def restart(self, dataset_info: DatasetInfo) -> "GLE":
+        # merge old and new dataset info
+        merged_info = self.dataset_info.union(dataset_info)
+        new_atomic_types = [
+            at for at in merged_info.atomic_types if at not in self.atomic_types
+        ]
+        new_targets = {
+            key: value
+            for key, value in merged_info.targets.items()
+            if key not in self.dataset_info.targets
+        }
+        self.has_new_targets = len(new_targets) > 0
+
+        # Targets that were present before this run but are not part of the current
+        # run's dataset: with a backbone-altering finetuning method (full/lora), their
+        # heads are no longer meaningful and are dropped once training starts, by
+        # ``apply_finetuning_strategy`` (which decides based on the method).
+        stale_targets = compute_stale_targets(
+            self.dataset_info.targets, dataset_info.targets
+        )
+
+        if len(new_atomic_types) > 0:
+            raise ValueError(
+                f"New atomic types found in the dataset: {new_atomic_types}. "
+                "The GLE model does not support adding new atomic types."
+            )
+
+        # Modified dataset_info with the targets as they will be seen by GLE
+        # during training.
+        train_dataset_info = self._train_dataset_info(dataset_info)
+
+        # register new outputs as new last layers
+        for target_name in new_targets:
+            self.target_names.append(target_name)
+            self._add_output(target_name, train_dataset_info.targets[target_name])
+
+        self.dataset_info = merged_info
+
+        # restart the composition and scaler models
+        self.additive_models[0] = self.additive_models[0].restart(
+            dataset_info=DatasetInfo(
+                length_unit=dataset_info.length_unit,
+                atomic_types=self.atomic_types,
+                targets={
+                    target_name: target_info
+                    for target_name, target_info in dataset_info.targets.items()
+                    if CompositionModel.is_valid_target(target_name, target_info)
+                },
+            ),
+        )
+        self.scaler = self.scaler.restart(train_dataset_info)
+
+        # Actual removal (if any) is deferred to ``apply_finetuning_strategy``.
+        self._stale_finetune_targets = stale_targets
+
+        return self
+
+    def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        return [self.requested_nl]
+
+    def requested_inputs(self) -> Dict[str, ModelOutput]:
+        if self.system_conditioning is not None:
+            return {
+                key: ModelOutput(quantity="", unit="", sample_kind="system")
+                for key in self.system_conditioning.required_data_keys
+            }
+        return {}
+
+    def forward(
+        self,
+        systems: List[System],
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        """
+        Forward pass of the GLE model.
+
+        This mirrors :meth:`metatrain.pet.model.PET.forward` stage by stage (see its
+        docstring for the description of the PET stages), with one addition: when
+        ``mtt::A`` is requested, the frozen per-type theta baseline is added to it,
+        so that training and deployment see the same ``theta_total``.
+
+        :param systems: List of `metatomic.torch.System` objects to process.
+        :param outputs: Dictionary of requested outputs.
+        :param selected_atoms: Optional `metatensor.torch.Labels` object specifying a
+            subset of atoms for which to compute outputs.
+        :return: Dictionary of `metatensor.torch.TensorMap` objects containing the
+            requested outputs.
+        """
+        device = systems[0].device
+        return_dict: Dict[str, TensorMap] = {}
+        nl_options = self.requested_neighbor_lists()[0]
+
+        if self.single_label.values.device != device:
+            self._move_labels_to_device(device)
+
+        with torch.profiler.record_function("GLE::concatenate_structures"):
+            # **Stage 0: Input Preparation**
+            (
+                positions,
+                centers,
+                neighbors,
+                species,
+                cells,
+                cell_shifts,
+                system_indices,
+                sample_labels,
+            ) = concatenate_structures(systems, nl_options)
+
+        with torch.profiler.record_function("GLE::backend::preprocess"):
+            batch_data = self.backend.preprocess(
+                positions,
+                centers,
+                neighbors,
+                species,
+                cells,
+                cell_shifts,
+                system_indices,
+                self.cutoff_width_adaptive,
+            )
+
+        if "mtt::aux::cutoff_stats" in outputs:
+            with torch.profiler.record_function("GLE::_get_cutoff_stats"):
+                return_dict["mtt::aux::cutoff_stats"] = self._get_cutoff_stats(
+                    batch_data["atomic_cutoffs_stats"],
+                    batch_data["padding_mask"],
+                    sample_labels,
+                    selected_atoms,
+                    outputs["mtt::aux::cutoff_stats"].sample_kind,
+                )
+
+        with torch.profiler.record_function("GLE::backend::compute_features"):
+            # **Stage 1: Feature Computation via GNN Layers**
+            if self.system_conditioning is not None:
+                charges, spin_multiplicities = _extract_charge_spin_multiplicity(
+                    systems, device
+                )
+                self.system_conditioning.validate(charges, spin_multiplicities)
+                batch_data["charge"] = charges
+                batch_data["spin_multiplicity"] = spin_multiplicities
+                batch_data["system_indices"] = system_indices
+
+            node_features_list, edge_features_list = self.backend.calculate_features(
+                batch_data
+            )
+
+            # If the long-range module is activated, we add the long-range features
+            # on top of the node features
+            if self.long_range:
+                long_range_features = self._calculate_long_range_features(
+                    systems,
+                    node_features_list,
+                    batch_data["edge_distances"],
+                    batch_data["padding_mask"],
+                )
+                for i in range(self.num_readout_layers):
+                    node_features_list[i] = (
+                        node_features_list[i] + long_range_features
+                    ) * 0.5**0.5
+
+        # **Stages 3 & 4: Last Layer Features and Atomic Predictions**
+        with torch.profiler.record_function("GLE::predict"):
+            requested_target_names: List[str] = []
+            for name in self.target_names:
+                if name in outputs:
+                    requested_target_names.append(name)
+            (
+                atomic_predictions,
+                node_last_layer_features_dict,
+                edge_last_layer_features_dict,
+            ) = self.backend.predict(
+                node_features_list,
+                edge_features_list,
+                batch_data,
+                cells,
+                system_indices,
+                requested_target_names,
+            )
+
+        # Delta-learning: add the frozen per-type theta baseline to the raw mtt::A
+        # output, so make_A (applied in the loss and at deploy) sees
+        # theta_total = theta_net(Q) + theta_base[Z]. A zero baseline is a no-op.
+        if "mtt::A" in atomic_predictions:
+            theta_base = self.theta_baseline.index_select(0, species).to(
+                positions.dtype
+            )
+            gle_blocks: List[torch.Tensor] = []
+            for block in atomic_predictions["mtt::A"]:
+                gle_blocks.append(block + theta_base)
+            atomic_predictions["mtt::A"] = gle_blocks
+
+        # **Stage 2: Intermediate Feature Output (Optional)**
+        with torch.profiler.record_function("GLE::_get_output_features"):
+            if "feature" in outputs:
+                features_dict = self._get_output_features(
+                    node_features_list,
+                    edge_features_list,
+                    batch_data["cutoff_factors"],
+                    selected_atoms,
+                    sample_labels,
+                    outputs,
+                )
+                # Since return_dict.update(features_dict) is not Torch-Scriptable,
+                # we use a simple iteration over the features_dict items.
+                for k, v in features_dict.items():
+                    return_dict[k] = v
+
+        # **Stage 3: Last Layer Feature Output (Optional)**
+        with torch.profiler.record_function("GLE::_get_output_last_layer_features"):
+            last_layer_features_dict = self._get_output_last_layer_features(
+                node_last_layer_features_dict,
+                edge_last_layer_features_dict,
+                batch_data["cutoff_factors"],
+                selected_atoms,
+                sample_labels,
+                outputs,
+            )
+
+            for k, v in last_layer_features_dict.items():
+                return_dict[k] = v
+
+        # **Stage 4: Atomic Predictions**
+        with torch.profiler.record_function("GLE::_get_output_atomic_predictions"):
+            atomic_predictions_dict = self._get_output_atomic_predictions(
+                atomic_predictions,
+                sample_labels,
+                outputs,
+                selected_atoms,
+            )
+
+            for k, v in atomic_predictions_dict.items():
+                return_dict[k] = v
+
+        # **Post-processing (Evaluation Only)**
+        with torch.profiler.record_function("GLE::post-processing"):
+            if not self.training:
+                # at evaluation, we also introduce the scaler and additive contributions
+                return_dict = self.scaler(
+                    systems,
+                    return_dict,
+                    selected_atoms=selected_atoms,
+                    use_per_target_scales=True,
+                    use_per_property_scales=True,
+                )
+
+                # For atomic basis targets, sparsify to create blocks with "atom_type"
+                # in the key dimensions, and ensure properties are unpadded. This is
+                # done before adding the additive contributions, which are also
+                # sparsified (by the additive models themselves, in eval mode).
+                for k in atomic_predictions_dict.keys():
+                    if (
+                        k in self.dataset_info.targets
+                        and self.dataset_info.targets[k].is_atomic_basis
+                    ):
+                        return_dict[k] = sparsify_atomic_basis_target(
+                            systems,
+                            return_dict[k],
+                            self.dataset_info.targets[k].layout,
+                            species,
+                        )
+
+                for additive_model in self.additive_models:
+                    outputs_for_additive_model: Dict[str, ModelOutput] = {}
+                    for name, output in outputs.items():
+                        if name in additive_model.outputs:
+                            outputs_for_additive_model[name] = output
+                    additive_contributions = additive_model(
+                        systems,
+                        outputs_for_additive_model,
+                        selected_atoms,
+                    )
+                    for name in additive_contributions:
+                        # "manual" sparse sum: update to metatensor.torch.add
+                        # after sparse sum is implemented in metatensor.operations
+                        output_blocks: List[TensorBlock] = []
+                        for k, b in return_dict[name].items():
+                            if k in additive_contributions[name].keys:
+                                output_blocks.append(
+                                    _add_block_block(
+                                        b,
+                                        additive_contributions[name]
+                                        .block(k)
+                                        .to(device=b.device, dtype=b.dtype),
+                                    )
+                                )
+                            else:
+                                output_blocks.append(
+                                    TensorBlock(
+                                        values=b.values,
+                                        samples=b.samples,
+                                        components=b.components,
+                                        properties=b.properties,
+                                    )
+                                )
+                        return_dict[name] = TensorMap(
+                            return_dict[name].keys, output_blocks
+                        )
+
+        return return_dict
+
+    def _calculate_long_range_features(
+        self,
+        systems: List[System],
+        node_features_list: List[torch.Tensor],
+        edge_distances: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate long-range electrostatic features using Ewald summation.
+        Forces use_ewald=True during training for stability.
+
+        :param systems: List of `metatomic.torch.System` objects to process.
+        :param node_features_list: List of node feature tensors from each GNN layer.
+        :param edge_distances: Tensor of edge distances [n_atoms, max_num_neighbors].
+        :param padding_mask: Boolean mask indicating real vs padded neighbors
+            [n_atoms, max_num_neighbors].
+        :return: Tensor of long-range features [n_atoms, d_pet].
+        """
+        if self.training:
+            # Currently, the long-range implementation show instabilities
+            # during training if P3MCalculator is used instead of the
+            # EwaldCalculator. We will use the EwaldCalculator for training.
+            self.long_range_featurizer.use_ewald = True
+        flattened_lengths = edge_distances[padding_mask]
+        short_range_features = (
+            torch.stack(node_features_list).sum(dim=0)
+            * (1 / len(node_features_list)) ** 0.5
+        )
+        long_range_features = self.long_range_featurizer(
+            systems, short_range_features, flattened_lengths
+        )
+        return long_range_features
+
+    def _get_cutoff_stats(
+        self,
+        atomic_cutoffs: torch.Tensor,
+        padding_mask: torch.Tensor,
+        sample_labels: Labels,
+        selected_atoms: Optional[Labels],
+        sample_kind: str,
+    ) -> TensorMap:
+        # padding_mask is True for real edges, False for padding, shape
+        # (num_nodes, max_edges_per_node).
+        num_neighbors = padding_mask.sum(dim=-1).to(atomic_cutoffs.dtype)
+        values = torch.stack([atomic_cutoffs, num_neighbors], dim=-1)
+        tmap = TensorMap(
+            keys=self.single_label,
+            blocks=[
+                TensorBlock(
+                    values=values,
+                    samples=sample_labels,
+                    components=[],
+                    properties=Labels(
+                        names=["property"],
+                        values=torch.tensor([[0], [1]], device=values.device),
+                        assume_unique=True,
+                    ),
+                )
+            ],
+        )
+        if selected_atoms is not None:
+            tmap = mts.slice(tmap, axis="samples", selection=selected_atoms)
+        if sample_kind == "system":
+            tmap = mts.mean_over_samples(tmap, sample_names=["atom"])
+        return tmap
+
+    def _get_output_features(
+        self,
+        node_features_list: List[torch.Tensor],
+        edge_features_list: List[torch.Tensor],
+        cutoff_factors: torch.Tensor,
+        selected_atoms: Optional[Labels],
+        sample_labels: Labels,
+        requested_outputs: Dict[str, ModelOutput],
+    ) -> Dict[str, TensorMap]:
+        """
+        Concatenate node and edge features from all layers into intermediate
+        feature representations. Edge features are summed with cutoff weighting.
+
+        :param node_features_list: List of node feature tensors from each GNN layer.
+        :param edge_features_list: List of edge feature tensors from each GNN layer.
+        :param cutoff_factors: Tensor of cutoff factors for edge distances
+            [n_atoms, max_num_neighbors].
+        :param selected_atoms: Optional Labels specifying a subset of atoms to include.
+        :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param requested_outputs: Dictionary of requested outputs.
+        :return: Dictionary mapping "feature" to a TensorMap of intermediate
+            representations, either per-atom or summed over atoms.
+        """
+        features_dict: Dict[str, TensorMap] = {}
+        node_features = torch.cat(node_features_list, dim=1)
+        edge_features = torch.cat(edge_features_list, dim=2)
+        edge_features = (edge_features * cutoff_factors[:, :, None]).sum(dim=1)
+        features = torch.cat([node_features, edge_features], dim=1)
+
+        feature_tmap = TensorMap(
+            keys=self.single_label,
+            blocks=[
+                TensorBlock(
+                    values=features,
+                    samples=sample_labels,
+                    components=[],
+                    properties=Labels(
+                        names=["feature"],
+                        values=torch.arange(
+                            features.shape[-1], device=features.device
+                        ).reshape(-1, 1),
+                        assume_unique=True,
+                    ),
+                )
+            ],
+        )
+        if selected_atoms is not None:
+            feature_tmap = mts.slice(
+                feature_tmap,
+                axis="samples",
+                selection=selected_atoms,
+            )
+        if requested_outputs["feature"].sample_kind == "atom":
+            features_dict["feature"] = feature_tmap
+        else:
+            features_dict["feature"] = sum_over_atoms(feature_tmap)
+        return features_dict
+
+    def _get_output_last_layer_features(
+        self,
+        node_last_layer_features_dict: Dict[str, List[torch.Tensor]],
+        edge_last_layer_features_dict: Dict[str, List[torch.Tensor]],
+        cutoff_factors: torch.Tensor,
+        selected_atoms: Optional[Labels],
+        sample_labels: Labels,
+        requested_outputs: Dict[str, ModelOutput],
+    ) -> Dict[str, TensorMap]:
+        """
+        Combine node and edge last layer features for requested last layer
+        features output. Edge features are summed with cutoff weighting.
+
+        :param node_last_layer_features_dict: Dictionary mapping output names to
+            lists of node last layer features.
+        :param edge_last_layer_features_dict: Dictionary mapping output names to
+            lists of edge last layer features.
+        :param cutoff_factors: Tensor of cutoff factors for edge distances
+            [n_atoms, max_num_neighbors].
+        :param selected_atoms: Optional Labels specifying a subset of atoms to include.
+        :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param requested_outputs: Dictionary of requested outputs.
+        :return: Dictionary mapping requested last layer features output names
+            to TensorMaps of last layer features, either per-atom or summed over atoms.
+        """
+        last_layer_features_dict: Dict[str, List[torch.Tensor]] = {}
+        last_layer_features_outputs: Dict[str, TensorMap] = {}
+        for output_name in node_last_layer_features_dict.keys():
+            if not should_compute_last_layer_features(output_name, requested_outputs):
+                continue
+            if output_name not in last_layer_features_dict:
+                last_layer_features_dict[output_name] = []
+            for i in range(len(node_last_layer_features_dict[output_name])):
+                node_last_layer_features = node_last_layer_features_dict[output_name][i]
+                edge_last_layer_features = edge_last_layer_features_dict[output_name][i]
+                edge_last_layer_features = (
+                    edge_last_layer_features * cutoff_factors[:, :, None]
+                ).sum(dim=1)
+                last_layer_features_dict[output_name].append(node_last_layer_features)
+                last_layer_features_dict[output_name].append(edge_last_layer_features)
+
+        for output_name in requested_outputs:
+            if not (
+                output_name.startswith("mtt::aux::")
+                and output_name.endswith("_last_layer_features")
+            ):
+                continue
+            base_name = output_name.replace("mtt::aux::", "").replace(
+                "_last_layer_features", ""
+            )
+            # the corresponding output could be base_name or mtt::base_name
+            if f"mtt::{base_name}" in last_layer_features_dict:
+                base_name = f"mtt::{base_name}"
+            last_layer_features_values = torch.cat(
+                last_layer_features_dict[base_name], dim=1
+            )
+            last_layer_feature_tmap = TensorMap(
+                keys=self.single_label,
+                blocks=[
+                    TensorBlock(
+                        values=last_layer_features_values,
+                        samples=sample_labels,
+                        components=[],
+                        properties=Labels(
+                            names=["feature"],
+                            values=torch.arange(
+                                last_layer_features_values.shape[-1],
+                                device=last_layer_features_values.device,
+                            ).reshape(-1, 1),
+                            assume_unique=True,
+                        ),
+                    )
+                ],
+            )
+            if selected_atoms is not None:
+                last_layer_feature_tmap = mts.slice(
+                    last_layer_feature_tmap,
+                    axis="samples",
+                    selection=selected_atoms,
+                )
+            last_layer_features_options = requested_outputs[output_name]
+            if last_layer_features_options.sample_kind == "atom":
+                last_layer_features_outputs[output_name] = last_layer_feature_tmap
+            else:
+                last_layer_features_outputs[output_name] = sum_over_atoms(
+                    last_layer_feature_tmap
+                )
+        return last_layer_features_outputs
+
+    def _get_output_atomic_predictions(
+        self,
+        atomic_predictions: Dict[str, List[torch.Tensor]],
+        sample_labels: Labels,
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels],
+    ) -> Dict[str, TensorMap]:
+        """
+        Wrap the per-block atomic predictions computed by the backend into TensorMaps.
+        Returns per-atom or per-structure predictions based on output configuration.
+
+        :param atomic_predictions: Dictionary mapping output names to lists of per-block
+            flat prediction tensors, as returned by :meth:`PETBackend.predict`.
+        :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param outputs: Dictionary of requested outputs.
+        :param selected_atoms: Optional Labels specifying a subset of atoms to include.
+        :return: Dictionary mapping requested output names to TensorMaps of
+            predictions, either per-atom or summed over atoms.
+        """
+        atomic_predictions_tmap_dict: Dict[str, TensorMap] = {}
+        for output_name in self.target_names:
+            if output_name in outputs:
+                prediction_blocks = atomic_predictions[output_name]
+                blocks: List[TensorBlock] = []
+                block_index = 0
+                for shape, components, properties in zip(
+                    self.output_shapes[output_name].values(),
+                    self.component_labels[output_name],
+                    self.property_labels[output_name],
+                    strict=True,
+                ):
+                    blocks.append(
+                        TensorBlock(
+                            values=prediction_blocks[block_index].reshape([-1] + shape),
+                            samples=sample_labels,
+                            components=components,
+                            properties=properties,
+                        )
+                    )
+                    block_index += 1
+                atomic_predictions_tmap_dict[output_name] = TensorMap(
+                    keys=self.key_labels[output_name],
+                    blocks=blocks,
+                )
+        # If selected atoms request is provided, we slice the atomic predictions
+        # tensor maps to get the predictions for the selected atoms only.
+
+        if selected_atoms is not None:
+            for output_name, tmap in atomic_predictions_tmap_dict.items():
+                atomic_predictions_tmap_dict[output_name] = mts.slice(
+                    tmap, axis="samples", selection=selected_atoms
+                )
+
+        # If per-atom predictions are requested, we return the atomic predictions
+        # tensor maps. Otherwise, we sum the atomic predictions over the atoms
+        # to get the final per-structure predictions for each requested output.
+
+        for output_name, atomic_property in atomic_predictions_tmap_dict.items():
+            if outputs[output_name].sample_kind == "atom":
+                atomic_predictions_tmap_dict[output_name] = atomic_property
+            else:
+                atomic_predictions_tmap_dict[output_name] = sum_over_atoms(
+                    atomic_property
+                )
+
+        return atomic_predictions_tmap_dict
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint: Dict[str, Any],
+        context: Literal["restart", "finetune", "export"],
+    ) -> "GLE":
+        if context == "restart":
+            logging.info(f"Using latest model from epoch {checkpoint['epoch']}")
+            model_state_dict = checkpoint["model_state_dict"]
+        elif context in {"finetune", "export"}:
+            logging.info(f"Using best model from epoch {checkpoint['best_epoch']}")
+            model_state_dict = checkpoint["best_model_state_dict"]
+        else:
+            raise ValueError("Unknown context tag for checkpoint loading!")
+
+        # Create the model
+        model_data = checkpoint["model_data"]
+        model = cls(
+            hypers=model_data["model_hypers"],
+            dataset_info=model_data["dataset_info"],
+        )
+
+        finetune_config = model_state_dict.pop("finetune_config", {})
+        if finetune_config:
+            # Re-apply the finetuning strategy to restore the trainable/frozen
+            # parameter state (and LoRA layers, if any). ``inherit_heads`` is
+            # skipped here: it is a one-time weight-copy initialization step that
+            # already ran when finetuning first started.
+            model = apply_finetuning_strategy(
+                model, finetune_config, apply_inherit_heads=False
+            )
+        # The checkpoint's dtype is that of the weights. Pick the first floating
+        # point entry rather than a fixed position: the state dict also holds
+        # integer buffers (``species_to_species_index``), and GLE's own
+        # ``theta_baseline`` buffer is emitted before the backend's entries.
+        dtype = next(
+            value.dtype
+            for value in model_state_dict.values()
+            if isinstance(value, torch.Tensor) and value.is_floating_point()
+        )
+        model.to(dtype).load_state_dict(model_state_dict)
+        model.additive_models[0].sync_tensor_maps()
+        model.scaler.sync_tensor_maps()
+
+        # Loading the metadata from the checkpoint
+        model.metadata = merge_metadata(model.metadata, checkpoint.get("metadata"))
+
+        return model
+
+    def export(self, metadata: Optional[ModelMetadata] = None) -> AtomisticModel:
+        dtype = next(self.parameters()).dtype
+        if dtype not in self.__supported_dtypes__:
+            raise ValueError(f"unsupported dtype {dtype} for GLE")
+
+        # Make sure the model is all in the same dtype
+        # For example, after training, the additive models could still be in
+        # float64
+        self.to(dtype)
+
+        # Additionally, the composition model contains some `TensorMap`s that cannot
+        # be registered correctly with Pytorch. This function moves them:
+        self.additive_models[0].weights_to(torch.device("cpu"), torch.float64)
+
+        interaction_ranges = [self.num_gnn_layers * self.cutoff]
+        for additive_model in self.additive_models:
+            if hasattr(additive_model, "cutoff_radius"):
+                interaction_ranges.append(additive_model.cutoff_radius)
+        interaction_range = max(interaction_ranges)
+
+        capabilities = ModelCapabilities(
+            outputs=self.outputs,
+            atomic_types=self.atomic_types,
+            interaction_range=interaction_range,
+            length_unit=self.dataset_info.length_unit,
+            supported_devices=self.__supported_devices__,
+            dtype=dtype_to_str(dtype),
+        )
+
+        metadata = merge_metadata(self.metadata, metadata)
+
+        return AtomisticModel(self.eval(), metadata, capabilities)
+
+    def _train_dataset_info(self, dataset_info: DatasetInfo) -> DatasetInfo:
+        """Converts the original dataset info to one corresponding to what GLE
+        will see during training, which depends on transforms applied to the
+        targets during data loading.
+
+        :param dataset_info: Original dataset info describing the targets as
+            they are in the raw data.
+        :return: Modified dataset info describing the targets as they will be
+            seen by GLE during training.
+        """
+        return densify_atomic_basis_dataset_info(dataset_info)
+
+    def _add_output(self, target_name: str, target_info: TargetInfo) -> None:
+        """
+        Register a new output target by creating corresponding heads and last layers.
+        Sets up node/edge heads and linear layers for all readout layers.
+
+        :param target_name: Name of the target to add.
+        :param target_info: TargetInfo object containing details about the target.
+        """
+        # one output shape for each tensor block, grouped by target (i.e. tensormap)
+        self.output_shapes[target_name] = {}
+        for key, block in target_info.layout.items():
+            dict_key = target_name
+            for n, k in zip(key.names, key.values, strict=True):
+                dict_key += f"_{n}_{int(k)}"
+            self.output_shapes[target_name][dict_key] = [
+                len(comp.values) for comp in block.components
+            ] + [len(block.properties.values)]
+
+        self.outputs[target_name] = ModelOutput(
+            quantity=target_info.quantity,
+            unit=target_info.unit,
+            sample_kind="atom",
+            description=target_info.description,
+        )
+
+        # The learnable heads and last layers live on the pure-PyTorch backend.
+        self.backend.add_output(target_name, self.output_shapes[target_name])
+
+        # Register last-layer parameters, in the same order as they are returned as
+        # last-layer features in the model (the modules live on ``self.backend``).
+        self.last_layer_parameter_names[target_name] = []
+        for layer_index in range(self.num_readout_layers):
+            for key in self.output_shapes[target_name].keys():
+                self.last_layer_parameter_names[target_name].append(
+                    f"backend.node_last_layers.{target_name}.{layer_index}.{key}.weight"
+                )
+                self.last_layer_parameter_names[target_name].append(
+                    f"backend.edge_last_layers.{target_name}.{layer_index}.{key}.weight"
+                )
+
+        ll_features_name = get_last_layer_features_name(target_name)
+        self.outputs[ll_features_name] = ModelOutput(
+            sample_kind="atom", description=f"last layer features for {target_name}"
+        )
+        self.key_labels[target_name] = target_info.layout.keys
+        self.component_labels[target_name] = [
+            block.components for block in target_info.layout.blocks()
+        ]
+        self.property_labels[target_name] = [
+            block.properties for block in target_info.layout.blocks()
+        ]
+
+    def remove_output(self, target_name: str) -> None:
+        """
+        Remove a previously registered output target, mirroring ``_add_output``.
+
+        :param target_name: Name of the target to remove.
+        """
+        self.output_shapes.pop(target_name, None)
+        self.outputs.pop(target_name, None)
+        self.outputs.pop(get_last_layer_features_name(target_name), None)
+        self.backend.remove_output(target_name)
+        self.last_layer_parameter_names.pop(target_name, None)
+        self.key_labels.pop(target_name, None)
+        self.component_labels.pop(target_name, None)
+        self.property_labels.pop(target_name, None)
+
+    def _move_labels_to_device(self, device: torch.device) -> None:
+        self.single_label = self.single_label.to(device)
+        self.key_labels = {
+            output_name: label.to(device)
+            for output_name, label in self.key_labels.items()
+        }
+        self.component_labels = {
+            output_name: [
+                [labels.to(device) for labels in components_block]
+                for components_block in components_tmap
+            ]
+            for output_name, components_tmap in self.component_labels.items()
+        }
+        self.property_labels = {
+            output_name: [labels.to(device) for labels in properties_tmap]
+            for output_name, properties_tmap in self.property_labels.items()
+        }
+
+    @classmethod
+    def upgrade_checkpoint(cls, checkpoint: Dict) -> Dict:
+        for v in range(1, cls.__checkpoint_version__):
+            if checkpoint["model_ckpt_version"] == v:
+                update = getattr(checkpoints, f"model_update_v{v}_v{v + 1}")
+                update(checkpoint)
+                checkpoint["model_ckpt_version"] = v + 1
+
+        if checkpoint["model_ckpt_version"] != cls.__checkpoint_version__:
+            raise RuntimeError(
+                f"Unable to upgrade the checkpoint: the checkpoint is using model "
+                f"version {checkpoint['model_ckpt_version']}, while the current model "
+                f"version is {cls.__checkpoint_version__}."
+            )
+
+        return checkpoint
+
+    def get_checkpoint(self) -> Dict:
+        model_state_dict = self.state_dict()
+        model_state_dict["finetune_config"] = self.finetune_config
+        checkpoint = {
+            "architecture_name": "gle",
+            "model_ckpt_version": self.__checkpoint_version__,
+            "metadata": self.metadata,
+            "model_data": {
+                "model_hypers": self.hypers,
+                "dataset_info": self.dataset_info,
+            },
+            "epoch": None,
+            "best_epoch": None,
+            "model_state_dict": model_state_dict,
+            "best_model_state_dict": self.state_dict(),
+        }
+        return checkpoint
