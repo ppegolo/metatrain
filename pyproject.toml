@@ -71,6 +71,7 @@ soap-bpnn = [
     "wigners",
 ]
 pet = []
+gle = []
 gap = [
     "featomic-torch >=0.7.4,<0.8",
     "skmatter",
