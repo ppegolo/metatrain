@@ -6,8 +6,8 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import NeighborListOptions, System
 
 from ..data import DatasetInfo
-from .atom_pair_helpers import get_pair_sample_labels
-from .target_info import TargetInfo
+from ..data.atom_pair_helpers import get_pair_sample_labels
+from ..data.target_info import TargetInfo
 
 
 # ===== General utilities
@@ -173,6 +173,116 @@ def _densify_atomic_basis_target(
         tensor = mts.remove_dimension(tensor, "samples", name)
 
     return tensor
+
+
+class DensifyStatics:
+    """Layout-derived constants for densifying atomic-basis targets.
+
+    Everything here depends only on the (static) layout, so computing it once
+    per training run — instead of once per batch inside the collate transform —
+    removes the union/select/empty-block construction from the hot path.
+
+    :param layout: the layout ``TensorMap`` defining the global basis set.
+    """
+
+    def __init__(self, layout: TensorMap):
+        keys = layout.keys
+        self.layout_keys = keys
+        self.type_names = [n for n in keys.names if n.endswith("atom_type")]
+        non_type_indices = [
+            i for i, n in enumerate(keys.names) if not n.endswith("atom_type")
+        ]
+
+        union_properties: Dict[Tuple[int, ...], Labels] = {}
+        for key, block in layout.items():
+            key_vals = tuple(int(key.values[i]) for i in non_type_indices)
+            if key_vals not in union_properties:
+                union_properties[key_vals] = block.properties
+            else:
+                union_properties[key_vals] = union_properties[key_vals].union(
+                    block.properties
+                )
+
+        # Per layout key: the union properties for its group and the positions
+        # of the block's own properties inside that union.
+        self.union_properties: Dict[Tuple[int, ...], Labels] = {}
+        self.property_masks: Dict[Tuple[int, ...], torch.Tensor] = {}
+        self.empty_samples: Dict[Tuple[int, ...], Labels] = {}
+        self.components: Dict[Tuple[int, ...], List[Labels]] = {}
+        self.empty_values: Dict[Tuple[int, ...], torch.Tensor] = {}
+        for key, block in layout.items():
+            full_key = tuple(int(v) for v in key.values)
+            key_vals = tuple(int(key.values[i]) for i in non_type_indices)
+            union = union_properties[key_vals]
+            self.union_properties[full_key] = union
+            self.property_masks[full_key] = union.select(block.properties)
+            self.empty_samples[full_key] = block.samples
+            self.components[full_key] = block.components
+            self.empty_values[full_key] = torch.empty(
+                (0, *[len(c) for c in block.components], len(union)),
+                dtype=block.values.dtype,
+            )
+
+
+def _densify_per_atom_with_statics(
+    tensor: TensorMap,
+    statics: DensifyStatics,
+    fill_value: float = torch.nan,
+) -> TensorMap:
+    """Densify using precomputed layout statics (see :class:`DensifyStatics`).
+
+    Semantically identical to :func:`_densify_per_atom_atomic_basis_target`,
+    but all layout-only work (property unions, selection masks, empty blocks)
+    is read from ``statics`` instead of being recomputed per call.
+
+    :param tensor: the per-atom atomic basis target TensorMap to densify.
+    :param statics: precomputed layout constants.
+    :param fill_value: the value used for the padded entries.
+    :return: the densified per-atom atomic basis target TensorMap.
+    """
+    present = {
+        tuple(int(v) for v in key.values): block for key, block in tensor.items()
+    }
+
+    padded_blocks = []
+    for key in statics.layout_keys:
+        full_key = tuple(int(v) for v in key.values)
+        block = present.get(full_key)
+        union = statics.union_properties[full_key]
+        if block is None:
+            padded_blocks.append(
+                TensorBlock(
+                    values=statics.empty_values[full_key],
+                    samples=statics.empty_samples[full_key],
+                    components=statics.components[full_key],
+                    properties=union,
+                )
+            )
+            continue
+        padded_values = torch.full(
+            (
+                len(block.samples),
+                *[len(c) for c in block.components],
+                len(union),
+            ),
+            fill_value,
+            dtype=block.values.dtype,
+        )
+        padded_values[..., statics.property_masks[full_key]] = block.values
+        padded_blocks.append(
+            TensorBlock(
+                values=padded_values,
+                samples=block.samples,
+                components=block.components,
+                properties=union,
+            )
+        )
+
+    out = TensorMap(statics.layout_keys, padded_blocks)
+    out = out.keys_to_samples(statics.type_names, sort_samples=True)
+    for name in statics.type_names:
+        out = mts.remove_dimension(out, "samples", name)
+    return out
 
 
 def densify_atomic_basis_target(
@@ -363,6 +473,7 @@ def prepare_atomic_basis_targets(
     layout: TensorMap,
     nl_options: Optional[NeighborListOptions] = None,
     fill_value: float = torch.nan,
+    statics: Optional[DensifyStatics] = None,
 ) -> TensorMap:
     """
     Prepare the atomic basis targets for batching by densifying (moving "atom_type" key
@@ -379,12 +490,17 @@ def prepare_atomic_basis_targets(
     :param fill_value: the value to use for filling in the padded values when densifying
         and padding. Default is NaN, but can be set to 0 if desired (e.g. for
         classification targets).
+    :param statics: optional precomputed layout constants (see
+        :class:`DensifyStatics`); avoids recomputing layout-only work per batch.
     :return: the prepared atomic basis target TensorMap, densified and padded, keeping
         the tensor's own native "system" ids.
     """
 
     # Densify: "atom type" key dimensions -> samples
-    tensor = densify_atomic_basis_target(tensor, layout, fill_value)
+    if statics is not None and "atom" in tensor.sample_names:
+        tensor = _densify_per_atom_with_statics(tensor, statics, fill_value)
+    else:
+        tensor = densify_atomic_basis_target(tensor, layout, fill_value)
 
     # Pad samples, labelling them with the target's own native "system" ids
     tensor = pad_samples_atomic_basis_target(systems, tensor, system_ids, nl_options)
@@ -722,37 +838,47 @@ def get_prepare_atomic_basis_targets_transform(
     :return: A function that takes in systems, targets and extra data, and returns the
         systems, targets and extra data with prepared atomic basis targets.
     """
+    # Precompute property masks for all atomic basis targets and extra data.
+    # This avoids calling layout_properties.select(block.properties) every
+    # time we want to sparsify a batch.
+    sparse_properties: dict[str, TensorMap] = {}
+    densify_statics: Dict[str, DensifyStatics] = {}
+    for name, info in target_info_dict.items():
+        if info.is_atomic_basis:
+            sparse_properties[name] = _compute_sparse_properties(info.layout)
+            densify_statics[name] = DensifyStatics(info.layout)
+    for name, info in extra_data_info_dict.items():
+        if info.is_atomic_basis:
+            sparse_properties[name] = _compute_sparse_properties(info.layout)
+            densify_statics[name] = DensifyStatics(info.layout)
 
     def transform(
         systems: List[System],
         targets: Dict[str, TensorMap],
         extra: Dict[str, TensorMap],
     ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-        """
-        Transform function that prepares the atomic basis targets for batching by
-        densifying and padding, modifying in-place. Samples keep the tensor's own
-        native "system" ids throughout.
+        system_ids: Optional[torch.Tensor] = None
+        if any(
+            name in target_info_dict and target_info_dict[name].is_atomic_basis
+            for name in targets
+        ) or any(
+            name in extra_data_info_dict and extra_data_info_dict[name].is_atomic_basis
+            for name in extra
+        ):
+            if "mtt::aux::system_index" not in extra:
+                raise ValueError(
+                    "Atomic-basis targets require the "
+                    "'mtt::aux::system_index' extra data, which is "
+                    "currently only provided by datasets read from disk "
+                    "(DiskDataset)."
+                )
+            system_ids = (
+                extra["mtt::aux::system_index"][0].values[:, 0].to(dtype=torch.int64)
+            )
 
-        :param systems: List of systems.
-        :param targets: Dictionary containing the targets corresponding to the systems.
-        :param extra: Dictionary containing any extra data.
-        :return: The systems, targets and extra data with prepared atomic basis targets.
-        """
         for name, tensor in targets.items():
             if name in target_info_dict and target_info_dict[name].is_atomic_basis:
-                if "mtt::aux::system_index" not in extra:
-                    raise ValueError(
-                        "Atomic-basis targets require the "
-                        "'mtt::aux::system_index' extra data, which is "
-                        "currently only provided by datasets read from disk "
-                        "(DiskDataset)."
-                    )
-                system_ids = (
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64)
-                )
-
+                assert system_ids is not None
                 targets[name] = prepare_atomic_basis_targets(
                     systems,
                     system_ids,
@@ -760,6 +886,7 @@ def get_prepare_atomic_basis_targets_transform(
                     target_info_dict[name].layout,
                     nl_options,
                     fill_value=torch.nan,
+                    statics=densify_statics.get(name),
                 )
 
         for name, tensor in extra.items():
@@ -767,19 +894,7 @@ def get_prepare_atomic_basis_targets_transform(
                 name in extra_data_info_dict
                 and extra_data_info_dict[name].is_atomic_basis
             ):
-                if "mtt::aux::system_index" not in extra:
-                    raise ValueError(
-                        "Atomic-basis targets require the "
-                        "'mtt::aux::system_index' extra data, which is "
-                        "currently only provided by datasets read from disk "
-                        "(DiskDataset)."
-                    )
-                system_ids = (
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64)
-                )
-
+                assert system_ids is not None
                 extra[name] = prepare_atomic_basis_targets(
                     systems,
                     system_ids,
@@ -787,36 +902,16 @@ def get_prepare_atomic_basis_targets_transform(
                     extra_data_info_dict[name].layout,
                     nl_options,
                     fill_value=torch.nan,
+                    statics=densify_statics.get(name),
                 )
 
         return systems, targets, extra
-
-    # Precompute property masks for all atomic basis targets and extra data.
-    # This avoids calling layout_properties.select(block.properties) every
-    # time we want to sparsify a batch.
-    sparse_properties: dict[str, TensorMap] = {}
-    for name, info in target_info_dict.items():
-        if info.is_atomic_basis:
-            sparse_properties[name] = _compute_sparse_properties(info.layout)
-    for name, info in extra_data_info_dict.items():
-        if info.is_atomic_basis:
-            sparse_properties[name] = _compute_sparse_properties(info.layout)
 
     def reverse_transform(
         systems: List[System],
         targets: Dict[str, TensorMap],
         extra: Dict[str, TensorMap],
     ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-        """
-        Reverse transform function that unpads, undensifies and reindexes the atomic
-        basis targets, modifying in-place.
-
-        :param systems: List of systems.
-        :param targets: Dictionary containing the targets corresponding to the systems.
-        :param extra: Dictionary containing any extra data.
-        :return: The systems, targets and extra data with unprepared atomic basis
-            targets.
-        """
         for name, tensor in targets.items():
             if name in target_info_dict and target_info_dict[name].is_atomic_basis:
                 if name in sparse_properties:

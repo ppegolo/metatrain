@@ -12,8 +12,8 @@ from metatrain.utils.additive import (
     ZBL,
     remove_additive,
 )
+from metatrain.utils.atomic_basis.helpers import densify_atomic_basis_target
 from metatrain.utils.data import Dataset, DatasetInfo
-from metatrain.utils.data.atomic_basis_helpers import densify_atomic_basis_target
 from metatrain.utils.data.readers import read_systems, read_targets
 from metatrain.utils.data.readers.metatensor import _empty_tensor_map_like
 from metatrain.utils.data.target_info import (
