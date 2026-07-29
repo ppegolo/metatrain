@@ -59,7 +59,6 @@ class PETBackend(torch.nn.Module):
         self.transformer_type = hypers["transformer_type"]
         self.featurizer_type = hypers["featurizer_type"]
         self.readout_type = hypers["readout_type"]
-        self.geometry_embedding_lmax = hypers["geometry_embedding_lmax"]
 
         num_atomic_species = len(atomic_types)
         self.n_species = num_atomic_species
@@ -90,7 +89,6 @@ class PETBackend(torch.nn.Module):
                     self.transformer_type,
                     num_atomic_species,
                     layer_index == 0,  # is first layer
-                    self.geometry_embedding_lmax,
                 )
                 for layer_index in range(self.num_gnn_layers)
             ]

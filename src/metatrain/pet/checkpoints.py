@@ -372,16 +372,14 @@ def model_update_v16_v17(checkpoint: dict) -> None:
     """
     Update a v16 checkpoint to v17.
 
-    v17 added the ``readout_type`` and ``geometry_embedding_lmax`` model hypers
-    (both read unconditionally by ``PETBackend.__init__``). Older checkpoints
-    lack them; fill in the defaults, which reproduce the old behaviour exactly
-    (plain linear last layers, standard edge geometry embeddings).
+    v17 added the ``readout_type`` model hyper (read unconditionally by
+    ``PETBackend.__init__``). Older checkpoints lack it; fill in the default,
+    which reproduces the old behaviour exactly (plain linear last layers).
 
     :param checkpoint: The checkpoint to update.
     """
     model_hypers = checkpoint["model_data"]["model_hypers"]
     model_hypers.setdefault("readout_type", None)
-    model_hypers.setdefault("geometry_embedding_lmax", None)
 
 
 ###########################

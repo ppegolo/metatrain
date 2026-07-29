@@ -142,7 +142,6 @@ important** (in decreasing order of importance):
   .. autoattribute:: {{model_hypers_path}}.readout_type
       :no-index:
 
-  .. autoattribute:: {{model_hypers_path}}.geometry_embedding_lmax
       :no-index:
 """
 
@@ -349,10 +348,6 @@ class ModelHypers(TypedDict):
 
     The ``readout_type`` applies only to atomic basis targets; non-atomic-basis
     targets always use a shared linear readout regardless of this setting.
-    """
-    geometry_embedding_lmax: Optional[int] = None
-    """
-    The L max of solid spherical harmonics to use for edge geometry embeddings
     """
 
 
