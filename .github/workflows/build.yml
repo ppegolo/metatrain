@@ -1,0 +1,30 @@
+# This workflow builds and checks the package for release
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v8.1.0
+      with:
+        python-version: "3.13"
+        enable-cache: true
+        activate-environment: true
+
+    - name: Setup dependencies
+      run: |
+        uv tool install tox --with tox-uv
+
+    - name: Test build integrity
+      run: tox -e build
+      env:
+        # Use the CPU only version of torch when building/running the code
+        PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu

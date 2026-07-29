@@ -1,0 +1,56 @@
+name: Architecture tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Check all PR
+
+jobs:
+  tests:
+    name: ${{ matrix.architecture-name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture-name:
+          - classifier
+          - flashmd
+          - flashmd-symplectic
+          - gap
+          - llpr
+          - mace
+          - pet
+          - phace
+          - soap-bpnn
+          - dpa3
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v8.1.0
+      with:
+        python-version: "3.13"
+        enable-cache: true
+        activate-environment: true
+
+    - name: Setup dependencies
+      run: |
+        uv tool install tox --with tox-uv
+        pip install coverage[toml]
+
+    - name: run architecture tests and generate coverage
+      run: |
+        tox -e ${{ matrix.architecture-name }}-tests
+        coverage xml -o coverage.xml
+      env:
+        # Use the CPU only version of torch when building/running the code
+        PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+    - name: upload to codecov.io
+      uses: codecov/codecov-action@v6
+      with:
+        fail_ci_if_error: false
+        files: coverage.xml

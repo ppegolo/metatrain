@@ -1,0 +1,14 @@
+# This file defines code owners for the different architectures, ensuring
+# that they get asked for a review whenever the code for this architecture
+# is modified.
+
+**/soap_bpnn            @frostedoyster
+**/pet                  @abmazitov @frostedoyster @sofiia-chorna
+**/gap                  @DavideTisi
+**/phace                @frostedoyster
+**/llpr                 @frostedoyster @SanggyuChong
+**/flashmd              @johannes-spies @frostedoyster
+**/flashmd_symplectic   @frostedoyster @johannes-spies
+**/classifier           @frostedoyster
+**/mace                 @pfebrer @jwa7
+**/dpa3                 @HaoZeke

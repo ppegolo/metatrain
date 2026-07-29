@@ -1,0 +1,193 @@
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+import tomllib
+
+
+# When importing metatensor-torch, this will change the definition of the classes to
+# include the documentation
+os.environ["METATENSOR_IMPORT_FOR_SPHINX"] = "1"
+os.environ["METATOMIC_IMPORT_FOR_SPHINX"] = "1"
+os.environ["PYTORCH_JIT"] = "0"
+os.environ["METATENSOR_DEBUG_EXTENSIONS_LOADING"] = "1"
+
+import metatrain  # noqa: E402
+
+
+ROOT = os.path.abspath(os.path.join("..", ".."))
+
+# We use a second (pseudo) sphinx project located in `docs/generate_examples` to run the
+# examples and generate the actual output for our shinx-gallery. This is necessary
+# because here we have to set `METATENSOR_IMPORT_FOR_SPHINX` and
+# `METATOMIC_IMPORT_FOR_SPHINX` to `"1"` allowing the correct generation of the class
+# and function docstrings which are seperate from the actual code.
+#
+# We register and use the same sphinx gallery configuration as in the pseudo project.
+sys.path.append(os.path.join(ROOT, "docs"))
+from generate_examples.conf import sphinx_gallery_conf  # noqa
+from src.architectures.generate import setup_architectures_docs  # noqa
+
+
+# -- Project information -----------------------------------------------------
+
+# The master toctree document.
+master_doc = "index"
+
+with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fp:
+    project_dict = tomllib.load(fp)["project"]
+
+project = project_dict["name"]
+author = ", ".join(a["name"] for a in project_dict["authors"])
+
+copyright = f"{datetime.now().date().year}, {author}"
+
+# The full version, including alpha/beta/rc tags
+release = metatrain.__version__
+
+
+# -- General configuration ---------------------------------------------------
+def copy_readme():
+    """Copy the main README.md to the docs/src directory and modify it.
+
+    The docs include the README file in the homepage, but the main README.md
+    contains links to the online documentation for the architecture pages.
+    Since we are building the docs, we want those links to point to the
+    generated documentation instead of the online docs. This requires
+    modifying the links in the README file.
+    """
+    orig_readme = os.path.join(ROOT, "README.md")
+    docs_readme = os.path.join(ROOT, "docs", "src", "mtt_README.md")
+    with open(orig_readme, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Substitute everything that looks like [ARCH_NAME][arch-ARCHREF] with the myst
+    # compatible reference role {ref}`ARCH_NAME <arch-ARCHREF>`
+    pattern = re.compile(r"\[([^\]]+)]\[arch-([^\]]+)]")
+    content = pattern.sub(r"{ref}`\1 <arch-\2>`", content)
+    with open(docs_readme, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def generate_examples():
+    # we can not run sphinx-gallery in the same process as the normal sphinx, since they
+    # need to import metatensor.torch and metatomic.torch differently (with and without
+    # {METATENSOR/METATOMIC}_IMPORT_FOR_SPHINX=1). So instead we run it inside a small
+    # script, and include the corresponding output later.
+    del os.environ["METATENSOR_IMPORT_FOR_SPHINX"]
+    del os.environ["METATOMIC_IMPORT_FOR_SPHINX"]
+    del os.environ["PYTORCH_JIT"]
+    script = os.path.join(ROOT, "docs", "generate_examples", "generate-examples.py")
+    subprocess.run([sys.executable, script])
+    os.environ["METATENSOR_IMPORT_FOR_SPHINX"] = "1"
+    os.environ["METATOMIC_IMPORT_FOR_SPHINX"] = "1"
+    os.environ["PYTORCH_JIT"] = "0"
+
+
+def setup(app):
+    copy_readme()
+    generate_examples()
+    setup_architectures_docs()
+
+
+# Add any Sphinx extension module names here, as strings. They can be
+# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
+# ones.
+extensions = [
+    "myst_parser",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.autodoc",
+    "sphinx.ext.intersphinx",
+    "sphinx_sitemap",
+    "sphinxcontrib.bibtex",
+    "sphinx_copybutton",
+    "sphinx_toggleprompt",
+    "sphinx_gallery.gen_gallery",
+    "chemiscope.sphinx",
+]
+
+# List of patterns, relative to source directory, that match files and
+# directories to ignore when looking for source files.
+# This pattern also affects html_static_path and html_extra_path.
+exclude_patterns = [
+    "Thumbs.db",
+    ".DS_Store",
+    "examples/sg_execution_times.rst",
+    "examples/ase/index.rst",
+    "sg_execution_times.rst",
+    "architectures/templates/*",
+    "architectures/README.md",
+]
+
+
+python_use_unqualified_type_names = True
+
+autoclass_content = "both"
+autodoc_member_order = "bysource"
+autodoc_typehints = "both"
+autodoc_typehints_format = "short"
+
+intersphinx_mapping = {
+    "ase": ("https://ase-lib.org/", None),
+    "python": ("https://docs.python.org/3", None),
+    "torch": ("https://docs.pytorch.org/docs/stable/", None),
+    "metatensor": ("https://docs.metatensor.org/latest/", None),
+    "metatomic": ("https://docs.metatensor.org/metatomic/latest/", None),
+    "omegaconf": ("https://omegaconf.readthedocs.io/en/latest/", None),
+    "pydantic": ("https://docs.pydantic.dev/latest", None),
+}
+
+# The path to the bibtex file
+bibtex_bibfiles = ["../static/refs.bib"]
+bibtex_default_style = "unsrt"
+bibtex_reference_style = "author_year"
+
+# sitemap/SEO settings
+html_baseurl = "https://docs.metatensor.org/metatrain/latest/"  # prefix for the sitemap
+sitemap_url_scheme = "{link}"  # avoids language settings
+html_extra_path = ["robots.txt"]  # extra files to move
+
+# -- Options for HTML output -------------------------------------------------
+
+# The theme to use for HTML and HTML Help pages.  See the documentation for
+# a list of builtin themes.
+html_title = "Metatrain"
+html_theme = "furo"
+
+# Add any paths that contain custom static files (such as style sheets) here,
+# relative to this directory. They are copied after the builtin static files,
+# so a file named "default.css" will overwrite the builtin "default.css".
+html_static_path = [os.path.join(ROOT, "docs", "static")]
+templates_path = ["_templates"]
+html_favicon = "logo/metatrain-64.png"
+
+html_theme_options = {
+    "light_logo": "images/metatrain-horizontal.png",
+    "dark_logo": "images/metatrain-horizontal-dark.png",
+    "sidebar_hide_name": True,
+    "source_repository": "https://github.com/metatensor/metatrain",
+    "source_branch": "main",
+    "source_directory": "docs/src/",
+    "footer_icons": [],
+}
+
+html_sidebars = {
+    "**": [
+        "sidebar/brand.html",
+        "sidebar/github-link.html",
+        "sidebar/search.html",
+        "sidebar/scroll-start.html",
+        "sidebar/navigation.html",
+        "sidebar/scroll-end.html",
+    ],
+}
+
+# font-awesome logos (used in the footer)
+html_css_files = [
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/fontawesome.min.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/solid.min.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/brands.min.css",
+    "styles.css",
+]

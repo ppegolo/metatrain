@@ -1,0 +1,14 @@
+chemiscope
+furo
+jinja2
+matplotlib
+myst-parser
+pytest
+# Sphinx < 9.0 because of some warnings on docs build (likely sphinx bug), 
+# if future sphinx builds without warnings, remove constraint
+sphinx < 9.0 
+sphinxcontrib-bibtex
+sphinx-gallery
+sphinx-copybutton
+sphinx-sitemap
+sphinx-toggleprompt

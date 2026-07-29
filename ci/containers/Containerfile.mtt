@@ -1,0 +1,12 @@
+ARG BASE_IMAGE
+FROM $BASE_IMAGE
+
+# Copy metatrain repository within the container
+# The repo is cloned by CI (GIT_STRATEGY: clone)
+COPY . /metatrain/
+
+RUN uv venv /mtt-venv && \
+	. /mtt-venv/bin/activate && \
+	uv pip install --no-cache-dir torch==2.8.0+cu129 setuptools wheel cmake>=3.30 && \
+	uv pip install --no-cache-dir --no-build-isolation sphericart-torch && \
+	uv pip install --no-cache-dir /metatrain[soap-bpnn]
