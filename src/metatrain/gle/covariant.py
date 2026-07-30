@@ -334,3 +334,63 @@ def assert_covariant(n_aux: int, seed: int = 0, tol: float = 1e-9) -> None:
             f"symmetric part not positive definite at n_aux={n_aux}: "
             f"min eigenvalue {smallest:.3e}"
         )
+
+
+# --- fluctuation-dissipation: the noise is FIXED by A, not fitted -----------------------
+#
+# The extended-variable dynamics is an Ornstein-Uhlenbeck process
+#
+#     dY/dt = -A Y + B xi(t),      <xi(t) xi(t')^T> = delta(t - t') I ,
+#
+# whose stationary covariance C solves the Lyapunov equation ``A C + C A^T = B B^T``.
+#
+# **Convention: mass-scaled variables.** Y = (p / sqrt(m), s_1, ..., s_n_aux), so
+# equipartition reads ``C = kT I_d`` exactly. The caller is responsible for the mass scaling;
+# the deployment currently carries masses explicitly (`run_gle.py` builds an edge stationary
+# scale ``kT (1/m_i + 1/m_j)``), so this must be applied consistently there.
+#
+# With ``C = kT I`` the FDT gives ``B B^T = 2 kT sym(A)``, which EXISTS precisely because
+# ``sym(A)`` is positive definite by construction (``1/2 M M^T + eps I``). Nothing here is
+# fitted: the noise follows from the learned drift.
+#
+# **Why this is written out rather than inherited.** ``C = kT I_d`` is proportional to the
+# identity, hence isotropic in every Cartesian slot AND invariant under ``I_b (x) R``. So
+# equipartition holds direction-by-direction even though ``A`` is anisotropic. An
+# implementation that instead inferred the stationary covariance from ``A`` could land on an
+# anisotropic ``C``, which would violate equipartition per Cartesian direction while leaving
+# the TRACE (and hence the reported temperature) correct -- invisible in every standard
+# diagnostic this project runs.
+
+
+def stationary_covariance(
+    n_aux: int, kT: float, dtype: torch.dtype = torch.float64,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Equilibrium covariance of the mass-scaled extended state: ``kT I_d``."""
+    return kT * torch.eye(3 * (1 + n_aux), dtype=dtype, device=device)
+
+
+def ou_propagator(
+    A: torch.Tensor, dt: float, kT: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact one-step OU propagator for ``dY/dt = -A Y + B xi``.
+
+    Returns ``(T, Sigma)`` with ``T = exp(-A dt)`` and the noise covariance
+
+        Sigma = C - T C T^T = kT (I - T T^T) ,
+
+    which is the EXACT finite-timestep result, not a small-``dt`` expansion: propagating
+    ``Y -> T Y + Sigma^{1/2} z`` therefore preserves the stationary covariance for ANY ``dt``,
+    so the integrator cannot heat or cool the auxiliaries however coarse the step.
+
+    :param A: ``[..., d, d]`` drift, ``d = 3(1 + n_aux)``.
+    :param dt: timestep, in the same time unit as ``A``.
+    :param kT: thermal energy.
+    """
+    T = torch.matrix_exp(-A * dt)
+    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
+    sigma = kT * (eye - T @ T.transpose(-1, -2))
+    # symmetrise: `Sigma` is symmetric analytically, but `matrix_exp` leaves an asymmetry of
+    # order the arithmetic precision, and an eigendecomposition of a non-symmetric matrix can
+    # return complex eigenvalues and fail far from here.
+    return T, 0.5 * (sigma + sigma.transpose(-1, -2))
