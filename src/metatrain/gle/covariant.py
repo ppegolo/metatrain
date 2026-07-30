@@ -407,3 +407,124 @@ def ou_propagator(
     # order the arithmetic precision, and an eigendecomposition of a non-symmetric matrix can
     # return complex eigenvalues and fail far from here.
     return T, 0.5 * (sigma + sigma.transpose(-1, -2))
+
+
+# --- spherical TensorMap <-> flat theta --------------------------------------------------
+#
+# The model emits `mtt::A` as a TensorMap with l = 0 and l = 2 blocks; `make_A_covariant`
+# consumes a FLAT per-atom vector. The two orderings have the same length, so a mismatch is
+# SILENT: training would converge on a drift assembled from permuted components and the only
+# symptom would be wrong dynamics. `assert_theta_roundtrip` therefore checks the conversion
+# on random data rather than leaving the convention to a comment.
+#
+# Layout, per atom: property `p` of the spherical blocks (0 .. 2 b^2 - 1, the M grid then the
+# N grid) maps to the CONTIGUOUS slice `theta[6p : 6p + 6] = [l0, l2_0 ... l2_4]`, which is
+# what `_blocks` reshapes.
+
+
+def tensormap_to_theta(tensor_map, n_aux: int) -> torch.Tensor:
+    """Flatten the spherical ``mtt::A`` prediction into ``theta`` for the assembly.
+
+    :param tensor_map: a ``TensorMap`` with ``(o3_lambda, o3_sigma)`` keys ``(0, 1)`` and
+        ``(2, 1)``, values ``[n_atoms, 2l + 1, 2 b^2]``.
+    :param n_aux: number of auxiliary 3-vectors.
+    :return: ``[n_atoms, theta_size(n_aux)]``.
+    """
+    blocks = {}
+    for key, block in tensor_map.items():
+        blocks[int(key["o3_lambda"])] = block.values
+    if set(blocks) != {0, 2}:
+        raise ValueError(
+            f"expected o3_lambda blocks {{0, 2}}, got {sorted(blocks)}; the l = 1 channel "
+            "is deliberately absent (Onsager reciprocity -- see the module docstring)"
+        )
+    l0, l2 = blocks[0], blocks[2]              # [atoms, 1, P], [atoms, 5, P]
+    n_props = l0.shape[-1]
+    expected = 2 * (1 + n_aux) ** 2
+    if n_props != expected:
+        raise ValueError(
+            f"expected {expected} properties for n_aux = {n_aux}, got {n_props}"
+        )
+    # -> [atoms, P, 6] with the l = 0 component first, then the five l = 2 components,
+    # then flatten so each block's six numbers stay contiguous.
+    stacked = torch.cat([l0.transpose(1, 2), l2.transpose(1, 2)], dim=-1)
+    return stacked.reshape(stacked.shape[0], -1)
+
+
+def theta_to_irrep_values(
+    theta: torch.Tensor, n_aux: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`tensormap_to_theta`: flat theta -> ``(l0, l2)`` block values.
+
+    Returns the arrays in TensorMap order, ``[n_atoms, 2l + 1, 2 b^2]``.
+    """
+    n_props = 2 * (1 + n_aux) ** 2
+    stacked = theta.reshape(theta.shape[0], n_props, 6)
+    return stacked[..., :1].transpose(1, 2), stacked[..., 1:].transpose(1, 2)
+
+
+def assert_theta_roundtrip(n_aux: int, seed: int = 0, tol: float = 1e-12) -> None:
+    """Check the flat/spherical conversion is an exact inverse, and preserves ``A``.
+
+    Both directions are checked, and so is the assembled drift: a permutation that happened
+    to survive one direction would still change ``A``, which is the object that matters.
+    """
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+
+    generator = torch.Generator().manual_seed(seed)
+    n_atoms = 5
+    theta = torch.randn(
+        n_atoms, theta_size(n_aux), dtype=torch.float64, generator=generator
+    )
+    l0, l2 = theta_to_irrep_values(theta, n_aux)
+
+    samples = Labels(
+        names=["system", "atom"],
+        values=torch.stack(
+            [torch.zeros(n_atoms, dtype=torch.long), torch.arange(n_atoms)], dim=1
+        ),
+    )
+    properties = Labels(
+        names=["A"], values=torch.arange(l0.shape[-1]).unsqueeze(1)
+    )
+    blocks = []
+    for o3_lambda, values in ((0, l0), (2, l2)):
+        blocks.append(
+            TensorBlock(
+                values=values,
+                samples=samples,
+                components=[
+                    Labels(
+                        names=["o3_mu"],
+                        values=torch.arange(
+                            -o3_lambda, o3_lambda + 1, dtype=torch.long
+                        ).unsqueeze(1),
+                    )
+                ],
+                properties=properties,
+            )
+        )
+    tensor_map = TensorMap(
+        keys=Labels(
+            names=["o3_lambda", "o3_sigma"],
+            values=torch.tensor([[0, 1], [2, 1]], dtype=torch.long),
+        ),
+        blocks=blocks,
+    )
+
+    recovered = tensormap_to_theta(tensor_map, n_aux)
+    error = (recovered - theta).abs().max().item()
+    if error > tol:
+        raise AssertionError(
+            f"theta round trip failed at n_aux={n_aux}: max |theta' - theta| = {error:.3e}"
+        )
+    drift_error = (
+        (make_A_covariant(recovered, n_aux) - make_A_covariant(theta, n_aux))
+        .abs()
+        .max()
+        .item()
+    )
+    if drift_error > tol:
+        raise AssertionError(
+            f"round trip changed the drift at n_aux={n_aux}: max |dA| = {drift_error:.3e}"
+        )
