@@ -73,6 +73,24 @@ import torch
 #   l = 1 : the antisymmetric part,  3 components, T_anti <-> a pseudo-vector
 #   l = 2 : symmetric traceless,     5 components
 #
+# **l = 1 IS DELIBERATELY OMITTED. The Cartesian blocks are SYMMETRIC.** Two independent
+# reasons, one physical and one practical:
+#
+#   * Onsager reciprocity. The Mori-Zwanzig kernel obeys K_ij(tau) = K_ji(tau)^T, so the
+#     diagonal block K_ii is symmetric. An antisymmetric part of the friction would be a
+#     magnetic / Coriolis-like term, forbidden without a magnetic field or broken
+#     time-reversal symmetry.
+#   * A pseudo-vector (l = 1, sigma = -1) is parity-ODD and cannot be built from
+#     parity-EVEN descriptors. MEASURED with a SOAP-BPNN backbone: l = 0 and l = 2 came out
+#     equivariant to 1e-16 while the l = 1 channel was ~1e-7 -- six orders below the others
+#     and not equivariant, i.e. numerical noise rather than a pseudo-vector, and it was the
+#     ONLY non-equivariant part of the output.
+#
+# This costs no oscillatory memory. The antisymmetry that makes a GLE non-Markovian lives in
+# the BLOCK indices (the p <-> s coupling), not the Cartesian ones: with symmetric 3x3 blocks
+# N_ij, the antisymmetric part K = N - N^T has blocks N_ij - N_ji, still antisymmetric in the
+# block index. Onsager in the Cartesian slots, oscillatory in the block structure.
+#
 # Emitting these three irreps SEPARATELY -- rather than 9 unstructured numbers -- is what
 # lets metatrain's architectures deliver equivariance themselves: SOAP-BPNN builds a
 # `TensorBasis` per (o3_lambda, o3_sigma), and SPACE is equivariant by construction. PET is
@@ -103,46 +121,38 @@ def _l2_basis(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     return b
 
 
-def irreps_to_cartesian(
-    l0: torch.Tensor, l1: torch.Tensor, l2: torch.Tensor
-) -> torch.Tensor:
-    """``(l0 [...,1], l1 [...,3], l2 [...,5])`` -> Cartesian blocks ``[..., 3, 3]``."""
+def irreps_to_cartesian(l0: torch.Tensor, l2: torch.Tensor) -> torch.Tensor:
+    """``(l0 [...,1], l2 [...,5])`` -> SYMMETRIC Cartesian blocks ``[..., 3, 3]``.
+
+    There is no ``l = 1`` argument: see the module docstring -- Onsager reciprocity makes
+    the Cartesian friction tensor symmetric, and a pseudo-vector cannot be built from
+    parity-even descriptors anyway.
+    """
     dtype, device = l0.dtype, l0.device
     eye = torch.eye(3, dtype=dtype, device=device)
-    out = l0[..., 0, None, None] * eye / _SQRT3
-    # antisymmetric part from the pseudo-vector: T_ij = -eps_ijk v_k / sqrt(2)
-    v = l1 / _SQRT2
-    zero = torch.zeros_like(v[..., 0])
-    anti = torch.stack(
-        [
-            torch.stack([zero, v[..., 2], -v[..., 1]], dim=-1),
-            torch.stack([-v[..., 2], zero, v[..., 0]], dim=-1),
-            torch.stack([v[..., 1], -v[..., 0], zero], dim=-1),
-        ],
-        dim=-2,
-    )
+    trace = l0[..., 0, None, None] * eye / _SQRT3
     basis = _l2_basis(dtype, device)
-    sym = (l2[..., :, None, None] * basis).sum(dim=-3)
-    return out + anti + sym
+    traceless = (l2[..., :, None, None] * basis).sum(dim=-3)
+    return trace + traceless
 
 
 def cartesian_to_irreps(
     tensor: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Inverse of :func:`irreps_to_cartesian`. Returns ``(l0, l1, l2)``."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`irreps_to_cartesian`. Returns ``(l0, l2)``.
+
+    Any antisymmetric part of ``tensor`` is DISCARDED, not an error: the construction only
+    ever produces symmetric blocks, and this is used to check that.
+    """
     trace = tensor.diagonal(dim1=-2, dim2=-1).sum(-1)
     l0 = (trace / _SQRT3)[..., None]
-    anti = 0.5 * (tensor - tensor.transpose(-1, -2))
-    l1 = _SQRT2 * torch.stack(
-        [anti[..., 1, 2], anti[..., 2, 0], anti[..., 0, 1]], dim=-1
-    )
     basis = _l2_basis(tensor.dtype, tensor.device)
     sym = 0.5 * (tensor + tensor.transpose(-1, -2))
     sym = sym - (trace / 3.0)[..., None, None] * torch.eye(
         3, dtype=tensor.dtype, device=tensor.device
     )
     l2 = (sym[..., None, :, :] * basis).sum(dim=(-2, -1))
-    return l0, l1, l2
+    return l0, l2
 
 
 def irrep_property_counts(n_aux: int) -> Dict[int, int]:
@@ -152,7 +162,7 @@ def irrep_property_counts(n_aux: int) -> Dict[int, int]:
     ``2 b^2`` properties; the o3_mu components are handled by the TensorMap layout.
     """
     b = 1 + n_aux
-    return {0: 2 * b * b, 1: 2 * b * b, 2: 2 * b * b}
+    return {0: 2 * b * b, 2: 2 * b * b}
 
 
 # --- the `mtt::A` target, declared SPHERICALLY -----------------------------------------
@@ -171,7 +181,7 @@ def irrep_property_counts(n_aux: int) -> Dict[int, int]:
 # Getting the l = 1 parity wrong would let the network fit an object of the wrong symmetry
 # and would not be caught by any shape check.
 
-_IRREPS: Tuple[Tuple[int, int], ...] = ((0, 1), (1, -1), (2, 1))
+_IRREPS: Tuple[Tuple[int, int], ...] = ((0, 1), (2, 1))
 
 
 def gle_target_info_covariant(n_aux: int) -> "TargetInfo":
@@ -223,7 +233,7 @@ def gle_target_info_covariant(n_aux: int) -> "TargetInfo":
 def theta_size(n_aux: int) -> int:
     """Number of raw network outputs per bead for :func:`make_A_covariant`."""
     b = 1 + n_aux
-    return 2 * 9 * b * b
+    return 2 * 6 * b * b
 
 
 def _blocks(theta: torch.Tensor, n_aux: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -236,10 +246,11 @@ def _blocks(theta: torch.Tensor, n_aux: int) -> Tuple[torch.Tensor, torch.Tensor
             f"got {theta.shape[-1]}"
         )
     batch = theta.shape[:-1]
-    half = 9 * b * b
-    m = theta[..., :half].reshape(*batch, b, b, 3, 3)
-    n = theta[..., half:].reshape(*batch, b, b, 3, 3)
-    return m, n
+    half = 6 * b * b
+    def to_cartesian(flat):
+        irreps = flat.reshape(*batch, b, b, 6)
+        return irreps_to_cartesian(irreps[..., :1], irreps[..., 1:])
+    return to_cartesian(theta[..., :half]), to_cartesian(theta[..., half:])
 
 
 def _assemble(blocks: torch.Tensor) -> torch.Tensor:
@@ -291,9 +302,11 @@ def rotate_theta(theta: torch.Tensor, rotation: torch.Tensor, n_aux: int) -> tor
     """
     m, n = _blocks(theta, n_aux)
     rt = rotation.transpose(-1, -2)
-    m = rotation @ m @ rt
-    n = rotation @ n @ rt
-    return torch.cat([m.flatten(start_dim=-4), n.flatten(start_dim=-4)], dim=-1)
+    out = []
+    for blocks in (rotation @ m @ rt, rotation @ n @ rt):
+        l0, l2 = cartesian_to_irreps(blocks)
+        out.append(torch.cat([l0, l2], dim=-1).flatten(start_dim=-3))
+    return torch.cat(out, dim=-1)
 
 
 def assert_covariant(n_aux: int, seed: int = 0, tol: float = 1e-9) -> None:
