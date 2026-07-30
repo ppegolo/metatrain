@@ -155,6 +155,71 @@ def irrep_property_counts(n_aux: int) -> Dict[int, int]:
     return {0: 2 * b * b, 1: 2 * b * b, 2: 2 * b * b}
 
 
+# --- the `mtt::A` target, declared SPHERICALLY -----------------------------------------
+#
+# Emitting the drift blocks as l = 0 (+) 1 (+) 2 rather than as a flat vector of scalars is
+# what makes equivariance metatrain's job instead of ours: SOAP-BPNN builds a `TensorBasis`
+# per (o3_lambda, o3_sigma), and SPACE is equivariant by construction. PET is invariant and
+# would need rotational augmentation to learn the l > 0 channels; training it without is a
+# useful CONTROL -- it isolates what covariance buys -- not a blocker.
+#
+# Parities. `A` maps momenta to momenta, so under inversion (p -> -p) it is EVEN: a proper
+# rank-2 tensor. Its decomposition therefore carries
+#     l = 0  o3_sigma = +1   (trace)
+#     l = 1  o3_sigma = -1   (antisymmetric part <-> a PSEUDO-vector)
+#     l = 2  o3_sigma = +1   (symmetric traceless)
+# Getting the l = 1 parity wrong would let the network fit an object of the wrong symmetry
+# and would not be caught by any shape check.
+
+_IRREPS: Tuple[Tuple[int, int], ...] = ((0, 1), (1, -1), (2, 1))
+
+
+def gle_target_info_covariant(n_aux: int) -> "TargetInfo":
+    """``TargetInfo`` for the covariant ``mtt::A``: a per-atom spherical tensor target.
+
+    Properties index the ``2 b^2`` Cartesian blocks (the ``M`` and ``N`` grids, ``b = 1 +
+    n_aux``); the ``o3_mu`` components carry the ``2l + 1`` parts of each irrep.
+    """
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+
+    from metatrain.utils.data import TargetInfo
+
+    counts = irrep_property_counts(n_aux)
+    blocks = []
+    for o3_lambda, o3_sigma in _IRREPS:
+        n_props = counts[o3_lambda]
+        blocks.append(
+            TensorBlock(
+                values=torch.empty(0, 2 * o3_lambda + 1, n_props),
+                samples=Labels(
+                    names=["system", "atom"],
+                    values=torch.empty((0, 2), dtype=torch.long),
+                ),
+                components=[
+                    Labels(
+                        names=["o3_mu"],
+                        values=torch.arange(
+                            -o3_lambda, o3_lambda + 1, dtype=torch.long
+                        ).unsqueeze(1),
+                    )
+                ],
+                properties=Labels(
+                    names=["A"],
+                    values=torch.arange(n_props, dtype=torch.long).unsqueeze(1),
+                ),
+            )
+        )
+    layout = TensorMap(
+        keys=Labels(
+            names=["o3_lambda", "o3_sigma"],
+            values=torch.tensor([list(irrep) for irrep in _IRREPS], dtype=torch.long),
+        ),
+        blocks=blocks,
+    )
+    return TargetInfo(quantity="", unit="", layout=layout)
+
+
+
 def theta_size(n_aux: int) -> int:
     """Number of raw network outputs per bead for :func:`make_A_covariant`."""
     b = 1 + n_aux
