@@ -76,198 +76,36 @@ from metatrain.utils.scaler import FixedScalerWeights
 
 
 class ModelHypers(TypedDict):
-    """Hyperparameters for the GLE model."""
+    """Hyperparameters of the COVARIANT GLE architecture.
 
-    cutoff: float = 4.5
-    """Cutoff radius for neighbor search.
+    The backbone is a nested block naming any metatrain architecture plus that
+    architecture's own hyperparameters, validated against ITS schema
+    (:func:`metatrain.gle.wrapper.validate_backbone_hypers`). GLE no longer re-declares
+    PET's hyperparameters, so adding a backbone does not mean editing this file -- which
+    was the coupling the covariant rewrite removed.
 
-    This should be set to a value after which most of the interactions
-    between atoms is expected to be negligible. A lower cutoff will lead
-    to faster models.
+    ``mtt::A`` is emitted as a per-atom SPHERICAL target (``l = 0`` and ``l = 2``), so the
+    backbone must be able to predict equivariants. PET is invariant and can only reach the
+    ``l = 2`` channel through rotational augmentation; training it without is a useful
+    control rather than a misconfiguration.
     """
-    num_neighbors_adaptive: Optional[int] = None
-    """Target number of neighbors for the adaptive cutoff scheme.
 
-    This parameter activates the adaptive cutoff functionality.
-    Each atomic environments has a different cutoff, that is chosen
-    such that the number of neighbors is approximately equal to this
-    value. This can be useful to have a more uniform number of neighbors
-    per atom, especially in sparse systems. Setting it to None disables
-    this feature and uses all neighbors within the fixed cutoff radius.
-    """
-    adaptive_cutoff_method: Literal["grid", "solver"] = "solver"
-    """Algorithm used to compute the per-atom adaptive cutoffs.
+    backbone: dict = {"name": "soap_bpnn"}
+    """The backbone architecture and its own hypers, e.g.
+    ``{name: soap_bpnn, cutoff: 5.0, ...}``. Validated by that architecture's schema."""
 
-    ``"grid"`` evaluates the smoothed neighbor count on a discrete probe-cutoff
-    grid and returns a Gaussian-weighted average of the probes (legacy
-    behaviour). ``"solver"`` solves ``n_total(r) = num_neighbors_adaptive`` via
-    a Newton-bisection root finder (default; faster and more accurate). Only
-    has effect when ``num_neighbors_adaptive`` is set.
-    """
-    cutoff_function: Literal["Cosine", "Bump"] = "Bump"
-    """Type of the smoothing function at the cutoff"""
-    cutoff_width: float = 0.5
-    """Width of the smoothing function at the cutoff"""
-    cutoff_width_adaptive: float = 1.0
-    """Width of the smooth cutoff taper used by the adaptive cutoff scheme.
+    covariant: bool = True
+    """Use the rotationally covariant drift construction.
 
-    This controls the taper width of the smoothed neighbor count used to
-    compute the per-atom adaptive cutoffs. Only has effect when
-    ``num_neighbors_adaptive`` is set.
-    """
-    d_pet: int = 128
-    """Dimension of the edge features.
+    The Mori-Zwanzig kernel is a rank-2 Cartesian tensor, so rotational invariance of the
+    underlying Hamiltonian forces ``K(RQ) = R K(Q) R^T``. With this set the auxiliary
+    variables are 3-VECTORS and the state is ``3 (1 + num_auxiliary_variables)``; the
+    Cartesian blocks are symmetric, since Onsager reciprocity makes the friction tensor
+    symmetric and a pseudo-vector cannot be built from parity-even descriptors anyway.
 
-    This hyperparameters controls width of the neural network. In general,
-    increasing it might lead to better accuracy, especially on larger datasets, at the
-    cost of increased training and evaluation time.
-    """
-    d_head: int = 128
-    """Dimension of the attention heads."""
-    d_node: int = 256
-    """Dimension of the node features.
+    This is a different state space from the scalar construction, not a reparametrisation,
+    so checkpoints are not interchangeable between the two."""
 
-    Increasing this hyperparameter might lead to better accuracy,
-    with a relatively small increase in inference time.
-    """
-    d_feedforward: int = 256
-    """Dimension of the feedforward network in the attention layer."""
-    num_heads: int = 8
-    """Attention heads per attention layer."""
-    num_attention_layers: int = 2
-    """The number of attention layers in each layer of the graph
-    neural network. Depending on the dataset, increasing this hyperparameter might
-    lead to better accuracy, at the cost of increased training and evaluation time.
-    """
-    num_gnn_layers: int = 2
-    """The number of graph neural network layers.
-
-    In general, decreasing this hyperparameter to 1 will lead to much faster models,
-    at the expense of accuracy. Increasing it may or may not lead to better accuracy,
-    depending on the dataset, at the cost of increased training and evaluation time.
-    """
-    normalization: Literal["RMSNorm", "LayerNorm"] = "RMSNorm"
-    """Layer normalization type."""
-    activation: Literal["SiLU", "SwiGLU"] = "SwiGLU"
-    """Activation function."""
-    attention_temperature: float = 1.0
-    """The temperature scaling factor for attention scores."""
-    transformer_type: Literal["PreLN", "PostLN"] = "PreLN"
-    """The order in which the layer normalization and attention
-    are applied in a transformer block. Available options are ``PreLN``
-    (normalization before attention) and ``PostLN`` (normalization after attention)."""
-    featurizer_type: Literal["residual", "feedforward"] = "feedforward"
-    """Implementation of the featurizer of the model to use. Available
-    options are ``residual`` (the original featurizer from the PET paper, that uses
-    residual connections at each GNN layer for readout) and ``feedforward`` (a modern
-    version that uses the last representation after all GNN iterations for readout).
-    Additionally, the feedforward version uses bidirectional features flow during the
-    message passing iterations, that favors features flowing from atom ``i`` to atom
-    ``j`` to be not equal to the features flowing from atom ``j`` to atom ``i``."""
-    zbl: bool = False
-    """Use ZBL potential for short-range repulsion"""
-    soft_core: bool = False
-    """Use a WCA excluded-volume repulsive prior (qTIP4P/f O-O LJ core) as an
-    additive baseline for delta-learning (CG coarse-bead short-range stability)."""
-    soft_core_sigma_by_type: Dict[int, float] = {}
-    """Per-bead-type WCA ``sigma`` (Angstrom), keyed by atomic number.
-
-    Only meaningful when ``soft_core`` is enabled. Coarse-grained beads carry an
-    atomic number as a LABEL rather than as a real element, so this is a per-bead-type
-    excluded-volume radius. Types omitted here keep the global default (the
-    qTIP4P/f O-O value, or the ``MTT_SOFTCORE_SIGMA_A`` environment override).
-    Unlike pairs are mixed with the Lorentz-Berthelot rule
-    ``sigma_ij = (sigma_i + sigma_j) / 2``, and the WCA truncation is applied per
-    edge at ``2^(1/6) sigma_ij``. Example: ``{8: 3.16, 6: 3.90, 7: 3.80, 9: 3.30}``."""
-    soft_core_epsilon_by_type: Dict[int, float] = {}
-    """Per-bead-type WCA ``epsilon`` (eV), keyed by atomic number.
-
-    Only meaningful when ``soft_core`` is enabled. Types omitted here keep the global
-    default (the qTIP4P/f O-O value, or the ``MTT_SOFTCORE_EPSILON_EV`` environment
-    override). Unlike pairs are mixed with the Lorentz-Berthelot rule
-    ``epsilon_ij = sqrt(epsilon_i * epsilon_j)``."""
-    soft_core_molecule_blocks: List[List[int]] = []
-    """Intramolecular exclusions for the ``soft_core`` prior, as a list of
-    ``[n_molecules, beads_per_molecule]`` blocks applied in order from atom 0.
-
-    Beads of the same coarse-grained molecule are permanently bonded and sit well
-    inside the WCA wall, so the prior must not act between them. Bead ordering in a
-    CG frame is contiguous and fixed by the coarse-graining map, so molecule identity
-    is index arithmetic rather than topology: ``[[240, 1], [120, 3]]`` means 240
-    one-bead molecules followed by 120 three-bead molecules (600 beads in total).
-    Every edge whose two beads share a molecule gets both its energy and its force
-    zeroed. Training aborts if the total bead count does not match the systems.
-    Leave empty (the default) for a single-bead-per-molecule system such as CG
-    water.
-
-    **Do not use this for molecules with more than three beads.** It masks EVERY
-    same-molecule pair, which coincides with the 1-2/1-3 rule only because a
-    three-bead molecule has no pair further apart. For a larger molecule -- and
-    especially for a single solute in implicit solvent, where it masks the whole
-    system and the prior becomes identically zero while the config still reads
-    ``soft_core: true`` -- use ``soft_core_bonds`` instead."""
-    soft_core_bonds: List[List[int]] = []
-    """CG bond topology for the ``soft_core`` prior, as a list of ``[i, j]`` 0-based
-    bead index pairs covering the whole system.
-
-    When given, this **takes precedence over** ``soft_core_molecule_blocks`` and the
-    exclusion becomes topological: every bead pair separated by at most
-    ``soft_core_exclusion_depth`` bonds has its energy and force zeroed. This is the
-    rule CGnet/CGSchNet use -- 1-2 and 1-3 pairs are carried by bonded prior terms,
-    and the excluded-volume repulsion applies only to pairs more than two bonds
-    apart. Training aborts if the bead count implied here does not match the
-    systems."""
-    soft_core_exclusion_depth: int = 2
-    """Bond separation at or below which ``soft_core_bonds`` excludes a pair.
-
-    The default 2 excludes 1-2 (bonded) and 1-3 (angle) pairs, matching CGnet. Only
-    meaningful when ``soft_core_bonds`` is non-empty."""
-    harmonic_bonded: bool = False
-    """Use harmonic bond and angle terms as an additive baseline for
-    delta-learning (the bonded half of the CGnet/CGSchNet prior energy).
-
-    Complements ``soft_core``: the excluded-volume prior is switched OFF between
-    1-2 and 1-3 pairs (see ``soft_core_exclusion_depth``) precisely because those
-    coordinates are carried by these harmonic terms instead. CGSchNet reports the
-    bonded prior as essential for capped alanine."""
-    harmonic_bonded_bonds: List[List[int]] = []
-    """CG bond topology for the ``harmonic_bonded`` prior, as a list of ``[i, j]``
-    0-based bead index pairs.
-
-    Bonded terms are topological, not cutoff-based: no neighbor list is used and
-    the bead ordering (fixed by the coarse-graining map) is the identifier.
-    Training aborts if the bead count implied here does not match the systems."""
-    harmonic_bonded_bond_k: List[float] = []
-    """Harmonic bond force constants in **eV/Angstrom^2**, one per entry of
-    ``harmonic_bonded_bonds``.
-
-    Obtained elsewhere by Boltzmann inversion of the all-atom reference,
-    ``k = kB*T / Var[r]``; this prior only evaluates ``0.5 k (r - r0)^2``."""
-    harmonic_bonded_bond_r0: List[float] = []
-    """Harmonic bond equilibrium lengths in **Angstrom**, one per entry of
-    ``harmonic_bonded_bonds`` (``r0 = E[r]`` from the reference)."""
-    harmonic_bonded_angles: List[List[int]] = []
-    """CG angle topology for the ``harmonic_bonded`` prior, as a list of
-    ``[i, j, k]`` 0-based bead index triples, where ``j`` is the VERTEX."""
-    harmonic_bonded_angle_k: List[float] = []
-    """Harmonic angle force constants in **eV/radian^2**, one per entry of
-    ``harmonic_bonded_angles`` (``k = kB*T / Var[theta]``)."""
-    harmonic_bonded_angle_theta0: List[float] = []
-    """Harmonic angle equilibrium values in **radian**, one per entry of
-    ``harmonic_bonded_angles`` (``theta0 = E[theta]``). Degrees are rejected."""
-    long_range: LongRangeHypers = init_with_defaults(LongRangeHypers)
-    """Long-range Coulomb interactions parameters."""
-    system_conditioning: bool = False
-    """Enable charge and spin conditioning embeddings. When enabled, per-system
-    charge and spin multiplicity are embedded and added to node features at each
-    GNN layer, allowing different predictions for the same structure under
-    different electronic states."""
-    max_charge: int = 10
-    """Maximum absolute charge for the conditioning embedding table. Supports
-    charges in the range ``[-max_charge, +max_charge]``."""
-    max_spin_multiplicity: int = 10
-    """Maximum spin multiplicity (2S+1) for the conditioning embedding table.
-    Supports values in the range ``[1, max_spin_multiplicity]``."""
     num_auxiliary_variables: int = 13
     """Number of auxiliary momentum variables per bead.
 

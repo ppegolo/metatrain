@@ -52,7 +52,8 @@ from metatrain.utils.transfer import batch_to
 from . import checkpoints
 from .covariant import make_A_covariant
 from .documentation import TrainerHypers
-from .model import GLE, gle_target_info
+from .covariant import gle_target_info_covariant, tensormap_to_theta
+from .wrapper import GLEWrapper as GLE
 
 
 def get_scheduler(
@@ -339,7 +340,16 @@ class GLELoss:
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        theta_total = predictions["mtt::A"].block().values
+        # `mtt::A` is a SPHERICAL target with l = 0 and l = 2 blocks, so a single
+        # `.block()` no longer addresses it. `tensormap_to_theta` flattens them into the
+        # order the assembly expects, and `assert_theta_roundtrip` covers that ordering --
+        # both layouts have the same length, so a mismatch would be silent.
+        if getattr(self, "covariant", False):
+            theta_total = tensormap_to_theta(
+                predictions["mtt::A"], self.n_gle_variables // 3 - 1
+            )
+        else:
+            theta_total = predictions["mtt::A"].block().values
         A = self._make_A(theta_total)
         if self.target_kind == "memory_kernel":
             return self._kernel_loss(systems, A)
@@ -826,7 +836,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
             for symbol, mass in self.hypers["bead_mass_by_symbol"].items()
         }
         loss_fn = GLELoss(
-            num_auxiliary_variables=core_model.n_gle_variables - 3,
+            covariant=getattr(core_model, "covariant", False),
+            # NOT `n_gle_variables - 3`: that is the SCALAR convention. Covariant
+            # auxiliaries are 3-vectors, so the state is 3(1 + n_aux) and the inverse is
+            # n_gle_variables // 3 - 1. The model owns the number, so ask it.
+            num_auxiliary_variables=getattr(
+                core_model, "n_aux", core_model.n_gle_variables - 3
+            ),
             bead_mass_by_z=bead_mass_by_z,
             temperature=float(self.hypers["temperature"]),
             jitter=float(self.hypers["transition_jitter"]),
@@ -858,7 +874,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # ``mtt::A`` is not a dataset target: it is the model's own output that the
         # GLE loss turns into a transition density. It therefore has to be requested
         # explicitly alongside the dataset's targets.
-        gle_output = gle_target_info(core_model.n_gle_variables)
+        gle_output = gle_target_info_covariant(core_model.n_aux)
 
         def requested_outputs(target_names) -> Dict[str, Any]:
             requested = {name: train_targets[name] for name in target_names}

@@ -1,8 +1,11 @@
-from .model import GLE
 from .trainer import Trainer
+from .wrapper import GLEWrapper
 
 
-__model__ = GLE
+# On the `gle-covariant` branch the GLE architecture IS the backbone-agnostic covariant
+# wrapper. The PET-bound scalar model lives on the `gle` branch; the two are separate
+# lineages with different state spaces and incompatible checkpoints, deliberately.
+__model__ = GLEWrapper
 __trainer__ = Trainer
 __capabilities__ = {
     "supported_devices": __model__.__supported_devices__,
