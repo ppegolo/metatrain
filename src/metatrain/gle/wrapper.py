@@ -33,8 +33,10 @@ a useful control that isolates what covariance buys, not a misconfiguration.
 from typing import Any, Dict, List, Optional
 
 import torch
-from metatensor.torch import Labels, TensorMap
+from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import (
+    AtomisticModel,
+    ModelCapabilities,
     ModelMetadata,
     ModelOutput,
     NeighborListOptions,
@@ -48,6 +50,8 @@ from metatrain.utils.architectures import (
     import_architecture,
 )
 from metatrain.utils.data import DatasetInfo
+from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.pydantic import validate as pydantic_validate
 
 from .covariant import gle_target_info_covariant, irrep_property_counts
@@ -103,10 +107,23 @@ class GLEWrapper(ModelInterface):
         dataset_info: DatasetInfo,
         metadata: Optional[ModelMetadata] = None,
     ):
-        super().__init__(hypers, dataset_info, metadata or ModelMetadata())
-        self._hypers = dict(hypers)
+        # `metadata is not None`, NOT `metadata or ...`: ModelMetadata is a TorchScript
+        # class with no __bool__ or __len__, so a truthiness test raises
+        # "'__len__' is not implemented for ModelMetadata".
+        super().__init__(
+            hypers, dataset_info, metadata if metadata is not None else ModelMetadata()
+        )
         self._dataset_info = dataset_info
         self.n_aux = int(hypers["num_auxiliary_variables"])
+        # Plain attributes, NOT properties reading the hypers dict: TorchScript converts
+        # every attribute a scripted method touches, and the hypers dict is heterogeneous
+        # ("Found Dict[str, str] and bool"), so deriving these at call time makes the model
+        # unexportable. Fixed at construction instead.
+        self.covariant = bool(hypers.get("covariant", True))
+        self.n_gle_variables = (
+            3 * (1 + self.n_aux) if self.covariant else 3 + self.n_aux
+        )
+        self.finetune_config: Dict[str, Any] = {}
         backbone_hypers = validate_backbone_hypers(hypers["backbone"])
         self.backbone_name = backbone_hypers.pop("name")
 
@@ -178,45 +195,34 @@ class GLEWrapper(ModelInterface):
         selected_atoms: Optional[Labels] = None,
     ) -> Dict[str, TensorMap]:
         predictions = self.backbone(systems, outputs, selected_atoms)
-        if GLE_OUTPUT not in predictions:
+        # The literal rather than the module-level GLE_OUTPUT constant: TorchScript cannot
+        # close over a global str ("python value of type 'str' cannot be used as a value"),
+        # and this method has to script for the model to be exportable at all.
+        if "mtt::A" not in predictions:
             return predictions
 
-        tensor = predictions[GLE_OUTPUT]
-        keys = tensor.keys
-        blocks = []
-        species = torch.cat([system.types for system in systems]).to(torch.long)
+        tensor = predictions["mtt::A"]
+        species_list: List[torch.Tensor] = []
+        for system in systems:
+            species_list.append(system.types.to(torch.long))
+        species = torch.cat(species_list)
+
+        blocks: List[TensorBlock] = []
         for key, block in tensor.items():
             values = block.values
-            if int(key["o3_lambda"]) == 0:
+            if int(key[0]) == 0:
                 base = self.theta_baseline.to(values.dtype).index_select(0, species)
                 values = values + base.unsqueeze(1)
-            blocks.append(_rebuild(block, values))
-        predictions[GLE_OUTPUT] = TensorMap(keys=keys, blocks=blocks)
+            blocks.append(
+                TensorBlock(
+                    values=values,
+                    samples=block.samples,
+                    components=block.components,
+                    properties=block.properties,
+                )
+            )
+        predictions["mtt::A"] = TensorMap(keys=tensor.keys, blocks=blocks)
         return predictions
-
-    @property
-    def finetune_config(self) -> Dict[str, Any]:
-        """Fine-tuning configuration, empty unless the backbone declares one.
-
-        The trainer records this at checkpoint time; backbones that have no notion of it
-        (anything other than PET) would otherwise abort the run at the first save.
-        """
-        return getattr(self.backbone, "finetune_config", {}) or {}
-
-    @property
-    def covariant(self) -> bool:
-        """This branch's GLE is covariant by construction."""
-        return bool(self._hypers.get("covariant", True))
-
-    @property
-    def n_gle_variables(self) -> int:
-        """Dimension of the extended state, which the trainer sizes its loss from.
-
-        Covariant: the auxiliaries are 3-VECTORS, so the state is ``3 (1 + n_aux)`` rather
-        than ``3 + n_aux``. Defined on the wrapper rather than delegated -- the backbone has
-        no notion of a GLE state.
-        """
-        return 3 * (1 + self.n_aux) if self.covariant else 3 + self.n_aux
 
     def requested_inputs(self) -> Dict[str, ModelOutput]:
         """Extra per-system data the GLE loss needs, beyond positions and types.
@@ -259,31 +265,77 @@ class GLEWrapper(ModelInterface):
         return self
 
     def get_checkpoint(self) -> Dict[str, Any]:
+        """Checkpoint in the same shape as the other architectures.
+
+        The whole wrapper (backbone weights and the GLE baseline alike) is one state dict,
+        so nothing has to know how the backbone serialises itself -- a bespoke nested
+        format here would diverge from upstream the moment it changed.
+        """
+        state = self.state_dict()
         return {
             "architecture_name": "gle",
             "model_ckpt_version": self.__checkpoint_version__,
-            "gle_hypers": self._hypers,
-            "gle_state": {"theta_baseline": self.theta_baseline},
-            "backbone_name": self.backbone_name,
-            "backbone_checkpoint": self.backbone.get_checkpoint(),
+            "metadata": self.metadata,
+            "model_data": {
+                "model_hypers": self.hypers,
+                "dataset_info": self.dataset_info,
+            },
+            "epoch": None,
+            "best_epoch": None,
+            "model_state_dict": state,
+            "best_model_state_dict": state,
         }
 
     @classmethod
     def load_checkpoint(
         cls, checkpoint: Dict[str, Any], context: str
     ) -> "GLEWrapper":
-        raise NotImplementedError(
-            "checkpoint loading for the covariant GLE wrapper is not implemented yet; "
-            "this branch treats checkpoints as disposable while the construction is "
-            "being validated"
-        )
+        """Rebuild from a checkpoint written by :meth:`get_checkpoint`.
 
-    def export(self, metadata=None):
-        raise NotImplementedError(
-            "export for the covariant GLE wrapper is not implemented yet: the deployment "
-            "(run_gle.py) still assumes the scalar 3 + n_aux state and has to be moved to "
-            "3 (1 + n_aux) first"
+        The hypers are replayed through ``__init__``, which reconstructs the backbone from
+        its nested block, and the state dict is then loaded whole.
+        """
+        data = checkpoint["model_data"]
+        model = cls(
+            hypers=data["model_hypers"],
+            dataset_info=data["dataset_info"],
+            metadata=checkpoint.get("metadata"),
         )
+        key = (
+            "best_model_state_dict"
+            if context == "export" and checkpoint.get("best_model_state_dict") is not None
+            else "model_state_dict"
+        )
+        state = dict(checkpoint[key])
+        state.pop("finetune_config", None)
+        model.load_state_dict(state)
+        return model
+
+    def export(self, metadata: Optional[ModelMetadata] = None) -> AtomisticModel:
+        """Wrap into a deployable :class:`AtomisticModel`.
+
+        Capabilities are taken from the BACKBONE where they are its property (interaction
+        range, atomic types), since the wrapper adds an output and a buffer but changes
+        neither the locality nor the species.
+        """
+        dtype = next(self.parameters()).dtype
+        if dtype not in self.__supported_dtypes__:
+            raise ValueError(f"unsupported dtype {dtype} for the covariant GLE")
+        self.to(dtype)
+
+        backbone_export = self.backbone.export()
+        capabilities = ModelCapabilities(
+            outputs=self.supported_outputs(),
+            atomic_types=sorted(self.dataset_info.atomic_types),
+            interaction_range=backbone_export.capabilities().interaction_range,
+            length_unit=self.dataset_info.length_unit,
+            supported_devices=self.__supported_devices__,
+            dtype=dtype_to_str(dtype),
+        )
+        merged = self.__default_metadata__
+        if metadata is not None:
+            merged = merge_metadata(metadata, self.__default_metadata__)
+        return AtomisticModel(self.eval(), merged, capabilities)
 
     @classmethod
     def upgrade_checkpoint(cls, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
