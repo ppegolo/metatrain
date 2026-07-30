@@ -50,6 +50,7 @@ from metatrain.utils.system_data import get_system_data_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
+from .covariant import make_A_covariant
 from .documentation import TrainerHypers
 from .model import GLE, gle_target_info
 
@@ -182,8 +183,24 @@ class GLELoss:
         theta_reg_weight: float = 0.0,
         gamma0_reg_weight: float = 0.0,
         gamma0_pin_freqs_thz: Optional[List[float]] = None,
+        covariant: bool = False,
     ) -> None:
-        self.n_gle_variables = 3 + num_auxiliary_variables
+        # COVARIANT mode: the auxiliaries are 3-VECTORS rather than scalars, so the state
+        # is 3 (1 + n_aux) and the drift is assembled from equivariant l = 0 + l = 2
+        # Cartesian blocks (`metatrain.gle.covariant`). Scalar auxiliaries admit no
+        # covariant GLE with memory at all -- covariance would force the p <-> s coupling
+        # to zero -- so this is a different state space, not a reparametrisation, and the
+        # two are deliberately not checkpoint-compatible.
+        #
+        # Everything downstream is unchanged by construction: the state is ordered
+        # block-major with the momentum FIRST, so the `[:3, :3]` momentum block of the
+        # propagator and the `[3:, 3:]` auxiliary block still slice correctly.
+        self.covariant = covariant
+        self.n_gle_variables = (
+            3 * (1 + num_auxiliary_variables)
+            if covariant
+            else 3 + num_auxiliary_variables
+        )
         self.bead_mass_by_z = bead_mass_by_z
         self.temperature = temperature
         self.jitter = jitter
@@ -213,6 +230,20 @@ class GLELoss:
         # leaving the finite-frequency response free.
         self.gamma0_reg_weight = gamma0_reg_weight
         self.gamma0_target: Optional[torch.Tensor] = None
+
+    def _make_A(self, theta: torch.Tensor) -> torch.Tensor:
+        """Assemble the drift, by whichever construction this loss was configured with.
+
+        Covariant mode uses equivariant l = 0 + l = 2 Cartesian blocks and a positive
+        semi-definite ``M M^T`` symmetric part; the scalar mode keeps the Cholesky-style
+        ``1/2 L L^T + K``. They are NOT interchangeable -- the state spaces differ
+        (3 (1 + n_aux) against 3 + n_aux) -- so the choice is made once, here, rather than
+        being inferred from a tensor shape somewhere downstream.
+        """
+        if self.covariant:
+            n_aux = self.n_gle_variables // 3 - 1
+            return make_A_covariant(theta, n_aux)
+        return make_A(theta, self.n_gle_variables)
         # Frequency grid for the pin (THz). [0.0] = the plain gamma0 point-pin.
         # A point-pin at omega=0 is evadable: a model can keep gamma0 fixed and dig a
         # hole in Re Sigma(omega) in the cage-hopping band 0.05-1 THz. Pinning a grid
@@ -231,7 +262,7 @@ class GLELoss:
                     "target is the baseline's own friction response)"
                 )
             with torch.no_grad():
-                A_base = make_A(theta_baseline.to(torch.float64), self.n_gle_variables)
+                A_base = self._make_A(theta_baseline.to(torch.float64))
                 self.gamma0_target = self._band_of(A_base)  # [Z, F]
         if kernel_reg_weight > 0.0 and kernel_target is None:
             raise ValueError(
@@ -309,7 +340,7 @@ class GLELoss:
         targets: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         theta_total = predictions["mtt::A"].block().values
-        A = make_A(theta_total, self.n_gle_variables)
+        A = self._make_A(theta_total)
         if self.target_kind == "memory_kernel":
             return self._kernel_loss(systems, A)
         if self.pairwise:
