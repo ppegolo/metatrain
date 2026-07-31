@@ -105,6 +105,66 @@ def read_systems(filename: str) -> List[System]:
             )
             system.add_data("mtt::time_lag", time_lag)
 
+    # Add the intra-window PMF force path (for the GLE's conservative-impulse target) if
+    # available. The transition mean needs the force CONVOLVED with the propagator, so the
+    # whole path over the window is required, not just its integral -- and the term depends
+    # on the drift, so it cannot be folded into the stored target.
+    #
+    # Stored per bead as a flat `[3 * n_steps]` row, grid-major and Cartesian-minor, so each
+    # grid point's force vector is contiguous. It is attached with an ``xyz`` COMPONENT
+    # rather than as opaque properties for a specific reason: `transform_system` rotates
+    # every piece of system data according to its components, so declaring the component
+    # makes rotational augmentation rotate the force path together with the positions and
+    # the momenta. Flattened into properties it would be left in the lab frame, and the
+    # augmented samples would silently pair a rotated geometry with an unrotated force.
+    if "window_forces" in ase_atoms[0].arrays:
+        for system, atoms in zip(systems, ase_atoms, strict=False):
+            flat = torch.tensor(atoms.arrays["window_forces"], dtype=torch.float64)
+            if flat.shape[-1] % 3 != 0:
+                raise ValueError(
+                    f"window_forces has width {flat.shape[-1]}, which is not 3 * n_steps"
+                )
+            n_steps = flat.shape[-1] // 3
+            values = flat.reshape(len(atoms), n_steps, 3).transpose(1, 2)
+            window_forces = TensorMap(
+                keys=Labels(["_"], torch.tensor([[0]])),
+                blocks=[
+                    TensorBlock(
+                        values=values,
+                        samples=Labels(
+                            ["system", "atom"],
+                            torch.tensor([[0, a] for a in range(len(atoms))]),
+                        ),
+                        components=[Labels(["xyz"], torch.arange(3).reshape(-1, 1))],
+                        properties=Labels(
+                            "window_force", torch.arange(n_steps).reshape(-1, 1)
+                        ),
+                    )
+                ],
+            )
+            system.add_data("mtt::window_forces", window_forces)
+
+            if "force_dt" not in atoms.info:
+                raise ValueError(
+                    "window_forces is present but force_dt is not: the grid spacing is "
+                    "what turns the stored path into an impulse, and guessing it from the "
+                    "lag would silently absorb an off-by-one in the number of steps"
+                )
+            force_dt = TensorMap(
+                keys=Labels(["_"], torch.tensor([[0]])),
+                blocks=[
+                    TensorBlock(
+                        values=torch.tensor(
+                            atoms.info["force_dt"], dtype=torch.float64
+                        ).reshape(1, 1),
+                        samples=Labels(["system"], torch.tensor([[0]])),
+                        components=[],
+                        properties=Labels("force_dt", torch.tensor([[0]])),
+                    )
+                ],
+            )
+            system.add_data("mtt::force_dt", force_dt)
+
     return systems
 
 

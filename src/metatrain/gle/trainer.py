@@ -50,7 +50,7 @@ from metatrain.utils.system_data import get_system_data_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
-from .covariant import make_A_covariant
+from .covariant import make_A_covariant, propagated_impulse
 from .documentation import TrainerHypers
 from .covariant import gle_target_info_covariant, tensormap_to_theta
 from .wrapper import GLEWrapper as GLE
@@ -185,6 +185,7 @@ class GLELoss:
         gamma0_reg_weight: float = 0.0,
         gamma0_pin_freqs_thz: Optional[List[float]] = None,
         covariant: bool = False,
+        conservative_impulse: bool = False,
     ) -> None:
         # COVARIANT mode: the auxiliaries are 3-VECTORS rather than scalars, so the state
         # is 3 (1 + n_aux) and the drift is assembled from equivariant l = 0 + l = 2
@@ -197,6 +198,13 @@ class GLELoss:
         # block-major with the momentum FIRST, so the `[:3, :3]` momentum block of the
         # propagator and the `[3:, 3:]` auxiliary block still slice correctly.
         self.covariant = covariant
+        # Route (a+): include the conservative impulse in the predicted mean. Without it
+        # the likelihood asks the drift to reproduce a momentum change that the mean force
+        # ALREADY produced, so the fitted friction absorbs it and the deployed dynamics --
+        # which applies that force again, on top of the drift -- comes out over-damped.
+        # OFF by default only so the two targets can be compared on the same data; the
+        # campaign's answer is that it should be ON.
+        self.conservative_impulse = conservative_impulse
         self.n_gle_variables = (
             3 * (1 + num_auxiliary_variables)
             if covariant
@@ -210,6 +218,17 @@ class GLELoss:
         if pairwise and neighbor_list_options is None:
             raise ValueError(
                 "pairwise GLE loss requires the model neighbor-list options"
+            )
+        if pairwise and conservative_impulse:
+            # The pairwise likelihood is written on the RELATIVE velocity of a bead pair,
+            # so its impulse is the relative conservative impulse, which is not what the
+            # dataset stores. Refusing is the point: silently dropping the term here would
+            # leave the pairwise model with exactly the double-counted target that route
+            # (a+) exists to remove, and it would look like it had been fixed.
+            raise NotImplementedError(
+                "conservative_impulse is not implemented for the pairwise loss: the "
+                "relative-velocity likelihood needs the relative impulse, not the "
+                "per-bead one the dataset carries"
             )
         # PMF-aware "memory_kernel" target: match A's analytic memory kernel
         # -tr(A_ps e^{-A_ss t} A_sp)/3 to a precomputed per-bead-type residual-force
@@ -231,20 +250,6 @@ class GLELoss:
         # leaving the finite-frequency response free.
         self.gamma0_reg_weight = gamma0_reg_weight
         self.gamma0_target: Optional[torch.Tensor] = None
-
-    def _make_A(self, theta: torch.Tensor) -> torch.Tensor:
-        """Assemble the drift, by whichever construction this loss was configured with.
-
-        Covariant mode uses equivariant l = 0 + l = 2 Cartesian blocks and a positive
-        semi-definite ``M M^T`` symmetric part; the scalar mode keeps the Cholesky-style
-        ``1/2 L L^T + K``. They are NOT interchangeable -- the state spaces differ
-        (3 (1 + n_aux) against 3 + n_aux) -- so the choice is made once, here, rather than
-        being inferred from a tensor shape somewhere downstream.
-        """
-        if self.covariant:
-            n_aux = self.n_gle_variables // 3 - 1
-            return make_A_covariant(theta, n_aux)
-        return make_A(theta, self.n_gle_variables)
         # Frequency grid for the pin (THz). [0.0] = the plain gamma0 point-pin.
         # A point-pin at omega=0 is evadable: a model can keep gamma0 fixed and dig a
         # hole in Re Sigma(omega) in the cage-hopping band 0.05-1 THz. Pinning a grid
@@ -278,6 +283,20 @@ class GLELoss:
                 for z, v in kernel_target["by_z"].items()
             }
         self.last_chi2_red = float("nan")  # calibration diagnostic, set each call
+
+    def _make_A(self, theta: torch.Tensor) -> torch.Tensor:
+        """Assemble the drift, by whichever construction this loss was configured with.
+
+        Covariant mode uses equivariant l = 0 + l = 2 Cartesian blocks and a positive
+        semi-definite ``M M^T`` symmetric part; the scalar mode keeps the Cholesky-style
+        ``1/2 L L^T + K``. They are NOT interchangeable -- the state spaces differ
+        (3 (1 + n_aux) against 3 + n_aux) -- so the choice is made once, here, rather than
+        being inferred from a tensor shape somewhere downstream.
+        """
+        if self.covariant:
+            n_aux = self.n_gle_variables // 3 - 1
+            return make_A_covariant(theta, n_aux)
+        return make_A(theta, self.n_gle_variables)
 
     def _gamma0_of(self, A: torch.Tensor) -> torch.Tensor:
         """Zero-frequency friction of drift matrices A [..., n, n]: the Schur
@@ -334,6 +353,80 @@ class GLELoss:
             )
         return masses
 
+    def _impulse(self, systems: List[Any], A: torch.Tensor) -> torch.Tensor:
+        """The propagated conservative impulse ``[int_0^tau e^{-A(tau-u)} F(u) du]_p``.
+
+        ``F`` is the PMF force sampled along each transition window and carried by the
+        dataset as ``mtt::window_forces`` (per bead, ``[3, n_steps]``) on a uniform grid of
+        spacing ``mtt::force_dt`` femtoseconds. It is the force the DEPLOYED dynamics will
+        apply, so training against a mean that already contains it is what stops the drift
+        from double-counting the decorrelation the force produces.
+
+        **Masses cancel.** ``A`` acts on the mass-scaled state ``y = p / sqrt(m)`` (that is
+        what makes the transition covariance ``m kT (I - T T^T)``), in which the driving
+        term is ``F / sqrt(m)``. Pushing the result back to momentum units multiplies by
+        ``sqrt(m)`` again, and since the mass is a per-bead SCALAR the two cancel exactly:
+        the physical force goes in and a momentum-unit impulse comes out. Applying a mass
+        factor here would therefore be wrong, and wrong by a smooth O(1) amount that no
+        shape or finiteness check would catch.
+
+        **Short windows are LEFT-padded, and that is exact, not an approximation.** Systems
+        in one batch carry different lags and so different numbers of grid steps. The
+        recursion weights each sub-interval by the time REMAINING to the end of the window,
+        so zeros prepended to a short window contribute nothing and leave every real step
+        with its correct weight. Padding on the RIGHT instead would keep propagating after
+        the window ended -- i.e. silently evaluate the impulse for a longer lag than the one
+        the target was measured at -- which is the natural way to write it and is wrong.
+        """
+        forces: List[torch.Tensor] = []
+        dts: List[float] = []
+        for system in systems:
+            known = system.known_data()
+            if "mtt::window_forces" not in known or "mtt::force_dt" not in known:
+                raise ValueError(
+                    "conservative_impulse is on but the dataset carries no "
+                    "`window_forces` / `force_dt`; rebuild the transition set with "
+                    "`gleprep prepare` so the PMF force is sampled along each window. "
+                    "Training without them silently reverts to the target whose drift "
+                    "double-counts the mean force."
+                )
+            values = system.get_data("mtt::window_forces").block().values
+            dt_fs = float(system.get_data("mtt::force_dt").block().values.item())
+            lag_fs = float(system.get_data("mtt::time_lag").block().values.item())
+            n_steps = values.shape[-1]
+            # The window the forces span must BE the lag the target was measured over. A
+            # mismatch here is a wrong-lag impulse: smooth, plausible, and undetectable
+            # downstream.
+            if abs(n_steps * dt_fs - lag_fs) > 1e-6 * max(lag_fs, 1.0):
+                raise ValueError(
+                    f"window forces span {n_steps} x {dt_fs} fs = {n_steps * dt_fs} fs "
+                    f"but the transition lag is {lag_fs} fs"
+                )
+            forces.append(values)
+            dts.append(dt_fs)
+
+        # One grid spacing for the whole batch, because the padding above shares a single
+        # propagator across systems. The builder writes one spacing per dataset; this
+        # catches a batch assembled from two of them.
+        if max(dts) - min(dts) > 1e-9 * max(dts):
+            raise ValueError(
+                f"window forces use more than one grid spacing in a batch: {sorted(set(dts))}"
+            )
+
+        n_steps = max(f.shape[-1] for f in forces)
+        padded = torch.concatenate(
+            [torch.nn.functional.pad(f, (n_steps - f.shape[-1], 0)) for f in forces]
+        )  # [n_beads, 3, n_steps], left-padded
+
+        # embed in the extended state: the conservative force acts on the momentum block
+        # only, so the auxiliary components of the driving term are zero.
+        extended = torch.zeros(
+            padded.shape[0], n_steps, A.shape[-1], dtype=A.dtype, device=A.device
+        )
+        extended[:, :, :3] = padded.transpose(1, 2).to(dtype=A.dtype, device=A.device)
+
+        return propagated_impulse(A, extended, dts[0] * ase.units.fs)[:, :3]
+
     def __call__(
         self,
         systems: List[Any],
@@ -382,6 +475,8 @@ class GLELoss:
             :, :3, :3
         ]
         mean = (propagator @ momenta.unsqueeze(-1)).squeeze(-1)
+        if self.conservative_impulse:
+            mean = mean + self._impulse(systems, A)
         masses = self._bead_masses(systems, A.device, A.dtype)
         covariance = (
             masses[:, None, None]
@@ -858,6 +953,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             gamma0_pin_freqs_thz=[
                 float(f) for f in self.hypers["gamma0_pin_freqs_thz"]
             ],
+            conservative_impulse=bool(self.hypers["conservative_impulse"]),
         )
         if target_kind == "memory_kernel":
             loss_description = "memory-kernel (PMF-aware)"

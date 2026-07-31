@@ -242,6 +242,23 @@ class TrainerHypers(TypedDict):
     water D 6x with exact gamma0). A grid spanning the transport band, e.g.
     ``[0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]``, closes that escape while leaving the
     vibrational band (>2 THz) free for the NLL to shape."""
+    conservative_impulse: bool = False
+    """Include the propagated conservative impulse in the transition mean (route a+).
+
+    The transition likelihood predicts ``E[P(tau)|P(0)] = T_pp P(0)``, which omits the
+    momentum the PMF force imparts over the window. The fitted drift then has to account
+    for decorrelation the mean force ALREADY produced, and the deployed dynamics — which
+    applies that force again on top of the drift — is over-damped. With this on, the mean
+    becomes ``T_pp P(0) + [int_0^tau e^{-A(tau-u)} F(u) du]_p``, using the PMF force
+    sampled along each window and carried by the dataset as ``window_forces`` /
+    ``force_dt``. The training set must have been built with them: the loss raises rather
+    than falling back, because falling back is indistinguishable from working.
+
+    Note the impulse enters CONVOLVED with the propagator, not bare. Subtracting the bare
+    ``int F du`` is only the ``tau -> 0`` limit and was measured on campaign data (at
+    ``gamma tau / m ~ 1.7``) to under-correct by ~30%, in the direction that overshoots an
+    over-damped model into UNDER-damping. Because the term depends on ``A`` it belongs in
+    the likelihood and cannot be moved into a preprocessing pass over the data."""
 
     log_interval: int = 1
     """Interval to log metrics."""
