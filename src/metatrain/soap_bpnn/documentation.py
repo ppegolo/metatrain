@@ -44,6 +44,7 @@ from typing import Literal, Optional
 from typing_extensions import NotRequired, TypedDict
 
 from metatrain.composition.documentation import FixedCompositionWeights
+from metatrain.utils.additive import AdditivePriorHypers
 from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.long_range import LongRangeHypers
 from metatrain.utils.loss import LossSpecification
@@ -96,7 +97,7 @@ class BPNNConfig(TypedDict):
     """
 
 
-class ModelHypers(TypedDict):
+class ModelHypers(AdditivePriorHypers):
     """Hyperparameters for the SOAP + BPNN architecture."""
 
     soap: SOAPConfig = init_with_defaults(SOAPConfig)
@@ -121,10 +122,6 @@ class ModelHypers(TypedDict):
     of one hidden layer with as many neurons as the
     SOAP-BPNN (see ``BPNNConfig.num_neurons_per_layer``)."""
 
-    zbl: bool = False
-    """Whether to use the ZBL short-range repulsion as the baseline for the model.
-    May be needed to achieve better description at the close-contact, repulsive regime.
-    """
 
     long_range: LongRangeHypers = init_with_defaults(LongRangeHypers)
     """Parameters related to long-range interactions.

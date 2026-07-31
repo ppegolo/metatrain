@@ -27,7 +27,7 @@ from metatrain.experimental.space.modules.finetuning import apply_finetuning_str
 from metatrain.experimental.space.utils import systems_to_batch
 from metatrain.pet.modules.finetuning import compute_stale_targets
 from metatrain.utils.abc import ModelInterface
-from metatrain.utils.additive import ZBL
+from metatrain.utils.additive import build_additive_priors
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
 from metatrain.utils.data.atomic_basis_helpers import (
     densify_atomic_basis_dataset_info,
@@ -137,22 +137,11 @@ class SPACE(ModelInterface[ModelHypers]):
             dataset_info, self.atomic_types
         )
         additive_models = [composition_model]
-        if self.hypers["zbl"]:
-            zbl_targets = {
-                target_name: target_info
-                for target_name, target_info in train_dataset_info.targets.items()
-                if ZBL.is_valid_target(target_name, target_info)
-            }
-            additive_models.append(
-                ZBL(
-                    {},
-                    dataset_info=DatasetInfo(
-                        length_unit=train_dataset_info.length_unit,
-                        atomic_types=self.atomic_types,
-                        targets=zbl_targets,
-                    ),
-                )
-            )
+        # The physical priors, in the canonical order (see utils/additive/build.py: the
+        # order IS the state-dict key, so it is not free).
+        additive_models += build_additive_priors(
+            self.hypers, train_dataset_info, self.atomic_types
+        )
         self.additive_models = torch.nn.ModuleList(additive_models)
 
         # scaler: this is also handled by the trainer at training time

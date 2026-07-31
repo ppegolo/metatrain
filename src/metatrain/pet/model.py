@@ -18,7 +18,7 @@ from metatomic.torch import (
 
 from metatrain.composition import CompositionModel
 from metatrain.utils.abc import ModelInterface
-from metatrain.utils.additive import ZBL, HarmonicBonded, SoftCore
+from metatrain.utils.additive import build_additive_priors
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import (
     check_no_atom_pair_targets,
@@ -172,89 +172,11 @@ class PET(ModelInterface[ModelHypers]):
             dataset_info, self.atomic_types
         )
         additive_models = [composition_model]
-
-        # Adds the ZBL repulsion model if requested
-        if self.hypers["zbl"]:
-            zbl_targets = {
-                target_name: target_info
-                for target_name, target_info in train_dataset_info.targets.items()
-                if ZBL.is_valid_target(target_name, target_info)
-            }
-            additive_models.append(
-                ZBL(
-                    {},
-                    dataset_info=DatasetInfo(
-                        length_unit=train_dataset_info.length_unit,
-                        atomic_types=self.atomic_types,
-                        targets=zbl_targets,
-                    ),
-                )
-            )
-
-        # Adds the SoftCore (WCA excluded-volume) repulsive prior if requested.
-        # Delta-learning: the PET network learns only the correction on top of a
-        # fixed physical repulsion (Clementi-style prior), which prevents the
-        # spurious compressed-basin instability of a raw force-matched CG PMF.
-        # `.get`, not `[...]`: a checkpoint whose hypers predate the `soft_core` hyper
-        # has no such key, and bracket access breaks the restart with
-        # `KeyError: 'soft_core'`. Same reason the per-type keys below use `.get`.
-        if self.hypers.get("soft_core", False):
-            soft_core_targets = {
-                target_name: target_info
-                for target_name, target_info in train_dataset_info.targets.items()
-                if SoftCore.is_valid_target(target_name, target_info)
-            }
-            additive_models.append(
-                SoftCore(
-                    {
-                        "sigma_by_type": self.hypers.get("soft_core_sigma_by_type", {}),
-                        "epsilon_by_type": self.hypers.get(
-                            "soft_core_epsilon_by_type", {}
-                        ),
-                        "molecule_blocks": self.hypers.get(
-                            "soft_core_molecule_blocks", []
-                        ),
-                        "bonds": self.hypers.get("soft_core_bonds", []) or None,
-                        "exclusion_depth": self.hypers.get(
-                            "soft_core_exclusion_depth", 2
-                        ),
-                    },
-                    dataset_info=DatasetInfo(
-                        length_unit=train_dataset_info.length_unit,
-                        atomic_types=self.atomic_types,
-                        targets=soft_core_targets,
-                    ),
-                )
-            )
-
-        # Adds the harmonic bond/angle prior if requested. Appended AFTER
-        # SoftCore so that the `additive_models.<i>` state-dict keys of every
-        # existing checkpoint keep pointing at the same module.
-        if self.hypers.get("harmonic_bonded", False):
-            harmonic_bonded_targets = {
-                target_name: target_info
-                for target_name, target_info in train_dataset_info.targets.items()
-                if HarmonicBonded.is_valid_target(target_name, target_info)
-            }
-            additive_models.append(
-                HarmonicBonded(
-                    {
-                        "bonds": self.hypers.get("harmonic_bonded_bonds", []),
-                        "bond_k": self.hypers.get("harmonic_bonded_bond_k", []),
-                        "bond_r0": self.hypers.get("harmonic_bonded_bond_r0", []),
-                        "angles": self.hypers.get("harmonic_bonded_angles", []),
-                        "angle_k": self.hypers.get("harmonic_bonded_angle_k", []),
-                        "angle_theta0": self.hypers.get(
-                            "harmonic_bonded_angle_theta0", []
-                        ),
-                    },
-                    dataset_info=DatasetInfo(
-                        length_unit=train_dataset_info.length_unit,
-                        atomic_types=self.atomic_types,
-                        targets=harmonic_bonded_targets,
-                    ),
-                )
-            )
+        # The physical priors, in the canonical order (see utils/additive/build.py: the
+        # order IS the state-dict key, so it is not free).
+        additive_models += build_additive_priors(
+            self.hypers, train_dataset_info, self.atomic_types
+        )
         self.additive_models = torch.nn.ModuleList(additive_models)
 
         # scaler: this is also handled by the trainer at training time

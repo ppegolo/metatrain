@@ -74,6 +74,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from metatrain.composition.documentation import FixedCompositionWeights
 from metatrain.pet.modules.finetuning import FinetuneHypers, NoFinetuneHypers
+from metatrain.utils.additive import AdditivePriorHypers
 from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.loss import LossSpecification
 from metatrain.utils.scaler import FixedScalerWeights
@@ -137,7 +138,7 @@ class RadialBasisHypers(TypedDict):
 ###########################
 
 
-class ModelHypers(TypedDict):
+class ModelHypers(AdditivePriorHypers):
     """Hyperparameters for the experimental.space model."""
 
     num_tensor_products: int = 6
@@ -219,8 +220,6 @@ class ModelHypers(TypedDict):
     heads: dict[str, Literal["linear", "mlp"]] = {}
     """Heads to use in the model, with options being "linear" or "mlp"."""
 
-    zbl: bool = False
-    """Whether to use the ZBL potential in the model."""
 
 
 ##############################
