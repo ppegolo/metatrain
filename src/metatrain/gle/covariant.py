@@ -528,3 +528,110 @@ def assert_theta_roundtrip(n_aux: int, seed: int = 0, tol: float = 1e-12) -> Non
         raise AssertionError(
             f"round trip changed the drift at n_aux={n_aux}: max |dA| = {drift_error:.3e}"
         )
+
+
+# --- the conservative impulse, propagated ------------------------------------------------
+#
+# The exact conditional mean of the extended OU process driven by a known force is
+#
+#     E[Y(tau) | Y(0)] = e^{-A tau} Y(0) + int_0^tau e^{-A(tau-u)} F(u) du ,
+#
+# so the impulse enters CONVOLVED with the propagator, not bare. The transition likelihood
+# has historically omitted the whole term, which makes the fitted drift absorb decorrelation
+# the conservative force already produced -- the deployed dynamics then applies the force
+# again and is over-damped.
+#
+# Subtracting the BARE impulse `int F du` is only the tau -> 0 limit of the correct term.
+# MEASURED on campaign data at gamma tau / m ~ 1.7, the bare form under-corrects by ~30%
+# (ratio 0.65-0.75, stable across basins and lags) and in the direction that would overshoot
+# an over-damped model into UNDER-damping, because the un-propagated leftover correlates
+# positively with P(0). On a synthetic process at gamma tau / m ~ 0.05 the two agree to 1%,
+# which is the same statement seen from the other side.
+#
+# This term is A-DEPENDENT, so it belongs in the likelihood and cannot be moved into a
+# preprocessing pass over the data.
+
+
+def propagator_and_integral(
+    A: torch.Tensor, dt: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(E, G)`` with ``E = exp(-A dt)`` and ``G = A^-1 (I - E)``.
+
+    Both come from ONE matrix exponential by Van Loan's block trick: for
+
+        M = [[-A, I], [0, 0]] * dt      ->      exp(M) = [[E, G], [0, I]]
+
+    the upper-right block is exactly the integral ``int_0^dt exp(-A w) dw``. Forming ``G``
+    as ``A^-1 (I - E)`` directly would need an explicit inverse, which is both more
+    expensive and ill-conditioned when ``A`` has small eigenvalues -- precisely the regime
+    of a weakly damped auxiliary.
+    """
+    d = A.shape[-1]
+    batch = A.shape[:-2]
+    block = torch.zeros(*batch, 2 * d, 2 * d, dtype=A.dtype, device=A.device)
+    block[..., :d, :d] = -A * dt
+    block[..., :d, d:] = torch.eye(d, dtype=A.dtype, device=A.device) * dt
+    expanded = torch.matrix_exp(block)
+    return expanded[..., :d, :d], expanded[..., :d, d:]
+
+
+def propagated_impulse(
+    A: torch.Tensor, forces: torch.Tensor, dt: float
+) -> torch.Tensor:
+    """``int_0^tau exp(-A(tau-u)) F(u) du`` for piecewise-constant ``F`` on a grid.
+
+    :param A: ``[..., d, d]`` drift.
+    :param forces: ``[..., n_steps, d]`` the driving term on each sub-interval, already
+        embedded in the extended state (the conservative force acts on the momentum block
+        only, so the auxiliary components are zero).
+    :param dt: sub-interval width; ``tau = n_steps * dt``.
+
+    Evaluated by the recursion ``J <- E J + G F_k``, which is ``n_steps`` matrix-VECTOR
+    products after a single matrix exponential. That is the whole cost argument for this
+    route over an integrator-consistent likelihood, which would need a matrix exponential
+    per step rather than a matvec.
+    """
+    E, G = propagator_and_integral(A, dt)
+    n_steps = forces.shape[-2]
+    J = torch.zeros(forces.shape[:-2] + (A.shape[-1],), dtype=A.dtype, device=A.device)
+    for k in range(n_steps):
+        J = (E @ J.unsqueeze(-1)).squeeze(-1) + (
+            G @ forces[..., k, :].unsqueeze(-1)
+        ).squeeze(-1)
+    return J
+
+
+def assert_impulse_correct(n_aux: int = 1, seed: int = 0, tol: float = 1e-8) -> None:
+    """Check the recursion against direct numerical integration of the same integral.
+
+    A closed-form propagator that is subtly wrong still produces a smooth, plausible
+    correction, so it is checked against a fine-grid quadrature of
+    ``int exp(-A(tau-u)) F(u) du`` rather than against itself.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    d = 3 * (1 + n_aux)
+    theta = torch.randn(theta_size(n_aux), dtype=torch.float64, generator=generator)
+    A = make_A_covariant(theta.unsqueeze(0), n_aux)[0]
+
+    n_steps, dt = 12, 0.05
+    forces = torch.randn(n_steps, d, dtype=torch.float64, generator=generator)
+    J = propagated_impulse(A, forces, dt)
+
+    # reference: dense Riemann sum of exp(-A(tau-u)) F(u), F piecewise constant
+    tau = n_steps * dt
+    fine = 400
+    reference = torch.zeros(d, dtype=torch.float64)
+    for i in range(n_steps * fine):
+        u = (i + 0.5) * dt / fine
+        k = min(int(u / dt), n_steps - 1)
+        reference = reference + (
+            torch.matrix_exp(-A * (tau - u)) @ forces[k]
+        ) * (dt / fine)
+
+    error = (J - reference).abs().max().item()
+    scale = reference.abs().max().item()
+    if error > tol * max(scale, 1.0):
+        raise AssertionError(
+            f"propagated impulse disagrees with quadrature at n_aux={n_aux}: "
+            f"max |dJ| = {error:.3e} against a scale of {scale:.3e}"
+        )
