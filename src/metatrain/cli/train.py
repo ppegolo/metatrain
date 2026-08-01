@@ -842,8 +842,14 @@ def _get_batch_size_from_hypers(hypers: Union[Dict, DictConfig]) -> Optional[int
             batch_size = _get_batch_size_from_hypers(value)
             if batch_size is not None:
                 return batch_size
+        # Hyper keys are not all strings: the additive priors are keyed BY ATOMIC TYPE
+        # (`soft_core_sigma_by_type: {8: ...}`, declared as `Dict[int, float]`), so this
+        # walk meets integer keys and `key.lower()` raised
+        # `AttributeError: 'int' object has no attribute 'lower'` -- after a full training
+        # run and after the model had been exported, turning a completed 100-epoch job into
+        # a FAILED token.
         if (
-            key.lower().replace("_", "").replace("-", "").replace(" ", "")
+            str(key).lower().replace("_", "").replace("-", "").replace(" ", "")
             == "batchsize"
         ):
             return value
