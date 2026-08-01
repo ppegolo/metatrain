@@ -3,6 +3,8 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from spex.spherical_expansion import SphericalExpansion
 from torch.nn import Module
 
+from .spherical_harmonics import ExportSafeSphericalHarmonics
+
 
 class SoapPowerSpectrum(Module):
     """Class for the SOAP power spectrum.
@@ -40,6 +42,10 @@ class SoapPowerSpectrum(Module):
         }
 
         self.calculator = SphericalExpansion(**self.spec)
+        # Replace the spex angular module: its sphericart operators only have an
+        # autograd formula in processes that import `sphericart.torch`, which
+        # deployed (exported) models do not (see modules/spherical_harmonics.py).
+        self.calculator.angular = ExportSafeSphericalHarmonics(max_angular)
 
         l_to_treat = list(range(self.calculator.max_angular + 1))
         self.n_per_l = self.calculator.radial.n_per_l

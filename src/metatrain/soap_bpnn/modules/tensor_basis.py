@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import metatensor.torch as mts
 import numpy as np
-import sphericart.torch
 import torch
 import wigners
 from metatensor.torch import Labels, TensorBlock, TensorMap
@@ -13,6 +12,10 @@ from metatensor.torch.learn.nn import Linear as LinearMap
 from spex import SphericalExpansion
 
 from ..documentation import SOAPConfig
+from .spherical_harmonics import (
+    ExportSafeSolidHarmonics,
+    ExportSafeSphericalHarmonics,
+)
 
 
 def _build_spex_hypers(
@@ -198,6 +201,10 @@ class VectorBasis(torch.nn.Module):
             legacy=self.legacy,
         )
         self.soap_calculator = SphericalExpansion(**spex_soap_hypers)
+        # Replace the spex angular module: its sphericart operators only have an
+        # autograd formula in processes that import `sphericart.torch`, which
+        # deployed (exported) models do not (see modules/spherical_harmonics.py).
+        self.soap_calculator.angular = ExportSafeSphericalHarmonics(max_angular=1)
 
         self.neighbor_species_labels = Labels(
             names=["neighbor_type"],
@@ -378,6 +385,12 @@ class LambdaBasis(torch.nn.Module):
             legacy=legacy,
         )
         self.spex_calculator = SphericalExpansion(**spex_soap_hypers)
+        # Replace the spex angular module: its sphericart operators only have an
+        # autograd formula in processes that import `sphericart.torch`, which
+        # deployed (exported) models do not (see modules/spherical_harmonics.py).
+        self.spex_calculator.angular = ExportSafeSphericalHarmonics(
+            max_angular=o3_lambda
+        )
 
         n_radial = self.spex_calculator.radial.n_per_l[o3_lambda]
         feature_count = n_radial * (len(atomic_types) if legacy else 4)
@@ -577,9 +590,11 @@ class TensorBasis(torch.nn.Module):
         else:
             self.vector_basis_pseudotensor = FakeVectorBasis()  # make torchscript work
 
-        # Spherical harmonics calculator
+        # Spherical harmonics calculator. The export-safe version is used instead
+        # of sphericart's own so that exported models keep exact position
+        # gradients (see modules/spherical_harmonics.py).
         if self.o3_lambda > 1:
-            self.spherical_harmonics_calculator = sphericart.torch.SolidHarmonics(
+            self.spherical_harmonics_calculator = ExportSafeSolidHarmonics(
                 l_max=self.o3_lambda
             )
         else:
