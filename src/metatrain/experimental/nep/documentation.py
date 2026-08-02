@@ -110,18 +110,12 @@ from metatrain.utils.loss import LossSpecification
 class ModelHypers(TypedDict):
     """Hyperparameters for the NEP model.
 
-    These mirror the keywords of a GPUMD ``nep.in`` file.  The element list is
-    derived automatically from the dataset's atomic numbers and should not be
-    set manually.
+    These mirror the keywords of a GPUMD ``nep.in`` file.
     """
 
     nep_model: Optional[str] = None
-    """Path to an existing GPUMD ``nep.txt`` file to fine-tune.  When provided,
-    all architecture hyperparameters below (version, cutoffs, ``n_max``, ...)
-    are read from the file and override the values in this section.  The
-    dataset must contain exactly the elements of the file.  The composition
-    weights are fixed to zero and the target scale to one, since the loaded
-    potential already predicts total energies."""
+    """Path to an existing GPUMD ``nep.txt`` file to fine-tune.  The file's
+    architecture hyperparameters override the values in this section."""
     version: int = 4
     """NEP version. ``3``: one shared neural network for all elements;
     ``4``: one neural network per element (recommended); ``5``: as ``4``
@@ -160,9 +154,9 @@ class ModelHypers(TypedDict):
     zbl_outer_cutoff: Optional[float] = None
     """If set, add GPUMD's universal ZBL short-range repulsion, smoothly
     switched off between half this value (inner cutoff) and this value (outer
-    cutoff), in Å.  Must be between 1 and 2.5 Å for physically sensible
-    results (GPUMD allows [1, 2.5]).  The ZBL term is handled as an additive
-    contribution that is excluded from target scaling, exactly as in GPUMD."""
+    cutoff), in Å.  GPUMD recommends values between 1 and 2.5 Å.  The ZBL term
+    is handled as an additive contribution that is excluded from target
+    scaling, exactly as in GPUMD."""
     seed: int = 0
     """Random seed for weight initialisation."""
 

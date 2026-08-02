@@ -16,7 +16,7 @@ from metatomic.torch import (
     System,
 )
 from torchnep import NepParameters, NepPotential, load_nep, write_nep
-from torchnep.nep_descriptor import _descriptor_type_ids_batched
+from torchnep.nep_descriptor import descriptor_type_ids_batched
 from torchnep.zbl import ZBLConfig
 
 from metatrain.composition import CompositionModel
@@ -186,7 +186,7 @@ def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
 
 
 class NEP(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 2
+    __checkpoint_version__ = 1
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -268,8 +268,7 @@ class NEP(ModelInterface[ModelHypers]):
         self.potential = NepPotential(params, train_q_scaler=False)
 
         # Lookup table from atomic numbers to NEP type indices (0..num_types-1)
-        max_z = max(max(self.atomic_types), 0) + 1
-        lookup = torch.full((max_z + 1,), -1, dtype=torch.long)
+        lookup = torch.full((max(self.atomic_types) + 1,), -1, dtype=torch.long)
         for index, z in enumerate(self.atomic_types):
             lookup[z] = index
         self.register_buffer("species_to_type_id", lookup, persistent=False)
@@ -558,7 +557,7 @@ class NEP(ModelInterface[ModelHypers]):
             ones = torch.ones(
                 potential.meta.dim, dtype=positions.dtype, device=positions.device
             )
-            q = _descriptor_type_ids_batched(
+            q = descriptor_type_ids_batched(
                 potential.meta,
                 potential.pbc_list,
                 potential.c.detach(),
@@ -608,10 +607,7 @@ class NEP(ModelInterface[ModelHypers]):
         ``atomic_type = -1``); a per-atom target stores one scale per type.
         """
         num_types = len(self.atomic_types)
-        try:
-            scales_tmap = self.scaler.model.scales[self.targets_keys]
-        except KeyError:
-            return torch.ones(num_types, dtype=torch.float64)
+        scales_tmap = self.scaler.model.scales[self.targets_keys]
         if len(scales_tmap) != 1:
             raise ValueError(
                 "NEP GPUMD export only supports single-block scalar targets."
@@ -648,26 +644,9 @@ class NEP(ModelInterface[ModelHypers]):
     def export_nep(self, path: Union[str, Path]) -> None:
         """Write a GPUMD-compatible ``nep.txt`` file for this model.
 
-        The metatrain per-atom prediction is ``s_t * e_nep + c_t``, where
-        ``s_t`` is the target scale (from the ``Scaler``) and ``c_t`` the
-        per-type composition baseline.  Both are folded exactly into the NEP
-        output layer so that native NEP implementations (GPUMD, NEP_CPU,
-        calorine, ...) reproduce the metatrain predictions:
-
-        - all versions: the output weights of type ``t`` are multiplied by
-          ``s_t``;
-        - NEP5 (``version: 5``): ``c_t`` and the scaled global bias are folded
-          into the per-type bias — always exact;
-        - NEP3/NEP4: there is only a global bias, so the fold is only exact
-          when ``s_t * b1 - c_t`` is the same for every type (e.g. a single
-          element, or uniform composition weights).  Otherwise a
-          ``ValueError`` suggests using ``version: 5``.
-
-        ZBL is handled as an additive model that is excluded from the scaler,
-        exactly as in native NEP, so ZBL models export with any scale.  The
-        electrostatic energy of NEP-Charge (qNEP) models is quadratic in the
-        predicted charges and cannot be folded, so exporting them requires
-        unit scales (train with ``scale_targets: false``).
+        The target scale and per-type composition baseline are folded into the
+        NEP output layer; a ``ValueError`` is raised when the fold is not exact
+        (NEP3/4 with non-uniform folded constants, qNEP with non-unit scale).
 
         :param path: Output path for the ``nep.txt`` file.
         """

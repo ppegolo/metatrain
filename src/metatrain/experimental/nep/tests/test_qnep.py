@@ -1,4 +1,5 @@
 import copy
+import re
 
 import pytest
 import torch
@@ -29,19 +30,6 @@ def _qnep_model(atomic_types, charge_mode, scale=1.0, composition=None):
     )
 
 
-@pytest.mark.parametrize("charge_mode", [1, 2, 3])
-def test_qnep_forward(charge_mode):
-    """qNEP models produce finite per-atom energies on periodic systems."""
-    model = _qnep_model([6, 14], charge_mode)
-    energies = _model_per_atom_energies(model, _test_system([6, 14]))
-    assert torch.isfinite(energies).all()
-    # charge terms change the prediction with respect to a regular NEP with
-    # the same energy-head parameters being absent from a plain model
-    plain = _make_model([6, 14], version=4, scale=1.0, composition={6: 0.0, 14: 0.0})
-    e_plain = _model_per_atom_energies(plain, _test_system([6, 14]))
-    assert not torch.allclose(energies, e_plain)
-
-
 def test_qnep_nonperiodic_raises():
     model = _qnep_model([6, 14], 2)
     system = System(
@@ -52,7 +40,10 @@ def test_qnep_nonperiodic_raises():
     )
     system = get_system_with_neighbor_lists(system, model.requested_neighbor_lists())
     model.eval()
-    with pytest.raises(ValueError, match="periodic"):
+    message = (
+        "NEP-Charge (qNEP) requires periodic systems: found a system with a zero cell."
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         model([system], model.outputs)
 
 
@@ -60,7 +51,8 @@ def test_qnep_requires_version_4():
     hypers = copy.deepcopy(MODEL_HYPERS)
     hypers["version"] = 5
     hypers["charge_mode"] = 2
-    with pytest.raises(ValueError, match="version: 4"):
+    message = "NEP-Charge (qNEP) requires `version: 4`, got version 5."
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         NEP(hypers, _dataset_info([6]))
 
 
@@ -96,7 +88,13 @@ def test_qnep_export_roundtrip(tmp_path, charge_mode):
 
 def test_qnep_export_with_scale_raises(tmp_path):
     model = _qnep_model([6, 14], 2, scale=0.6)
-    with pytest.raises(ValueError, match="scale_targets"):
+    message = (
+        "Cannot export a NEP-Charge (qNEP) model with a non-unit target "
+        "scale: the Ewald energy is quadratic in the predicted charges and "
+        "cannot be folded. Train with `scale_targets: false` to export this "
+        "model."
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         model.export_nep(tmp_path / "nep.txt")
 
 

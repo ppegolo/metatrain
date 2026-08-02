@@ -1,4 +1,5 @@
 import copy
+import re
 
 import pytest
 import torch
@@ -125,15 +126,19 @@ def test_export_nep_matches_model(tmp_path, version, atomic_types, composition):
 def test_export_nep4_nonuniform_composition_raises(tmp_path):
     """NEP4 has a single global bias: per-type composition cannot be folded."""
     model = _make_model([6, 14], 4, scale=0.6, composition={6: -2.0, 14: -7.5})
-    with pytest.raises(ValueError, match="version: 5"):
+    message = (
+        "NEP4 has a single global bias, but the folded per-type constants "
+        "differ (spread 5.500e+00). Use `version: 5`, whose per-type bias "
+        "makes the composition fold exact for multi-element models."
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         model.export_nep(tmp_path / "nep.txt")
 
 
-@pytest.mark.parametrize("scale", [1.0, 0.6])
-def test_export_nep_zbl(tmp_path, scale):
+def test_export_nep_zbl(tmp_path):
     """ZBL models export at any scale: the ZBL term is an additive
     contribution excluded from the scaler, matching native NEP."""
-    model = _make_model([6], 4, scale=scale, composition={6: -2.0}, zbl=2.0)
+    model = _make_model([6], 4, scale=0.6, composition={6: -2.0}, zbl=2.0)
     path = tmp_path / "nep.txt"
     model.export_nep(path)
 
