@@ -94,6 +94,9 @@ dpa3 = [
     "deepmd-kit[torch]>=3.1.0",
     "torch>=2.7",
 ]
+# torchnep is not on PyPI; install it from a GPUMD checkout
+# (pip install <path-to-torchnep>)
+nep = []
 
 [tool.check-manifest]
 ignore = ["src/metatrain/_version.py"]
