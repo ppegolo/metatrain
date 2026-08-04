@@ -3,7 +3,7 @@ model. Called from Python (the LLPR trainer and tests), never from the
 TorchScript forward path."""
 
 import logging
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from metatomic.torch import ModelOutput
@@ -13,6 +13,7 @@ from metatrain.utils.data import (
     CollateFn,
     CombinedDataLoader,
     Dataset,
+    build_val_dataloaders,
     unpack_batch,
 )
 from metatrain.utils.neighbor_lists import (
@@ -34,11 +35,10 @@ def _get_dataloader(
     is_distributed: bool,
 ) -> DataLoader:
     """
-    Create a DataLoader for the provided datasets. As the dataloader is only used to
-    accumulate the quantities needed for LLPR calibration, there is no need to
-    shuffle or drop the last non-full batch. Distributed sampling can be used or
-    not, based on the `is_distributed` argument, and training with double
-    precision is enforced.
+    Create a DataLoader for the provided datasets. The dataloader is only used
+    to accumulate the quantities needed for LLPR calibration, so every sample
+    is covered exactly once: no shuffling, no tail-batch dropping, and no
+    padding under distributed sampling.
 
     :param model: the LLPR model the dataloader is built for.
     :param datasets: List of datasets to create the dataloader from.
@@ -46,7 +46,6 @@ def _get_dataloader(
     :param is_distributed: Whether to use distributed sampling or not.
     :return: The created DataLoader.
     """
-    # Create the collate function
     targets_keys = list(model.dataset_info.targets.keys())
     requested_neighbor_lists = get_requested_neighbor_lists(model)
     collate_fn = CollateFn(
@@ -54,7 +53,8 @@ def _get_dataloader(
         callables=[get_system_with_neighbor_lists_transform(requested_neighbor_lists)],
     )
 
-    # Validate dtype from datasets
+    # an empty loader would silently accumulate a zero covariance and only
+    # fail later, confusingly, at the Cholesky decomposition
     if len(datasets) == 0:
         raise ValueError(
             "Cannot create dataloader from empty datasets list. "
@@ -66,42 +66,30 @@ def _get_dataloader(
             "Please provide non-empty datasets for LLPR calibration."
         )
 
-    # Build the dataloaders
-    samplers: List[torch.utils.data.Sampler | None]
     if is_distributed:
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        samplers = [
-            NoPadDistributedSampler(
-                dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=False,
-                seed=0,
-            )
-            for dataset in datasets
+        # Strided shards instead of DistributedSampler: its padding duplicates
+        # samples to equalize shard sizes, which would bias the covariance and
+        # the calibration. Unequal shard sizes are fine here, as the only
+        # collectives are the final all_reduces.
+        samplers: List[Any] = [
+            range(rank, len(dataset), world_size) for dataset in datasets
         ]
     else:
         samplers = [None] * len(datasets)
 
-    dataloaders = []
-    for dataset, sampler in zip(datasets, samplers, strict=True):
-        if len(dataset) < batch_size:
-            raise ValueError(
-                f"A dataset has fewer samples "
-                f"({len(dataset)}) than the batch size "
-                f"({batch_size}). "
-                "Please reduce the batch size."
-            )
-        dataloaders.append(
-            DataLoader(
-                dataset=dataset,
-                batch_size=batch_size,
-                sampler=sampler,
-                drop_last=False,
-                collate_fn=collate_fn,
-            )
-        )
+    # The validation dataloader builder covers every sample exactly once,
+    # without shuffling or dropping the tail batch, which is what the
+    # deterministic accumulation needs.
+    dataloaders = build_val_dataloaders(
+        val_datasets=datasets,
+        val_distributed_samplers=samplers,
+        collate_fn_val=collate_fn,
+        batch_size=batch_size,
+        max_atoms_per_batch=None,
+        num_workers=0,
+    )
 
     # important to keep shuffle=False for consistent calibration results
     # in distributed training
@@ -377,37 +365,3 @@ def calibrate(
         uncertainty_name, block_key = calibrated_blocks[calibrator_key]
         multiplier = model._get_multiplier(uncertainty_name, block_key)
         multiplier[:] = alpha.to(device=device, dtype=multiplier.dtype)
-
-
-class NoPadDistributedSampler(torch.utils.data.Sampler[int]):
-    def __init__(
-        self,
-        dataset: torch.utils.data.Dataset,
-        num_replicas: int,
-        rank: int,
-        shuffle: bool = False,
-        seed: int = 0,
-    ):
-        self.dataset = dataset
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.shuffle = shuffle
-        self.seed = seed
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
-    def __iter__(self) -> Iterator[int]:
-        n = len(self.dataset)
-        indices = torch.arange(n, dtype=torch.long)
-        if self.shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            indices = indices[torch.randperm(n, generator=g)]
-        # no padding, no dropping
-        return iter(indices[self.rank :: self.num_replicas].tolist())
-
-    def __len__(self) -> int:
-        n = len(self.dataset)
-        return (n - self.rank + self.num_replicas - 1) // self.num_replicas
