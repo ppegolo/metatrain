@@ -143,6 +143,9 @@ Changed
 - Models with atomic-basis targets evaluate faster: the conversion of their outputs
   to the sparse layout no longer recomputes the properties to select from the layout
   on every call, and selects the atoms of each type with a single sort.
+- Systems are sent from the dataloader workers as plain tensors instead of
+  serialized buffers, which is several times faster for large systems with neighbor
+  lists.
 
 Removed
 #######

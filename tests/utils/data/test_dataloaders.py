@@ -11,13 +11,16 @@ enough: it removes the duplication without losing coverage.
 
 from pathlib import Path
 
+import torch
 from metatensor.learn.data import Dataset
+from metatomic.torch import NeighborListOptions
 from omegaconf import OmegaConf
 
 from metatrain.utils.data import build_train_dataloaders, build_val_dataloaders
 from metatrain.utils.data.dataset import CollateFn, unpack_batch
 from metatrain.utils.data.readers import read_systems, read_targets
 from metatrain.utils.data.samplers import MaxAtomDistributedBatchSampler
+from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 
 
 RESOURCES_PATH = Path(__file__).resolve().parents[2] / "resources"
@@ -106,3 +109,58 @@ def test_max_atoms_per_batch_end_to_end():
     for batch in val_batch_sampler.all_batches:
         atom_count = sum(len(dataset[i].system) for i in batch)
         assert atom_count <= 20
+
+
+def test_worker_round_trip_is_lossless():
+    """Batches collated in dataloader worker processes decode to the systems, neighbor
+    lists and targets of the dataset."""
+    systems = read_systems(DATASET_PATH)[:10]
+    nl_options = NeighborListOptions(cutoff=3.0, full_list=True, strict=True)
+    systems = [get_system_with_neighbor_lists(s, [nl_options]) for s in systems]
+    conf = {
+        "energy": {
+            "quantity": "energy",
+            "read_from": DATASET_PATH,
+            "reader": "ase",
+            "key": "U0",
+            "unit": "eV",
+            "type": "scalar",
+            "sample_kind": "system",
+            "num_subtargets": 1,
+            "forces": False,
+            "stress": False,
+            "virial": False,
+        }
+    }
+    targets, _ = read_targets(OmegaConf.create(conf))
+    dataset = Dataset.from_dict({"system": systems, "energy": targets["energy"][:10]})
+    collate_fn = CollateFn(target_keys=["energy"])
+
+    loader = build_val_dataloaders(
+        val_datasets=[dataset],
+        val_distributed_samplers=[None],
+        collate_fn_val=collate_fn,
+        batch_size=4,
+        max_atoms_per_batch=None,
+        num_workers=2,
+    )[0]
+
+    decoded_systems, decoded_energies = [], []
+    for batch in loader:
+        batch_systems, batch_targets, _ = unpack_batch(batch)
+        decoded_systems.extend(batch_systems)
+        decoded_energies.append(batch_targets["energy"].block().values)
+
+    assert len(decoded_systems) == len(systems)
+    for system, decoded in zip(systems, decoded_systems, strict=True):
+        assert torch.equal(system.positions, decoded.positions)
+        assert torch.equal(system.types, decoded.types)
+        assert torch.equal(system.cell, decoded.cell)
+        assert torch.equal(system.pbc, decoded.pbc)
+        assert decoded.known_neighbor_lists() == [nl_options]
+        nl = system.get_neighbor_list(nl_options)
+        decoded_nl = decoded.get_neighbor_list(nl_options)
+        assert torch.equal(nl.samples.values, decoded_nl.samples.values)
+        assert torch.equal(nl.values, decoded_nl.values)
+    energies = torch.cat([t.block().values for t in targets["energy"][:10]])
+    assert torch.equal(torch.cat(decoded_energies), energies)
