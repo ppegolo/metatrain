@@ -2,7 +2,7 @@ import copy
 import logging
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import mace.modules as mace_modules
 import metatensor.torch as mts
@@ -32,6 +32,10 @@ from metatrain.utils.data.atomic_basis_helpers import (
     sparsify_atomic_basis_target,
 )
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.last_layer import (
+    block_key_name,
+    declare_per_block_last_layer_features,
+)
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
 
@@ -42,6 +46,7 @@ from .modules.heads import MACEHeadWrapper, NonLinearHead
 from .modules.scale_shift import FakeScaleShift
 from .utils.mace_head import get_mace_head_index
 from .utils.mts import (
+    e3nn_llf_to_aligned_tensormap,
     e3nn_to_tensormap,
     get_e3nn_mts_layout,
     get_samples_labels,
@@ -104,6 +109,10 @@ class MetaMACE(ModelInterface[ModelHypers]):
     # """List of additive models to compute additive contributions."""
     # scaler: Scaler
     # """Scaler to bring all targets to a scale that is optimal for training."""
+
+    # torchscript needs class-level annotations for possibly-empty dicts
+    llf_target_for: Dict[str, str]
+    llf_block_slices: Dict[str, List[List[Tuple[int, int]]]]
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
@@ -269,6 +278,14 @@ class MetaMACE(ModelInterface[ModelHypers]):
         # Create heads for each target, store the layout for each of them.
         self.heads = torch.nn.ModuleDict()
         self.layouts: Dict[str, TensorMap] = {}
+        # LLPR interface, filled by `_register_llpr_metadata`
+        self.llf_target_for: Dict[str, str] = {}
+        self.llf_block_slices: Dict[str, List[List[Tuple[int, int]]]] = {}
+        self.last_layer_feature_sizes: Dict[str, Dict[str, int]] = {}
+        self.last_layer_feature_map: Dict[str, List[str]] = {}
+        self.last_layer_parameter_slices: Dict[
+            str, Dict[str, List[Tuple[str, int, Tuple[int, int], float, bool]]]
+        ] = {}
         for target_name, target_info in train_dataset_info.targets.items():
             self._add_output(target_name, target_info)
 
@@ -446,11 +463,24 @@ class MetaMACE(ModelInterface[ModelHypers]):
 
         return_dict: Dict[str, TensorMap] = {}
         for output_name, model_output in model_outputs.items():
-            per_atom_output = e3nn_to_tensormap(
-                model_output,
-                samples=samples,
-                layout=self.layouts[output_name],
-            )
+            if output_name in self.llf_target_for:
+                # LLPR's contract is one feature block per target block,
+                # positionally paired, which the raw irreps layout cannot
+                # express for multi-block targets; undeclared targets keep the
+                # pre-existing raw layout below
+                aligned_target = self.llf_target_for[output_name]
+                per_atom_output = e3nn_llf_to_aligned_tensormap(
+                    model_output,
+                    samples=samples,
+                    target_layout=self.layouts[aligned_target],
+                    block_slices=self.llf_block_slices[aligned_target],
+                )
+            else:
+                per_atom_output = e3nn_to_tensormap(
+                    model_output,
+                    samples=samples,
+                    layout=self.layouts[output_name],
+                )
 
             if selected_atoms is not None:
                 per_atom_output = mts.slice(
@@ -698,11 +728,23 @@ class MetaMACE(ModelInterface[ModelHypers]):
         self.layouts[target_name] = target_info.layout
 
         if target_name == self.hypers["mace_head_target"]:
-            # Fake head that will not compute the target, but will help
-            # us extract the last layer features from MACE internal head.
-            self.heads[target_name] = MACEHeadWrapper(
+            # mace_head_target routes a target through the loaded MACE model's
+            # own readout (e.g. a foundation model's energy). Its last-layer
+            # features are exact, so LLPR uncertainties work; its readout
+            # weights live inside the loaded model, so no slices are declared
+            # and ensembles are refused.
+            head_wrapper = MACEHeadWrapper(
                 self.mace_model.readouts, self.per_layer_irreps, self.mace_head_index
             )
+            self.heads[target_name] = head_wrapper
+            block_key = block_key_name(target_name, target_info.layout.keys.entry(0))
+            llf_size = head_wrapper.last_layer_features_irreps.dim
+            declare_per_block_last_layer_features(
+                self, target_name, {block_key: llf_size}
+            )
+            self.last_layer_parameter_slices[target_name] = {}
+            self.llf_block_slices[target_name] = [[(0, llf_size)]]
+            self.llf_target_for[self._llf_name(target_name)] = target_name
         else:
             output_info = copy.deepcopy(target_info)
             output_info.layout = target_info.layout
@@ -715,8 +757,14 @@ class MetaMACE(ModelInterface[ModelHypers]):
 
             self.heads[target_name] = head.to(torch.float64)
 
+            if target_info.is_scalar or target_info.is_spherical:
+                self._register_llpr_metadata(target_name, target_info, head)
+
         llf_irreps = self.heads[target_name].last_layer_features_irreps
 
+        # the pre-existing raw all-irreps feature layout, still exposed for
+        # targets with no block alignment (missing irreps, cuequivariance,
+        # Cartesian); LLPR-declared targets get a block-aligned map in `forward`
         self.layouts[self._llf_name(target_name)] = get_e3nn_mts_layout(
             f"{target_name}_last_layer_features",
             {
@@ -725,6 +773,87 @@ class MetaMACE(ModelInterface[ModelHypers]):
                 "properties_name": "feature",
             },
         )
+
+    def _register_llpr_metadata(
+        self, target_name: str, target_info: TargetInfo, head: NonLinearHead
+    ) -> None:
+        """Declare the LLPR interface of a ``NonLinearHead`` target.
+
+        ``linear_2`` is an e3nn ``o3.Linear``: per-irrep channel mixing with all
+        path weights concatenated in one flat parameter. For every target block,
+        record the weight slices whose scaled concatenation is that block's
+        effective ``(n_properties, n_features)`` readout matrix, the per-block
+        feature size, and where the block's features live in the flat last-layer
+        feature tensor (used by ``forward`` to expose them block-aligned).
+
+        Blocks whose irrep is absent from the features have no linear readout
+        (their output is masked to zero); such targets are left undeclared and
+        keep the legacy all-irreps feature layout.
+
+        :param target_name: name of the target.
+        :param target_info: the target's info, whose layout orders the blocks.
+        :param head: the head that produces the target.
+        """
+        instructions = getattr(head.linear_2, "instructions", None)
+        if instructions is None:
+            # optimized (cuequivariance) linear: no slice metadata available
+            return
+        weight_name = f"heads.{target_name}.linear_2.weight"
+
+        # flat offsets of each instruction's weights, in storage order
+        instruction_offsets: List[int] = []
+        offset = 0
+        for instruction in instructions:
+            instruction_offsets.append(offset)
+            offset += instruction.path_shape[0] * instruction.path_shape[1]
+
+        # offsets of each input entry in the flat feature tensor
+        entry_offsets: List[int] = []
+        entry_offset = 0
+        for entry in head.last_layer_features_irreps:
+            entry_offsets.append(entry_offset)
+            entry_offset += entry.mul * entry.ir.dim
+
+        feature_sizes: Dict[str, int] = {}
+        weight_slices: Dict[
+            str, List[Tuple[str, int, Tuple[int, int], float, bool]]
+        ] = {}
+        block_slices: List[List[Tuple[int, int]]] = []
+        for i_out, (key, block) in enumerate(target_info.layout.items()):
+            block_key = block_key_name(target_name, key)
+            n_properties = len(block.properties)
+            block_weight_slices: List[
+                Tuple[str, int, Tuple[int, int], float, bool]
+            ] = []
+            block_feature_slices: List[Tuple[int, int]] = []
+            for instruction, instruction_offset in zip(
+                instructions, instruction_offsets, strict=True
+            ):
+                if instruction.i_out != i_out or instruction.path_shape[0] == 0:
+                    continue
+                block_weight_slices.append(
+                    (
+                        weight_name,
+                        instruction_offset,
+                        # stored feature-major (mul_in, mul_out)
+                        (n_properties, instruction.path_shape[0]),
+                        float(instruction.path_weight),
+                        True,
+                    )
+                )
+                block_feature_slices.append(
+                    (entry_offsets[instruction.i_in], instruction.path_shape[0])
+                )
+            if len(block_feature_slices) == 0:
+                return
+            feature_sizes[block_key] = sum(mul for _, mul in block_feature_slices)
+            weight_slices[block_key] = block_weight_slices
+            block_slices.append(block_feature_slices)
+
+        declare_per_block_last_layer_features(self, target_name, feature_sizes)
+        self.last_layer_parameter_slices[target_name] = weight_slices
+        self.llf_block_slices[target_name] = block_slices
+        self.llf_target_for[self._llf_name(target_name)] = target_name
 
     def _llf_name(self, target_name: str) -> str:
         """Get the name of the last layer features corresponding to a target.

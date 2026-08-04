@@ -5,7 +5,7 @@ of MACE (raw torch tensors that correspond to some e3nn irreps) to
 metatensor TensorMaps.
 """
 
-from typing import List
+from typing import List, Tuple
 
 import torch
 from e3nn import o3
@@ -13,6 +13,7 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
 from metatrain.utils.data import TargetInfo
+from metatrain.utils.last_layer import block_aligned_llf_tensormap
 
 
 def e3nn_to_tensormap(
@@ -80,6 +81,49 @@ def e3nn_to_tensormap(
         pointer = end
 
     return TensorMap(keys=layout.keys, blocks=blocks)
+
+
+def e3nn_llf_to_aligned_tensormap(
+    llf_values: torch.Tensor,
+    samples: Labels,
+    target_layout: TensorMap,
+    block_slices: List[List[Tuple[int, int]]],
+) -> TensorMap:
+    """Expose flat e3nn last-layer features as one block per target block.
+
+    For every block of the target's layout, gather the entries of the flat
+    feature tensor whose irrep matches that block (``block_slices`` holds their
+    ``(offset, multiplicity)`` pairs, in the order the block's readout weight
+    slices are declared) and stack them as the block's feature axis.
+
+    :param llf_values: ``(n_samples, dim)`` flat feature tensor.
+    :param samples: samples labels of the feature blocks.
+    :param target_layout: layout of the target the features belong to.
+    :param block_slices: per target block, the ``(offset, multiplicity)`` of
+        each matching entry in the flat feature tensor.
+    :return: a ``TensorMap`` with the target's keys and one feature block per
+        target block.
+    """
+    components_per_block: List[List[Labels]] = []
+    block_values: List[torch.Tensor] = []
+    block_index = 0
+    for block in target_layout.blocks():
+        components = block.components
+        components_per_block.append(components)
+        n_components = len(components[0]) if len(components) > 0 else 1
+        chunks: List[torch.Tensor] = []
+        for offset, multiplicity in block_slices[block_index]:
+            chunk = llf_values[:, offset : offset + multiplicity * n_components]
+            chunks.append(
+                chunk.reshape(
+                    llf_values.shape[0], multiplicity, n_components
+                ).transpose(1, 2)
+            )
+        block_values.append(torch.cat(chunks, dim=-1))
+        block_index += 1
+    return block_aligned_llf_tensormap(
+        block_values, samples, target_layout.keys, components_per_block
+    )
 
 
 def get_e3nn_mts_layout(target_name: str, target: dict) -> TensorMap:
