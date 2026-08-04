@@ -111,6 +111,9 @@ def e3nn_llf_to_aligned_tensormap(
         components = block.components
         components_per_block.append(components)
         n_components = len(components[0]) if len(components) > 0 else 1
+        is_cartesian_vector = len(components) > 0 and components[0].names[0].startswith(
+            "xyz"
+        )
         chunks: List[torch.Tensor] = []
         for offset, multiplicity in block_slices[block_index]:
             chunk = llf_values[:, offset : offset + multiplicity * n_components]
@@ -119,7 +122,13 @@ def e3nn_llf_to_aligned_tensormap(
                     llf_values.shape[0], multiplicity, n_components
                 ).transpose(1, 2)
             )
-        block_values.append(torch.cat(chunks, dim=-1))
+        values = torch.cat(chunks, dim=-1)
+        if is_cartesian_vector:
+            # `e3nn_to_tensormap` reorders Cartesian predictions from e3nn's
+            # (y, z, x) to (x, y, z); reorder the features identically so that
+            # the declared readout weights still map features to the block
+            values = values[:, [2, 0, 1], :]
+        block_values.append(values)
         block_index += 1
     return block_aligned_llf_tensormap(
         block_values, samples, target_layout.keys, components_per_block

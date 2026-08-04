@@ -35,18 +35,18 @@ members are equivariant by construction.
 Ensembles are more demanding than uncertainties: they are sampled in the weight space
 of the last layer, so they require every block of the target to be read directly off
 the last-layer features. This holds for all of :ref:`arch-pet`'s blocks, for
-:ref:`arch-mace`'s and :ref:`arch-space`'s scalar and spherical targets, for
-:ref:`arch-space`'s rank-1 Cartesian targets, and among :ref:`arch-soap_bpnn`'s
-blocks only for the scalar and ``o3_lambda=0`` ones. Requesting ensembles for an
-unsupported target raises an error; its uncertainties remain available. Other cases:
+:ref:`arch-mace`'s and :ref:`arch-space`'s scalar, spherical and rank-1 Cartesian
+targets, and among :ref:`arch-soap_bpnn`'s blocks only for the scalar and
+``o3_lambda=0`` ones. Requesting ensembles for an unsupported target raises an
+error; its uncertainties remain available. Other cases:
 
 - ``mace_head_target`` (routed through a loaded MACE model's own readouts):
   uncertainties are available, ensembles are refused.
 - :ref:`arch-space` rank-2 Cartesian targets: uncertainties are available, ensembles
   are refused.
-- MACE targets requesting irreps absent from its hidden features, MACE Cartesian
-  targets, and MACE models using the optimized (cuequivariance) linear layers:
-  neither uncertainties nor ensembles are available.
+- MACE targets requesting irreps absent from its hidden features, and MACE models
+  using the optimized (cuequivariance) linear layers: neither uncertainties nor
+  ensembles are available.
 
 The wrapped model's per-property output scales (its ``scaler``) are applied to the
 uncertainties and to the spread of the ensembles, so that both live in the same units

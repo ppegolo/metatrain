@@ -757,14 +757,16 @@ class MetaMACE(ModelInterface[ModelHypers]):
 
             self.heads[target_name] = head.to(torch.float64)
 
-            if target_info.is_scalar or target_info.is_spherical:
-                self._register_llpr_metadata(target_name, target_info, head)
+            # rank-2 Cartesian targets were refused above, so any Cartesian
+            # target here is rank 1: the 1o readout, declared like a spherical
+            # target (`forward` reorders its components to x, y, z)
+            self._register_llpr_metadata(target_name, target_info, head)
 
         llf_irreps = self.heads[target_name].last_layer_features_irreps
 
         # the pre-existing raw all-irreps feature layout, still exposed for
-        # targets with no block alignment (missing irreps, cuequivariance,
-        # Cartesian); LLPR-declared targets get a block-aligned map in `forward`
+        # targets with no block alignment (missing irreps, cuequivariance);
+        # LLPR-declared targets get a block-aligned map in `forward`
         self.layouts[self._llf_name(target_name)] = get_e3nn_mts_layout(
             f"{target_name}_last_layer_features",
             {
