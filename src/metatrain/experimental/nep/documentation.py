@@ -182,6 +182,13 @@ class TrainerHypers(TypedDict):
     memory."""
     num_epochs: int = 100
     """Number of epochs."""
+    num_workers: int = 0
+    """Number of dataloader worker processes, also used when fitting the
+    composition model.  The default of ``0`` loads data in the main process:
+    NEP datasets are held in memory with precomputed neighbor lists, so with
+    the ``fork`` start method each worker copies a large part of the parent
+    process and mostly multiplies memory usage.  Increase only for disk
+    datasets or when profiling shows data loading to be the bottleneck."""
     learning_rate: float = 0.001
     """Learning rate."""
 

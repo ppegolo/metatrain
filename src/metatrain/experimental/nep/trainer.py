@@ -18,6 +18,7 @@ from metatrain.utils.data import (
     build_train_dataloaders,
     build_val_dataloaders,
     unpack_batch,
+    validate_num_workers,
 )
 from metatrain.utils.distributed.distributed_data_parallel import (
     DistributedDataParallel,
@@ -180,6 +181,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         if self.hypers["compute_q_scaler"] and not model.loaded_nep:
             _compute_q_scaler(model, train_datasets, device, dtype)
 
+        num_workers = self.hypers["num_workers"]
+        validate_num_workers(num_workers)
+
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
             atomic_baseline={
@@ -191,6 +195,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             batch_size=self.hypers["batch_size"],
             is_distributed=is_distributed,
             checkpoint_dir=checkpoint_dir,
+            num_workers=num_workers,
         )
 
         if self.hypers["scale_targets"]:
@@ -248,7 +253,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             batch_size=self.hypers["batch_size"],
             max_atoms_per_batch=None,
             min_atoms_per_batch=0,
-            num_workers=0,
+            num_workers=num_workers,
         )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
 
@@ -259,7 +264,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             collate_fn_val=collate_fn,
             batch_size=self.hypers["batch_size"],
             max_atoms_per_batch=None,
-            num_workers=0,
+            num_workers=num_workers,
         )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
 
