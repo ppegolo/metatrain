@@ -682,7 +682,7 @@ class NEP(ModelInterface[ModelHypers]):
                 raise ValueError(
                     "NEP-Charge has a single global energy bias, but the "
                     f"per-type composition weights differ (spread {spread:.3e})."
-                    " Train with uniform `fixed_composition_weights` to export "
+                    " Train with a uniform `atomic_baseline` to export "
                     "this model."
                 )
             ann[b1_index] = float(d.mean())

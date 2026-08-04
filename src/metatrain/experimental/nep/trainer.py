@@ -185,12 +185,24 @@ class Trainer(TrainerInterface[TrainerHypers]):
         num_workers = self.hypers["num_workers"]
         validate_num_workers(num_workers)
 
+        atomic_baseline = self.hypers["atomic_baseline"]
+        if isinstance(atomic_baseline, str):
+            if model.get_fixed_composition_weights():
+                raise ValueError(
+                    "The loaded NEP model provides its own atomic baselines, "
+                    "which cannot be combined with a composition model "
+                    "checkpoint passed as `atomic_baseline`. Use the dict form "
+                    "of `atomic_baseline` instead."
+                )
+        else:
+            atomic_baseline = {
+                **model.get_fixed_composition_weights(),
+                **atomic_baseline,
+            }
+
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
-            atomic_baseline={
-                **model.get_fixed_composition_weights(),
-                **self.hypers["fixed_composition_weights"],
-            },
+            atomic_baseline=atomic_baseline,
             train_datasets=train_datasets,
             other_additive_models=list(model.additive_models[1:]),
             batch_size=self.hypers["batch_size"],
@@ -200,9 +212,28 @@ class Trainer(TrainerInterface[TrainerHypers]):
         )
 
         if self.hypers["scale_targets"]:
+            fixed_scaling_weights = self.hypers["fixed_scaling_weights"]
+            if isinstance(fixed_scaling_weights, str):
+                if not isinstance(atomic_baseline, str):
+                    raise ValueError(
+                        "Can't use a checkpoint for the scaler without "
+                        "providing a checkpoint also for the composition model."
+                    )
+                if model.get_fixed_scaling_weights():
+                    raise ValueError(
+                        "The loaded NEP model provides its own target scales, "
+                        "which cannot be combined with a scaler checkpoint "
+                        "passed as `fixed_scaling_weights`. Use the dict form "
+                        "of `fixed_scaling_weights` instead."
+                    )
+            else:
+                fixed_scaling_weights = {
+                    **model.get_fixed_scaling_weights(),
+                    **fixed_scaling_weights,
+                }
             train_or_load_scaler(
                 scaler=model.scaler,
-                fixed_weights=model.get_fixed_scaling_weights(),
+                fixed_weights=fixed_scaling_weights,
                 train_datasets=train_datasets,
                 additive_models=model.additive_models,
                 batch_size=self.hypers["batch_size"],
