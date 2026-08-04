@@ -1,6 +1,7 @@
 # tests/test_losses.py
 
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -753,3 +754,88 @@ def test_tensormap_gaussian_crps_loss(ensemble_tensor_maps):
     result = loss_fn.compute(predictions, targets)
     assert torch.isfinite(result)
     assert result.item() >= 0.0  # CRPS should be non-negative
+
+
+def _vector_tensor_map(values, n_prop, properties_name):
+    """A single-block TensorMap with an xyz component axis."""
+    n_samples = values.shape[0]
+    samples = Labels(
+        names=["system", "atom"],
+        values=torch.stack(
+            [torch.zeros(n_samples, dtype=torch.int32), torch.arange(n_samples)], dim=1
+        ),
+    )
+    return TensorMap(
+        keys=Labels(names=["_"], values=torch.tensor([[0]])),
+        blocks=[
+            TensorBlock(
+                values=values,
+                samples=samples,
+                components=[
+                    Labels(names=["xyz"], values=torch.tensor([[0], [1], [2]]))
+                ],
+                properties=Labels.range(properties_name, n_prop),
+            )
+        ],
+    )
+
+
+def test_ensemble_loss_recovers_members_for_vector_target():
+    """Check the Gaussian NLL of a vector-target ensemble against an independently
+    computed reference: the ensemble axis must be recovered from the last dimension,
+    not the component dimension (which silently NaNs the loss)."""
+    name = "non_conservative_force"
+    n_samples, n_ens, n_prop = 4, 5, 1
+    torch.manual_seed(0)
+
+    members = torch.randn(n_samples, 3, n_ens, n_prop, dtype=torch.float64)
+    expected_mean = members.mean(dim=-2)
+    expected_var = members.var(dim=-2, unbiased=True)
+
+    ens_values = members.reshape(n_samples, 3, n_ens * n_prop)
+
+    predictions = {
+        name: _vector_tensor_map(expected_mean, n_prop, name),
+        f"mtt::aux::{name}_ensemble": _vector_tensor_map(
+            ens_values, n_ens * n_prop, "ensemble_member"
+        ),
+    }
+    targets = {name: _vector_tensor_map(torch.zeros_like(expected_mean), n_prop, name)}
+
+    loss = TensorMapGaussianNLLLoss(
+        name=name, gradient=None, weight=1.0, reduction="mean"
+    )
+    value = loss.compute(predictions, targets)
+
+    reference = torch.nn.GaussianNLLLoss(reduction="mean")(
+        expected_mean.reshape(-1),
+        torch.zeros_like(expected_mean).reshape(-1),
+        expected_var.reshape(-1),
+    )
+    assert torch.allclose(value, reference)
+
+
+def test_ensemble_loss_rejects_single_member():
+    """A single member makes the variance undefined; fail loudly instead of NaN."""
+    name = "non_conservative_force"
+    n_samples, n_prop = 4, 1
+    values = torch.randn(n_samples, 3, n_prop, dtype=torch.float64)
+
+    predictions = {
+        name: _vector_tensor_map(values, n_prop, name),
+        f"mtt::aux::{name}_ensemble": _vector_tensor_map(
+            values, n_prop, "ensemble_member"
+        ),
+    }
+    targets = {name: _vector_tensor_map(torch.zeros_like(values), n_prop, name)}
+
+    loss = TensorMapGaussianNLLLoss(
+        name=name, gradient=None, weight=1.0, reduction="mean"
+    )
+    message = (
+        f"Cannot compute an ensemble loss for '{name}' from 1 ensemble member(s): "
+        "the ensemble variance is undefined. Please check the "
+        "`num_ensemble_members` setting of the LLPR model."
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        loss.compute(predictions, targets)

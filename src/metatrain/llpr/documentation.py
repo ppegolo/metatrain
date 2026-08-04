@@ -1,12 +1,12 @@
-"""
+r"""
 LLPR
 ====
 
 The LLPR architecture is a "wrapper" architecture that enables cheap uncertainty
 quantification via the last-layer prediction rigidity (LLPR) approach proposed by Bigi
 et al:footcite:p:`bigi_mlst_2024`. It is compatible with the following ``metatrain``
-models constructed from NN-based architectures: :ref:`arch-pet` and
-:ref:`arch-soap_bpnn`.
+models constructed from NN-based architectures: :ref:`arch-pet`,
+:ref:`arch-soap_bpnn`, :ref:`arch-mace` and :ref:`arch-space`.
 
 This implementation further allows the user to perform gradient-based tuning of the
 ensemble weights sampled from the LLPR formalism, which can lead to improved uncertainty
@@ -14,6 +14,43 @@ estimates. Gradients (e.g. forces and stresses) are not yet used.
 
 Note that the uncertainties computed with this implementation are returned as standard
 deviations, and not variances.
+
+Targets that carry components, such as the vector target ``non_conservative_force``, are
+supported. For these, the uncertainty is returned per component: for a Cartesian vector
+target it is the standard deviation of a single Cartesian component, *not* of the
+vector's magnitude. When the wrapped model produces last-layer features without
+components (as is the case for :ref:`arch-pet`), the last layer holds one independent
+weight row per component, so the resulting uncertainty is identical for all components
+of a given sample.
+
+Targets made of several blocks, such as a spherical target with more than one
+``o3_lambda``, are supported as well. The uncertainty mirrors the target's layout: it
+has the same keys, components and properties, one block per target block. Each block
+gets its own calibration factor :math:`\alpha`, fitted against that block's residuals.
+
+Wrapped models with *equivariant* last-layer features (:ref:`arch-mace` and
+:ref:`arch-space`) resolve the uncertainty per component, and their sampled ensemble
+members are equivariant by construction.
+
+Ensembles are more demanding than uncertainties: they are sampled in the weight space
+of the last layer, so they require every block of the target to be read directly off
+the last-layer features. This holds for all of :ref:`arch-pet`'s blocks, for
+:ref:`arch-mace`'s and :ref:`arch-space`'s scalar and spherical targets, for
+:ref:`arch-space`'s rank-1 Cartesian targets, and among :ref:`arch-soap_bpnn`'s
+blocks only for the scalar and ``o3_lambda=0`` ones. Requesting ensembles for an
+unsupported target raises an error; its uncertainties remain available. Other cases:
+
+- ``mace_head_target`` (routed through a loaded MACE model's own readouts):
+  uncertainties are available, ensembles are refused.
+- :ref:`arch-space` rank-2 Cartesian targets: uncertainties are available, ensembles
+  are refused.
+- MACE targets requesting irreps absent from its hidden features, MACE Cartesian
+  targets, and MACE models using the optimized (cuequivariance) linear layers:
+  neither uncertainties nor ensembles are available.
+
+The wrapped model's per-property output scales (its ``scaler``) are applied to the
+uncertainties and to the spread of the ensembles, so that both live in the same units
+as the model's predictions and the calibration factors stay scale-free.
 
 Additional outputs
 ------------------
@@ -70,7 +107,8 @@ class TrainerHypers(TypedDict):
     If set to ``null``, the internal routine will determine the smallest regularizer
     value that guarantees numerical stability in matrix inversion. Having exposed the
     formula here, we also note to the user that the training routine of the LLPR
-    wrapper model finds the ideal global calibration factor :math:`\alpha`."""
+    wrapper model finds the ideal calibration factor :math:`\alpha`, one per block of
+    each target."""
 
     model_checkpoint: Optional[str] = None
     """This should provide the checkpoint to the model for which the
