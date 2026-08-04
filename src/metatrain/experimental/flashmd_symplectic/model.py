@@ -33,6 +33,7 @@ from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
 from metatrain.utils.data.target_info import get_energy_target_info
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.last_layer import declare_shared_last_layer_features
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
@@ -143,6 +144,8 @@ class FlashMDSymplectic(ModelInterface):
         self.edge_heads = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
+        self.last_layer_feature_sizes: Dict[str, Dict[str, int]] = {}
+        self.last_layer_feature_map: Dict[str, List[str]] = {}
         self.last_layer_feature_size = (
             self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
         )
@@ -1374,6 +1377,9 @@ class FlashMDSymplectic(ModelInterface):
 
         ll_features_name = get_last_layer_features_name(target_name)
         self.outputs[ll_features_name] = ModelOutput(sample_kind="atom")
+        declare_shared_last_layer_features(
+            self, target_name, target_info.layout.keys, self.last_layer_feature_size
+        )
         self.key_labels[target_name] = target_info.layout.keys
         self.component_labels[target_name] = [
             block.components for block in target_info.layout.blocks()
@@ -1394,6 +1400,8 @@ class FlashMDSymplectic(ModelInterface):
         self.output_shapes.pop(target_name, None)
         self.outputs.pop(target_name, None)
         self.outputs.pop(get_last_layer_features_name(target_name), None)
+        self.last_layer_feature_sizes.pop(target_name, None)
+        self.last_layer_feature_map.pop(target_name, None)
         # ``torch.nn.ModuleDict.pop`` has no ``default`` argument.
         if target_name in self.node_heads:
             del self.node_heads[target_name]

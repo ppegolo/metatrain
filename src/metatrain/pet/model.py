@@ -31,6 +31,7 @@ from metatrain.utils.data.atomic_basis_helpers import (
     sparsify_atomic_basis_target,
 )
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.last_layer import declare_shared_last_layer_features
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
@@ -141,7 +142,10 @@ class PET(ModelInterface[ModelHypers]):
         self.property_labels: Dict[str, List[Labels]] = {}
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.target_names: List[str] = []
-        self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
+        # for LLPR: target name -> block key -> last-layer parameter names
+        self.last_layer_parameter_names: Dict[str, Dict[str, List[str]]] = {}
+        self.last_layer_feature_sizes: Dict[str, Dict[str, int]] = {}
+        self.last_layer_feature_map: Dict[str, List[str]] = {}
         for target_name, target_info in train_dataset_info.targets.items():
             self.target_names.append(target_name)
             self._add_output(target_name, target_info)
@@ -1059,17 +1063,24 @@ class PET(ModelInterface[ModelHypers]):
         # The learnable heads and last layers live on the pure-PyTorch backend.
         self.backend.add_output(target_name, self.output_shapes[target_name])
 
-        # Register last-layer parameters, in the same order as they are returned as
-        # last-layer features in the model (the modules live on ``self.backend``).
-        self.last_layer_parameter_names[target_name] = []
-        for layer_index in range(self.num_readout_layers):
-            for key in self.output_shapes[target_name].keys():
-                self.last_layer_parameter_names[target_name].append(
+        # Register last-layer parameters, grouped by block and, within a block, in the
+        # same order as they are returned as last-layer features in the model (the
+        # modules live on ``self.backend``). LLPR concatenates the tensors of a block
+        # along the feature axis to recover that block's last layer.
+        self.last_layer_parameter_names[target_name] = {}
+        for key in self.output_shapes[target_name].keys():
+            names: List[str] = []
+            for layer_index in range(self.num_readout_layers):
+                names.append(
                     f"backend.node_last_layers.{target_name}.{layer_index}.{key}.weight"
                 )
-                self.last_layer_parameter_names[target_name].append(
+                names.append(
                     f"backend.edge_last_layers.{target_name}.{layer_index}.{key}.weight"
                 )
+            self.last_layer_parameter_names[target_name][key] = names
+        declare_shared_last_layer_features(
+            self, target_name, target_info.layout.keys, self.last_layer_feature_size
+        )
 
         ll_features_name = get_last_layer_features_name(target_name)
         self.outputs[ll_features_name] = ModelOutput(
@@ -1097,6 +1108,8 @@ class PET(ModelInterface[ModelHypers]):
         self.outputs.pop(get_last_layer_features_name(target_name), None)
         self.backend.remove_output(target_name)
         self.last_layer_parameter_names.pop(target_name, None)
+        self.last_layer_feature_sizes.pop(target_name, None)
+        self.last_layer_feature_map.pop(target_name, None)
         self.key_labels.pop(target_name, None)
         self.component_labels.pop(target_name, None)
         self.property_labels.pop(target_name, None)
