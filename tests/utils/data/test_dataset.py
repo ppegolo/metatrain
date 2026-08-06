@@ -910,6 +910,46 @@ def test_memmap_extra_data_property_name_from_key(tmp_path):
     assert prop_name == "charge"
 
 
+def test_memmap_variant_target_property_name(tmp_path):
+    """Variant target names ("name/variant") strip the variant in the
+    properties label, matching ``get_generic_target_info``."""
+    target_options, _ = _write_minimal_memmap(tmp_path)
+    np.zeros((3, 3, 1), dtype="float32").tofile(tmp_path / "f.bin")
+
+    target_options["non_conservative_forces/r2scan"] = {
+        "key": "f",
+        "sample_kind": "atom",
+        "num_subtargets": 1,
+        "type": {"cartesian": {"rank": 1}},
+        "quantity": "force",
+    }
+    dataset = MemmapDataset(tmp_path, target_options)
+
+    tm = dataset[0]._asdict()["non_conservative_forces/r2scan"]
+    assert tm.block().properties.names[0] == "non_conservative_forces"
+
+
+def test_memmap_extra_data_variant_property_name(tmp_path):
+    """Variant extra_data names ("name/variant") strip the variant in the
+    properties label, like targets do."""
+    target_options, _ = _write_minimal_memmap(tmp_path)
+    np.array([1.0, 2.0, 3.0], dtype="float32").tofile(tmp_path / "charge.bin")
+
+    extra_data_options = {
+        "charge/pbe": {
+            "key": "charge",
+            "type": "scalar",
+            "sample_kind": "system",
+            "num_subtargets": 1,
+            "quantity": "",
+        },
+    }
+    dataset = MemmapDataset(tmp_path, target_options, extra_data_options)
+
+    tm = dataset[0]._asdict()["charge/pbe"]
+    assert tm.block().properties.names[0] == "charge"
+
+
 def test_memmap_extra_data_no_options_empty(tmp_path):
     """MemmapDataset without extra_data_options has no extra fields in sample."""
     target_options, _ = _write_minimal_memmap(tmp_path)

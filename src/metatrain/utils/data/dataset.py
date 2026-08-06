@@ -1555,7 +1555,13 @@ class MemmapDataset(TorchDataset):
                 samples=samples,
                 components=components,
                 properties=Labels.range(
-                    "energy" if is_energy else target_key.replace("mtt::", ""),
+                    # same property naming as get_generic_target_info: remove
+                    # variant and/or mtt:: prefix from the target name
+                    "energy"
+                    if is_energy
+                    else (
+                        target_key.split("/")[0] if "/" in target_key else target_key
+                    ).replace("mtt::", ""),
                     target_array.shape[-1],
                 ),
             )
@@ -1637,7 +1643,11 @@ class MemmapDataset(TorchDataset):
                         samples=extra_samples,
                         components=[],
                         properties=Labels.range(
-                            key.replace("mtt::", ""), arr.shape[-1]
+                            # same naming as targets: strip variant/mtt:: prefix
+                            (key.split("/")[0] if "/" in key else key).replace(
+                                "mtt::", ""
+                            ),
+                            arr.shape[-1],
                         ),
                     )
                 ],
