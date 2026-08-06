@@ -1182,3 +1182,82 @@ def test_multipole_metric_assembles_and_is_invariant_to_conserving_errors():
     delta[ao_loc[first_s]] = 1.0
     assert torch.allclose(v1 @ delta, torch.zeros(v1.shape[0], dtype=torch.float64))
     assert torch.allclose(v2 @ delta, torch.zeros(v2.shape[0], dtype=torch.float64))
+
+
+def test_surface_points_are_accessible_and_area_weighted():
+    # Every point must sit on its own atom's scaled vdW sphere and outside all
+    # others (that is what "accessible" means — cavity walls survive, buried
+    # area is culled), and the weights must sum to at most the total sphere
+    # area, with equality only if nothing is buried.
+    import numpy as np
+    from pyscf.data import radii
+
+    from metatrain.utils.pyscf_loss import (
+        ESP_POINTS_PER_ATOM,
+        compute_surface_points,
+    )
+
+    system = _system()
+    scale = 1.4
+    coords, weights = compute_surface_points(system, AUX_BASIS, scale)
+    mol = build_auxiliary_molecule(system, AUX_BASIS)
+    centres = mol.atom_coords()
+    spheres = scale * radii.VDW[mol.atom_charges()]
+
+    distances = np.linalg.norm(coords.numpy()[:, None, :] - centres[None, :, :], axis=2)
+    on_own_sphere = np.isclose(distances, spheres[None, :]).any(axis=1)
+    assert on_own_sphere.all()
+    assert (distances >= spheres[None, :] - 1e-10).all()
+
+    total_area = 4.0 * np.pi * (spheres**2).sum()
+    assert 0.0 < weights.sum() < total_area  # methane-like: some burial
+    assert len(coords) < mol.natm * ESP_POINTS_PER_ATOM
+
+
+def test_esp_metric_matches_the_far_field_of_the_charge_vector():
+    # The potential of the fitted density far away must reduce to (total
+    # charge)/distance: the ESP integrals evaluated at one distant point must
+    # equal the charge vector divided by the distance, which pins both the
+    # int2c2e usage and the unit conventions at once.
+    import numpy as np
+
+    from metatrain.utils.pyscf_loss import compute_charge_vector
+
+    pyscf_gto = pyscf.gto
+
+    system = _system()
+    mol = build_auxiliary_molecule(system, AUX_BASIS)
+    far = np.array([[150.0, 40.0, -80.0]])  # Bohr, far outside the molecule
+    fakemol = pyscf_gto.fakemol_for_charges(far)
+    integrals = pyscf_gto.mole.intor_cross("int2c2e", mol, fakemol)[:, 0]
+
+    s_vector = compute_charge_vector(system, AUX_BASIS).numpy()
+    distances = np.linalg.norm(mol.atom_coords() - far[0], axis=1)
+    # each aux function's potential ~ its own moment over its atom's distance;
+    # keep only the monopole scale by comparing against s_vector / distance
+    ao_atom = np.repeat(
+        [mol.bas_atom(shell) for shell in range(mol.nbas)],
+        [mol.ao_loc_nr()[i + 1] - mol.ao_loc_nr()[i] for i in range(mol.nbas)],
+    )
+    expected = s_vector / distances[ao_atom]
+    # s functions have zero dipole by parity, so their far potential is the
+    # monopole term up to ~quadrupole/r^3; other functions carry no monopole
+    # and only l>=1 tails, decaying at least one power of r faster.
+    is_s = s_vector != 0.0
+    np.testing.assert_allclose(integrals[is_s], expected[is_s], rtol=1e-3)
+    assert np.abs(integrals[~is_s]).max() < np.abs(integrals[is_s]).min()
+
+
+def test_esp_metric_assembles_on_top_of_the_base():
+    from metatrain.utils.pyscf_loss import compute_esp_metric, make_metric_spec
+
+    system = _system()
+    spec = make_metric_spec("overlap", esp_weight=3.0, esp_shell=1.6)
+    expected = compute_metric_matrix(
+        system, AUX_BASIS, "overlap"
+    ) + 3.0 * compute_esp_metric(system, AUX_BASIS, 1.6)
+    torch.testing.assert_close(compute_metric_matrix(system, AUX_BASIS, spec), expected)
+
+    metric = compute_esp_metric(system, AUX_BASIS, 1.6)
+    eigenvalues = torch.linalg.eigvalsh(metric)
+    assert eigenvalues.min() > -1e-8  # positive semi-definite by construction

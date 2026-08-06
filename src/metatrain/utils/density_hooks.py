@@ -133,6 +133,8 @@ def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
             spec.get("charge_weight", 0.0),
             spec.get("dipole_weight", 0.0),
             spec.get("quadrupole_weight", 0.0),
+            spec.get("esp_weight", 0.0),
+            spec.get("esp_shell"),
         )
         grouped.setdefault(metric, {})[target_name] = spec["aux_basis"]
     return grouped

@@ -32,19 +32,27 @@ def test_spec_round_trips_and_keeps_plain_metrics_unchanged():
     assert metric_matrix_name("mtt::ri", "coulomb") == coulomb_matrix_name("mtt::ri")
 
     spec = make_metric_spec("coulomb", omega=0.15, eps=0.01, charge_weight=2.0)
-    assert parse_metric_spec(spec) == ("coulomb", 0.15, 0.01, 2.0, 0.0, 0.0)
+    assert parse_metric_spec(spec) == ("coulomb", 0.15, 0.01, 2.0, 0.0, 0.0, 0.0, 1.4)
 
     # multipole terms round-trip, and their absence keeps pre-existing spec
     # strings (= extra_data and cache keys) byte-identical
     full = make_metric_spec(
         "overlap", charge_weight=1.0, dipole_weight=2.0, quadrupole_weight=3.0
     )
-    assert parse_metric_spec(full) == ("overlap", 0.0, 0.01, 1.0, 2.0, 3.0)
+    assert parse_metric_spec(full) == ("overlap", 0.0, 0.01, 1.0, 2.0, 3.0, 0.0, 1.4)
     assert "d=" not in spec and "Q=" not in spec
     assert (
         make_metric_spec("overlap", dipole_weight=0.5)
         == "overlap|omega=0|eps=0.01|q=0|d=0.5"
     )
+
+    esp = make_metric_spec("overlap", esp_weight=2.0)
+    assert parse_metric_spec(esp)[6:] == (2.0, 1.4)  # default shell
+    shell = parse_metric_spec(
+        make_metric_spec("overlap", esp_weight=2.0, esp_shell=1.8)
+    )
+    assert shell[7] == 1.8
+    assert "esp=" not in make_metric_spec("overlap", dipole_weight=0.5)
 
     # omega without an explicit eps must keep a positive-definite floor: the
     # long-range metric alone is rank-deficient
@@ -74,6 +82,10 @@ def test_spec_rejects_invalid_combinations():
         make_metric_spec("coulomb", dipole_weight=-1.0)
     with pytest.raises(ValueError, match="quadrupole_weight must be"):
         make_metric_spec("coulomb", quadrupole_weight=-1.0)
+    with pytest.raises(ValueError, match="esp_weight must be"):
+        make_metric_spec("coulomb", esp_weight=-1.0)
+    with pytest.raises(ValueError, match="esp_shell must be"):
+        make_metric_spec("coulomb", esp_weight=1.0, esp_shell=0.0)
 
 
 def _ri_tensor_map(value_l0: float, values_l1: list) -> TensorMap:

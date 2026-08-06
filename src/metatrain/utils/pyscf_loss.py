@@ -146,6 +146,15 @@ METRICS = ("overlap", "coulomb")
 DEFAULT_LR_EPS = 0.01
 
 
+#: Default scaling of the van der Waals radii for the ESP surface shell.
+DEFAULT_ESP_SHELL = 1.4
+
+#: Points per atomic sphere before burial culling, for the ESP surface. A
+#: module constant rather than a spec option: it sets discretisation accuracy,
+#: not physics, so it should not fragment the cache key space.
+ESP_POINTS_PER_ATOM = 50
+
+
 def make_metric_spec(
     metric: str,
     omega: float = 0.0,
@@ -153,6 +162,8 @@ def make_metric_spec(
     charge_weight: float = 0.0,
     dipole_weight: float = 0.0,
     quadrupole_weight: float = 0.0,
+    esp_weight: float = 0.0,
+    esp_shell: Optional[float] = None,
 ) -> str:
     """Build the canonical metric-spec string shared by the loss and the transform.
 
@@ -174,6 +185,12 @@ def make_metric_spec(
     :param dipole_weight: Weight on the distributed (per-atom) dipole penalty,
         which adds ``w * sum_a |dQ_a^{l=1}|**2`` to the loss. ``0`` disables it.
     :param quadrupole_weight: The same for the per-atom quadrupoles (l=2).
+    :param esp_weight: Weight on the surface-ESP penalty, an area-weighted sum
+        of ``|dV(r_g)|**2`` over an accessible-surface grid (see
+        :py:func:`compute_surface_points`). ``0`` disables it.
+    :param esp_shell: Scaling of the van der Waals radii defining that surface.
+        ``None`` uses :py:data:`DEFAULT_ESP_SHELL`. Ignored when
+        ``esp_weight == 0``.
     :return: Canonical spec string.
     """
     if metric not in METRICS:
@@ -184,6 +201,7 @@ def make_metric_spec(
         ("charge_weight", charge_weight),
         ("dipole_weight", dipole_weight),
         ("quadrupole_weight", quadrupole_weight),
+        ("esp_weight", esp_weight),
     ):
         if weight < 0.0:
             raise ValueError(f"{weight_name} must be >= 0, got {weight}.")
@@ -193,7 +211,7 @@ def make_metric_spec(
             f"got metric='{metric}' with omega={omega}."
         )
     if omega == 0.0 and charge_weight == 0.0:
-        if dipole_weight == 0.0 and quadrupole_weight == 0.0:
+        if dipole_weight == 0.0 and quadrupole_weight == 0.0 and esp_weight == 0.0:
             return metric
     resolved_eps = DEFAULT_LR_EPS if eps is None else float(eps)
     if resolved_eps < 0.0:
@@ -208,22 +226,29 @@ def make_metric_spec(
         spec += f"|d={float(dipole_weight):.10g}"
     if quadrupole_weight > 0.0:
         spec += f"|Q={float(quadrupole_weight):.10g}"
+    if esp_weight > 0.0:
+        resolved_shell = DEFAULT_ESP_SHELL if esp_shell is None else float(esp_shell)
+        if resolved_shell <= 0.0:
+            raise ValueError(f"esp_shell must be > 0, got {resolved_shell}.")
+        spec += f"|esp={float(esp_weight):.10g}|shell={resolved_shell:.10g}"
     return spec
 
 
-def parse_metric_spec(spec: str) -> Tuple[str, float, float, float, float, float]:
+def parse_metric_spec(
+    spec: str,
+) -> Tuple[str, float, float, float, float, float, float, float]:
     """Invert :py:func:`make_metric_spec`.
 
     :param spec: Canonical spec string.
     :return: ``(metric, omega, eps, charge_weight, dipole_weight,
-        quadrupole_weight)``.
+        quadrupole_weight, esp_weight, esp_shell)``.
     """
     if "|" not in spec:
         if spec not in METRICS:
             raise ValueError(
                 f"unknown metric {spec!r}; expected 'overlap' or 'coulomb'."
             )
-        return spec, 0.0, 0.0, 0.0, 0.0, 0.0
+        return spec, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, DEFAULT_ESP_SHELL
     metric, *parts = spec.split("|")
     values = dict(part.split("=") for part in parts)
     return (
@@ -233,6 +258,8 @@ def parse_metric_spec(spec: str) -> Tuple[str, float, float, float, float, float
         float(values["q"]),
         float(values.get("d", 0.0)),
         float(values.get("Q", 0.0)),
+        float(values.get("esp", 0.0)),
+        float(values.get("shell", DEFAULT_ESP_SHELL)),
     )
 
 
@@ -470,6 +497,104 @@ def compute_multipole_vectors(
     return torch.from_numpy(vectors).to(torch.float64)
 
 
+def compute_surface_points(
+    system: System, aux_basis: str, shell_scale: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build an accessible-surface point grid with area weights.
+
+    Each atom gets a Fibonacci sphere of :py:data:`ESP_POINTS_PER_ATOM` points
+    at ``shell_scale`` times its van der Waals radius; points buried inside any
+    other atom's scaled sphere are culled. This is algorithmic — no per-system
+    region choices — and traces cavity and pocket walls by construction, since
+    that is what "accessible" means. Each point carries its share of its
+    sphere's area, so the ESP penalty approximates a surface integral.
+
+    The sphere orientations are fixed in space, so the grid is *not* exactly
+    equivariant under rotations of the system (discretisation-level anisotropy
+    only). That is harmless here: metrics are built on the unaugmented geometry
+    and the losses evaluate in that same frame.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"`` (used
+        only to build the molecule, i.e. for the atomic numbers/positions).
+    :param shell_scale: Scaling of the van der Waals radii.
+    :return: ``(coords, weights)``: points in Bohr, shape ``(n, 3)``, and their
+        area weights in Bohr^2, shape ``(n,)``, both float64.
+    """
+    import numpy as np
+
+    radii = importlib.import_module("pyscf.data.radii")
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    centres = auxmol.atom_coords()  # Bohr
+    charges = auxmol.atom_charges()
+    sphere_radii = shell_scale * radii.VDW[charges]
+
+    n = ESP_POINTS_PER_ATOM
+    # Fibonacci sphere: near-uniform, deterministic.
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - (2.0 * np.arange(n) + 1.0) / n
+    rho = np.sqrt(1.0 - z * z)
+    phi = golden * np.arange(n)
+    unit = np.stack([rho * np.cos(phi), rho * np.sin(phi), z], axis=1)
+
+    coords, weights = [], []
+    for atom in range(auxmol.natm):
+        points = centres[atom] + sphere_radii[atom] * unit
+        buried = np.zeros(n, dtype=bool)
+        for other in range(auxmol.natm):
+            if other == atom:
+                continue
+            distances = np.linalg.norm(points - centres[other], axis=1)
+            buried |= distances < sphere_radii[other]
+        kept = points[~buried]
+        coords.append(kept)
+        area_per_point = 4.0 * np.pi * sphere_radii[atom] ** 2 / n
+        weights.append(np.full(len(kept), area_per_point))
+    coords = np.concatenate(coords)
+    weights = np.concatenate(weights)
+    return (
+        torch.from_numpy(coords).to(torch.float64),
+        torch.from_numpy(weights).to(torch.float64),
+    )
+
+
+def compute_esp_metric(
+    system: System, aux_basis: str, shell_scale: float
+) -> torch.Tensor:
+    """
+    Compute the surface-ESP quadratic form ``A W A^T``.
+
+    ``A[i, g] = int chi_i(r) / |r - r_g| dr`` is the electrostatic potential of
+    aux function ``i`` at surface point ``g`` (evaluated as two-centre Coulomb
+    integrals against delta-like charges), and ``W`` holds the points' area
+    weights, so ``dc^T (A W A^T) dc`` is the area-weighted sum of the squared
+    ESP error of the fitted density over the accessible surface.
+
+    The rank is at most the number of surface points, far below ``naux``: like
+    the long-range metric, this term needs the base metric as a
+    positive-definite floor.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param shell_scale: Scaling of the van der Waals radii for the surface.
+    :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    coords, weights = compute_surface_points(system, aux_basis, shell_scale)
+    fakemol = gto.fakemol_for_charges(coords.numpy())
+    integrals = gto.mole.intor_cross("int2c2e", auxmol, fakemol)  # (naux, n)
+    weighted = integrals * weights.numpy()[None, :]
+    return torch.from_numpy(np.ascontiguousarray(weighted @ integrals.T)).to(
+        torch.float64
+    )
+
+
 def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.Tensor:
     """
     Compute a two-centre metric matrix of the auxiliary basis for one system.
@@ -481,22 +606,32 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
         M = M + charge_weight * S_vec S_vec^T
         M = M + dipole_weight * V_1^T V_1
         M = M + quadrupole_weight * V_2^T V_2
+        M = M + esp_weight * A W A^T
 
     The charge term is rank-1 and contributes ``charge_weight * (S_vec . dc)**2``
     to the loss, i.e. a penalty on the predicted density's electron-count error
     relative to the RI reference. The multipole terms (``V_l`` from
     :py:func:`compute_multipole_vectors`) penalise the error in each atom's
     distributed multipole of order ``l``, which is what determines the
-    electrostatic potential outside the charge distribution.
+    electrostatic potential outside the charge distribution. The ESP term
+    (:py:func:`compute_esp_metric`) penalises the potential error directly on
+    an accessible-surface grid.
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
     :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
     """
-    base, omega, eps, charge_weight, dipole_weight, quadrupole_weight = (
-        parse_metric_spec(metric)
-    )
+    (
+        base,
+        omega,
+        eps,
+        charge_weight,
+        dipole_weight,
+        quadrupole_weight,
+        esp_weight,
+        esp_shell,
+    ) = parse_metric_spec(metric)
 
     if omega > 0.0:
         matrix = compute_long_range_coulomb_matrix(system, aux_basis, omega)
@@ -515,6 +650,9 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
         if weight > 0.0:
             vectors = compute_multipole_vectors(system, aux_basis, angular)
             matrix = matrix + weight * (vectors.T @ vectors)
+
+    if esp_weight > 0.0:
+        matrix = matrix + esp_weight * compute_esp_metric(system, aux_basis, esp_shell)
 
     return matrix
 

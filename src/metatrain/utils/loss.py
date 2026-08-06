@@ -562,6 +562,11 @@ class _DensityLoss(LossInterface):
       each atom's distributed multipole of that order, which is what determines
       the electrostatic potential outside the charge distribution — content the
       pointwise metrics underweight.
+    - ``esp_weight > 0`` penalises the electrostatic-potential error directly,
+      as an area-weighted integral over an automatically constructed
+      accessible-surface grid (``esp_shell`` times the van der Waals radii),
+      which traces cavity and pocket walls without any per-system region
+      choices.
 
     :param name: key of the coefficient target.
     :param gradient: not supported; must be ``None``.
@@ -580,6 +585,10 @@ class _DensityLoss(LossInterface):
     :param dipole_weight: weight on the per-atom dipole penalty; ``0`` disables it.
     :param quadrupole_weight: weight on the per-atom quadrupole penalty; ``0``
         disables it.
+    :param esp_weight: weight on the accessible-surface ESP penalty; ``0``
+        disables it.
+    :param esp_shell: van der Waals scaling of the ESP surface; ``None`` uses
+        the package default. Ignored when ``esp_weight == 0``.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -600,6 +609,8 @@ class _DensityLoss(LossInterface):
         charge_weight: float = 0.0,
         dipole_weight: float = 0.0,
         quadrupole_weight: float = 0.0,
+        esp_weight: float = 0.0,
+        esp_shell: Optional[float] = None,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -617,7 +628,14 @@ class _DensityLoss(LossInterface):
         # extra_data key: any divergence between the two sides would lose the
         # matrix this loss asks for.
         self.metric = make_metric_spec(
-            metric, omega, eps, charge_weight, dipole_weight, quadrupole_weight
+            metric,
+            omega,
+            eps,
+            charge_weight,
+            dipole_weight,
+            quadrupole_weight,
+            esp_weight,
+            esp_shell,
         )
         self.aux_basis = aux_basis
 
