@@ -649,7 +649,17 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
     for weight, angular in ((dipole_weight, 1), (quadrupole_weight, 2)):
         if weight > 0.0:
             vectors = compute_multipole_vectors(system, aux_basis, angular)
-            matrix = matrix + weight * (vectors.T @ vectors)
+            # V^T V, but per row: V is block-sparse (a row touches only the
+            # matching-l functions of one atom), so the dense gemm would waste
+            # naux^2 * n_rows flops — minutes per large system inside a
+            # single-threaded dataloader worker — on multiplying zeros.
+            for row in vectors:
+                nonzero = torch.nonzero(row).flatten()
+                if len(nonzero):
+                    values = row[nonzero]
+                    matrix[nonzero[:, None], nonzero] += weight * torch.outer(
+                        values, values
+                    )
 
     if esp_weight > 0.0:
         matrix = matrix + esp_weight * compute_esp_metric(system, aux_basis, esp_shell)
