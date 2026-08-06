@@ -757,11 +757,14 @@ def train_model(
         # Copy checkpoint and exported model to the requested path,
         # with checks to make sure that the requested path is not the path
         # where the files already are (copy would raise a SameFileError)
-        checkpoint_output_path = checkpoint_dir / output
+        # Only the file names are joined onto ``checkpoint_dir``: ``output`` may
+        # itself contain directories (e.g. ``-o outputs/model.pt``), which would
+        # otherwise point at a non-existent subdirectory of ``checkpoint_dir``.
+        checkpoint_output_path = checkpoint_dir / output.name
         if checkpoint_output_path.resolve() != output.resolve():
             shutil.copy(output, checkpoint_output_path)
         if checkpoint_output.exists():
-            checkpoint_copy_path = checkpoint_dir / checkpoint_output
+            checkpoint_copy_path = checkpoint_dir / checkpoint_output.name
             if checkpoint_copy_path.resolve() != checkpoint_output.resolve():
                 shutil.copy(checkpoint_output, checkpoint_copy_path)
 
