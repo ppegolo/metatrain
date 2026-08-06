@@ -16,6 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
 from metatrain.utils.pyscf_loss import (
+    esp_factor_name,
     make_metric_spec,
     metric_matrix_name,
     ri_density_fit_constant_name,
@@ -638,6 +639,10 @@ class _DensityLoss(LossInterface):
             esp_shell,
         )
         self.aux_basis = aux_basis
+        # Applied by the loss itself: the ESP term travels as a factor rather
+        # than folded into the metric matrix (see
+        # metatrain.utils.pyscf_loss.compute_esp_factor).
+        self.esp_weight = float(esp_weight)
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
         if extra_data is None or key not in extra_data:
@@ -791,14 +796,24 @@ class DensityMSELossViaC(_DensityLoss):
         # is the transformation this quadratic form actually is. The contraction is
         # bandwidth-bound on streaming M, so the arrangement matters less than not
         # streaming padding along with it.
-        return self._reduce(
-            torch.stack(
-                [
-                    _quadratic_form(delta, matrix)
-                    for delta, matrix in zip(deltas, matrices, strict=True)
-                ]
+        per_system = [
+            _quadratic_form(delta, matrix)
+            for delta, matrix in zip(deltas, matrices, strict=True)
+        ]
+        if self.esp_weight > 0.0:
+            # The ESP term is factored: |F dc|^2 per system, with the weight
+            # applied here so cached factors are shared across weight settings.
+            packed = self._require(
+                extra_data, esp_factor_name(self.target, self.metric)
             )
-        )
+            factors = unpack_metric_matrices(packed)
+            per_system = [
+                value + self.esp_weight * torch.mv(factor, delta).square().sum()
+                for value, delta, factor in zip(
+                    per_system, deltas, factors, strict=True
+                )
+            ]
+        return self._reduce(torch.stack(per_system))
 
 
 class DensityMSELossViaW(_DensityLoss):

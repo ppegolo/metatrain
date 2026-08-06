@@ -1261,3 +1261,45 @@ def test_esp_metric_assembles_on_top_of_the_base():
     metric = compute_esp_metric(system, AUX_BASIS, 1.6)
     eigenvalues = torch.linalg.eigvalsh(metric)
     assert eigenvalues.min() > -1e-8  # positive semi-definite by construction
+
+
+def test_esp_factored_loss_matches_the_dense_metric():
+    # The pipeline ships the ESP term as a factor and the loss applies it
+    # itself; the result must equal the quadratic form of the fully assembled
+    # dense metric (the standalone compute_metric_matrix path).
+    from metatrain.utils.pyscf_loss import (
+        _metric_matrices_transform,
+        make_metric_spec,
+    )
+
+    system = _system()
+    pred = _random_target(system, 0)
+    targ = _random_target(system, 1)
+    spec = make_metric_spec("overlap", esp_weight=2.0, esp_shell=1.6)
+
+    loss = DensityMSELossViaC(
+        TARGET,
+        None,
+        weight=1.0,
+        reduction="sum",
+        metric="overlap",
+        aux_basis=AUX_BASIS,
+        esp_weight=2.0,
+        esp_shell=1.6,
+    )
+    assert loss.metric == spec
+    extra: dict = {}
+    _metric_matrices_transform({TARGET: AUX_BASIS}, spec, [system], {}, extra)
+    value = float(loss.compute({TARGET: pred}, {TARGET: targ}, extra))
+
+    delta, _ = _flatten_to_pyscf_order(pred, targ)
+    dense = compute_metric_matrix(system, AUX_BASIS, spec)
+    expected = float(delta @ (dense @ delta))
+    assert value == pytest.approx(expected)
+
+    # the factor is required: extra data without it must fail loudly
+    stripped = {
+        key: val for key, val in extra.items() if not key.endswith("_esp_factor")
+    }
+    with pytest.raises(RuntimeError, match="esp_factor"):
+        loss.compute({TARGET: pred}, {TARGET: targ}, stripped)

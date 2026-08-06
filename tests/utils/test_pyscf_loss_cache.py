@@ -106,3 +106,30 @@ def test_transform_recomputes_without_system_ids(counted_compute):
         {"mtt::density": "some-basis"}, "overlap", systems, {}, {}
     )
     assert len(counted_compute) == 2
+
+
+def test_transform_caches_esp_factors(monkeypatch, counted_compute):
+    # The ESP factor must be cached like the metric matrices, keyed without
+    # the weight (which the loss applies), and attached under its own key.
+    calls = []
+
+    def fake_factor(system, aux_basis, shell):
+        calls.append(shell)
+        return torch.ones((2, len(system)), dtype=torch.float64)
+
+    monkeypatch.setattr(pyscf_loss, "compute_esp_factor", fake_factor)
+    spec = pyscf_loss.make_metric_spec("overlap", esp_weight=1.0)
+    systems = [_system(2)]
+    extra = {"mtt::aux::system_index": _system_index([3])}
+
+    _, _, extra = pyscf_loss._metric_matrices_transform(
+        {"mtt::density": "some-basis"}, spec, systems, {}, extra
+    )
+    assert pyscf_loss.esp_factor_name("mtt::density", spec) in extra
+    # the dense matrix carries only the base terms, stored under the full key
+    assert pyscf_loss.metric_matrix_name("mtt::density", spec) in extra
+
+    pyscf_loss._metric_matrices_transform(
+        {"mtt::density": "some-basis"}, spec, systems, {}, dict(extra)
+    )
+    assert len(calls) == 1  # second pass served from the cache

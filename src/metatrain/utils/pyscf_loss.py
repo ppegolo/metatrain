@@ -301,6 +301,16 @@ def metric_matrix_name(target_name: str, metric: str) -> str:
     return f"{target_name}_metric_{suffix}"
 
 
+def esp_factor_name(target_name: str, metric: str) -> str:
+    """Return the ``extra_data`` key for a target's surface-ESP factors.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
+    :return: The ``extra_data`` key.
+    """
+    return f"{metric_matrix_name(target_name, metric)}_esp_factor"
+
+
 def ri_projections_name(target_name: str) -> str:
     """Return the ``extra_data`` key for a target's projections ``w = M c_ref``.
 
@@ -560,17 +570,50 @@ def compute_surface_points(
     )
 
 
-def compute_esp_metric(
+def compute_esp_factor(
     system: System, aux_basis: str, shell_scale: float
 ) -> torch.Tensor:
     """
-    Compute the surface-ESP quadratic form ``A W A^T``.
+    Compute the surface-ESP factor ``F = W^(1/2) A^T``.
 
     ``A[i, g] = int chi_i(r) / |r - r_g| dr`` is the electrostatic potential of
     aux function ``i`` at surface point ``g`` (evaluated as two-centre Coulomb
     integrals against delta-like charges), and ``W`` holds the points' area
-    weights, so ``dc^T (A W A^T) dc`` is the area-weighted sum of the squared
-    ESP error of the fitted density over the accessible surface.
+    weights, so ``|F dc|**2`` is the area-weighted sum of the squared ESP error
+    of the fitted density over the accessible surface.
+
+    The ESP term is carried as this factor rather than folded into the dense
+    metric: forming ``A W A^T`` costs ``naux^2 * n_points`` flops per system —
+    minutes per large system inside a single-threaded dataloader worker — while
+    the factor needs only the integrals, and the loss-side ``F dc`` product is
+    no more expensive than the quadratic form it supplements.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param shell_scale: Scaling of the van der Waals radii for the surface.
+    :return: Dense ``(n_points, n_basis)`` matrix in PySCF AO order, float64.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    coords, weights = compute_surface_points(system, aux_basis, shell_scale)
+    fakemol = gto.fakemol_for_charges(coords.numpy())
+    integrals = gto.mole.intor_cross("int2c2e", auxmol, fakemol)  # (naux, n)
+    factor = np.sqrt(weights.numpy())[:, None] * integrals.T
+    return torch.from_numpy(np.ascontiguousarray(factor)).to(torch.float64)
+
+
+def compute_esp_metric(
+    system: System, aux_basis: str, shell_scale: float
+) -> torch.Tensor:
+    """
+    Compute the surface-ESP quadratic form ``A W A^T = F^T F``.
+
+    Reference implementation for the standalone
+    :py:func:`compute_metric_matrix` API and for tests; the training pipeline
+    carries :py:func:`compute_esp_factor` instead and never forms this matrix.
 
     The rank is at most the number of surface points, far below ``naux``: like
     the long-range metric, this term needs the base metric as a
@@ -581,18 +624,26 @@ def compute_esp_metric(
     :param shell_scale: Scaling of the van der Waals radii for the surface.
     :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
     """
-    import numpy as np
+    factor = compute_esp_factor(system, aux_basis, shell_scale)
+    return factor.T @ factor
 
-    gto, _ = _import_pyscf()
 
-    auxmol = build_auxiliary_molecule(system, aux_basis)
-    coords, weights = compute_surface_points(system, aux_basis, shell_scale)
-    fakemol = gto.fakemol_for_charges(coords.numpy())
-    integrals = gto.mole.intor_cross("int2c2e", auxmol, fakemol)  # (naux, n)
-    weighted = integrals * weights.numpy()[None, :]
-    return torch.from_numpy(np.ascontiguousarray(weighted @ integrals.T)).to(
-        torch.float64
+def strip_esp_from_spec(spec: str) -> Tuple[str, float, float]:
+    """
+    Split a metric spec into its dense part and its factored ESP part.
+
+    :param spec: Metric spec, as built by :py:func:`make_metric_spec`.
+    :return: ``(base_spec, esp_weight, esp_shell)``: the spec with the ESP term
+        removed (everything that lives in the dense metric matrix), and the ESP
+        parameters carried separately.
+    """
+    metric, omega, eps, charge, dipole, quadrupole, esp_weight, esp_shell = (
+        parse_metric_spec(spec)
     )
+    base_spec = make_metric_spec(
+        metric, omega, eps if omega > 0.0 else None, charge, dipole, quadrupole
+    )
+    return base_spec, esp_weight, esp_shell
 
 
 def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.Tensor:
@@ -615,7 +666,11 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
     distributed multipole of order ``l``, which is what determines the
     electrostatic potential outside the charge distribution. The ESP term
     (:py:func:`compute_esp_metric`) penalises the potential error directly on
-    an accessible-surface grid.
+    an accessible-surface grid. (The training pipeline does not fold the ESP
+    term into the matrix: the collate transform ships
+    :py:func:`compute_esp_factor` separately and the loss adds
+    ``esp_weight * |F dc|**2`` itself, avoiding the ``naux^2 * n_points``
+    assembly cost. This function assembles everything for standalone use.)
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
@@ -682,8 +737,9 @@ def pack_metric_matrices(matrices: List[torch.Tensor]) -> TensorMap:
     transport, and can exhaust host memory outright. A TensorMap is already a
     collection of differently shaped blocks, so this needs no special transport.
 
-    :param matrices: One dense square matrix per system.
-    :return: TensorMap keyed by ``system``, block ``i`` holding ``(n_i, n_i)``.
+    :param matrices: One dense matrix per system — square for metric matrices,
+        rectangular for factors such as the surface-ESP one.
+    :return: TensorMap keyed by ``system``, block ``i`` holding the matrix.
     """
     if len(matrices) == 0:
         raise ValueError("expected at least one metric matrix to pack")
@@ -691,7 +747,8 @@ def pack_metric_matrices(matrices: List[torch.Tensor]) -> TensorMap:
     device = matrices[0].device
     blocks = []
     for i_system, matrix in enumerate(matrices):
-        basis = torch.arange(matrix.shape[0], dtype=torch.int32, device=device)
+        rows = torch.arange(matrix.shape[0], dtype=torch.int32, device=device)
+        columns = torch.arange(matrix.shape[1], dtype=torch.int32, device=device)
         blocks.append(
             TensorBlock(
                 values=matrix,
@@ -702,12 +759,10 @@ def pack_metric_matrices(matrices: List[torch.Tensor]) -> TensorMap:
                 # on the unaugmented geometry, before augmentation runs.
                 samples=Labels(
                     names=["system", "basis"],
-                    values=torch.stack(
-                        [torch.full_like(basis, i_system), basis], dim=1
-                    ),
+                    values=torch.stack([torch.full_like(rows, i_system), rows], dim=1),
                 ),
                 components=[],
-                properties=Labels(names=["basis_2"], values=basis.reshape(-1, 1)),
+                properties=Labels(names=["basis_2"], values=columns.reshape(-1, 1)),
             )
         )
     keys = Labels(
@@ -786,6 +841,38 @@ def _batch_metric_matrices(
     return matrices
 
 
+def _batch_esp_factors(
+    systems: List[System],
+    system_ids: Optional[List[int]],
+    aux_basis: str,
+    esp_shell: float,
+) -> List[torch.Tensor]:
+    """Surface-ESP factors for one batch, through the cache when ids exist.
+
+    The factor depends only on ``(aux_basis, esp_shell)`` and the geometry —
+    not on ``esp_weight``, which the loss applies — so the cache key omits the
+    weight and entries are shared across weight settings.
+
+    :param systems: The batch's systems, in batch order.
+    :param system_ids: Native dataset ids of those systems, or ``None``.
+    :param aux_basis: Auxiliary basis name.
+    :param esp_shell: Scaling of the van der Waals radii for the surface.
+    :return: One ``(n_points_i, n_basis_i)`` factor per system, in batch order.
+    """
+    if system_ids is None:
+        return [compute_esp_factor(system, aux_basis, esp_shell) for system in systems]
+    cache = _metric_matrix_cache()
+    factors = []
+    for system, system_id in zip(systems, system_ids, strict=True):
+        key = (aux_basis, f"esp-factor|shell={esp_shell:.10g}", system_id)
+        factor = cache.get(key)
+        if factor is None:
+            factor = compute_esp_factor(system, aux_basis, esp_shell)
+            cache.put(key, factor)
+        factors.append(factor)
+    return factors
+
+
 # ── Collate transforms ────────────────────────────────────────────────────────
 
 
@@ -797,13 +884,25 @@ def _metric_matrices_transform(
     extra: Dict[str, TensorMap],
 ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
     system_ids = batch_system_ids(extra)
+    # The ESP term is not folded into the dense matrix (see
+    # compute_esp_factor): the matrix entry — still stored under the full-spec
+    # key the loss looks up — carries the base terms, and the factor travels
+    # alongside it under esp_factor_name for the loss to apply itself.
+    base_metric, esp_weight, esp_shell = strip_esp_from_spec(metric)
     packed_by_basis: Dict[str, TensorMap] = {}
+    factors_by_basis: Dict[str, TensorMap] = {}
     for target_name, aux_basis in target_to_aux_basis.items():
         if aux_basis not in packed_by_basis:
             packed_by_basis[aux_basis] = pack_metric_matrices(
-                _batch_metric_matrices(systems, system_ids, aux_basis, metric)
+                _batch_metric_matrices(systems, system_ids, aux_basis, base_metric)
             )
+            if esp_weight > 0.0:
+                factors_by_basis[aux_basis] = pack_metric_matrices(
+                    _batch_esp_factors(systems, system_ids, aux_basis, esp_shell)
+                )
         extra[metric_matrix_name(target_name, metric)] = packed_by_basis[aux_basis]
+        if esp_weight > 0.0:
+            extra[esp_factor_name(target_name, metric)] = factors_by_basis[aux_basis]
     return systems, targets, extra
 
 
