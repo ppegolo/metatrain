@@ -16,7 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
 from metatrain.utils.pyscf_loss import (
-    METRICS,
+    make_metric_spec,
     metric_matrix_name,
     ri_density_fit_constant_name,
     ri_projections_name,
@@ -545,6 +545,20 @@ class _DensityLoss(LossInterface):
     ``extra_data``. They differ only in what reference data they consume; see
     :py:class:`DensityMSELossViaC` and :py:class:`DensityMSELossViaW`.
 
+    Two optional terms refine the metric. Both are folded into ``M``, which the
+    collate transform precomputes and caches, so neither costs anything per step:
+
+    - ``omega > 0`` swaps the Coulomb kernel ``1/r`` for its long-range part
+      ``erf(omega r)/r`` and uses ``M = eps*J + J_lr``. This damps the sharp
+      near-nuclear modes the plain Coulomb metric over-weights, relative to the
+      smooth valence/far-field content that sets the electrostatic potential
+      outside the molecule. ``eps`` supplies a positive-definite floor: the
+      long-range term alone is numerically rank-deficient.
+    - ``charge_weight > 0`` adds the rank-1 term ``charge_weight * S_vec
+      S_vec^T``, i.e. ``charge_weight * (S_vec . dc)**2``, penalising the
+      predicted density's electron-count error while ignoring any redistribution
+      of charge that conserves the total.
+
     :param name: key of the coefficient target.
     :param gradient: not supported; must be ``None``.
     :param weight: weight of this term in the aggregated loss.
@@ -554,6 +568,11 @@ class _DensityLoss(LossInterface):
         e.g. ``"def2-universal-jfit"`` or ``"etb:def2-svp:2.0"``. Read by the trainer
         to build the metric transform, and kept here so the loss configuration is
         self-contained.
+    :param omega: range-separation parameter of the long-range Coulomb kernel;
+        ``0`` (default) keeps the plain kernel. Requires ``metric="coulomb"``.
+    :param eps: weight on the plain Coulomb term added to the long-range one;
+        ``None`` uses the package default. Ignored when ``omega == 0``.
+    :param charge_weight: weight on the electron-count penalty; ``0`` disables it.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -569,20 +588,26 @@ class _DensityLoss(LossInterface):
         reduction: str,
         metric: str = "overlap",
         aux_basis: Optional[str] = None,
+        omega: float = 0.0,
+        eps: Optional[float] = None,
+        charge_weight: float = 0.0,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support gradients of the coefficients."
             )
-        if metric not in METRICS:
-            raise ValueError(f"unknown metric {metric!r}; expected one of {METRICS}.")
         if aux_basis is None:
             raise ValueError(
                 f"density losses on target '{name}' require 'aux_basis', the "
                 "auxiliary basis the reference coefficients were fitted in."
             )
-        self.metric = metric
+        # Validated and canonicalised eagerly (and identically to the spec the
+        # trainer hooks build for the collate transform) so a bad config fails at
+        # construction rather than in the first batch. The spec doubles as the
+        # extra_data key: any divergence between the two sides would lose the
+        # matrix this loss asks for.
+        self.metric = make_metric_spec(metric, omega, eps, charge_weight)
         self.aux_basis = aux_basis
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:

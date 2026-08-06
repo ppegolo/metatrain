@@ -46,7 +46,7 @@ it lives here.
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .pyscf_loss import get_metric_matrices_transform
+from .pyscf_loss import get_metric_matrices_transform, make_metric_spec
 
 
 #: Loss types that need auxiliary-basis metric matrices attached to each batch.
@@ -58,7 +58,7 @@ def _metric_transforms(
 ) -> List[Callable]:
     """One transform per metric; targets sharing a basis share one computation.
 
-    :param aux_bases_by_metric: ``{metric: {target: aux_basis}}``.
+    :param aux_bases_by_metric: ``{metric spec: {target: aux_basis}}``.
     :return: The collate transforms.
     """
     return [
@@ -113,16 +113,25 @@ class DensityLossHooks:
 
 
 def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
-    """Group the density losses among ``specs`` by the metric they need.
+    """Group the density losses among ``specs`` by the metric spec they need.
 
     :param specs: Loss specifications keyed by target name.
-    :return: ``{metric: {target: aux_basis}}``, empty when none is a density loss.
+    :return: ``{metric spec: {target: aux_basis}}``, empty when none is a density
+        loss.
     """
     grouped: Dict[str, Dict[str, str]] = {}
     for target_name, spec in specs.items():
         if not isinstance(spec, dict) or spec.get("type") not in DENSITY_LOSS_TYPES:
             continue
-        metric = spec.get("metric", "overlap")
+        # Must be built exactly as the loss builds it: the spec is both the
+        # extra_data key and the cache key, so any divergence between the two
+        # sides silently loses the matrix the loss asks for.
+        metric = make_metric_spec(
+            spec.get("metric", "overlap"),
+            spec.get("omega", 0.0),
+            spec.get("eps"),
+            spec.get("charge_weight", 0.0),
+        )
         grouped.setdefault(metric, {})[target_name] = spec["aux_basis"]
     return grouped
 

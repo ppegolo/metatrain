@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import functools
 import importlib
+import re
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
@@ -50,9 +51,6 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from pyscf.gto import Mole
-
-
-METRICS = ("overlap", "coulomb")
 
 
 @lru_cache(maxsize=1)
@@ -131,6 +129,86 @@ def _load_auxiliary_basis(
     }
 
 
+# ── Metric specifications ─────────────────────────────────────────────────────
+
+
+#: The base two-centre metrics. A metric *spec* is either one of these bare
+#: names or a string encoding optional refinements on top of them; see
+#: :py:func:`make_metric_spec`.
+METRICS = ("overlap", "coulomb")
+
+
+#: Default weight on the plain Coulomb term when the long-range kernel is on.
+#: The long-range metric alone is numerically rank-deficient (condition number
+#: ~1e32 vs ~1e5 for J, because erf(wr)/r damps the compact directions away), so
+#: it needs a positive-definite floor. 0.01 keeps ~95% of the long-range
+#: reweighting while bringing the conditioning back to ~1e7.
+DEFAULT_LR_EPS = 0.01
+
+
+def make_metric_spec(
+    metric: str,
+    omega: float = 0.0,
+    eps: Optional[float] = None,
+    charge_weight: float = 0.0,
+) -> str:
+    """Build the canonical metric-spec string shared by the loss and the transform.
+
+    The spec fully determines the matrix, so it doubles as the ``extra_data`` key
+    and the cache key. With no optional term enabled it collapses to the bare
+    ``metric`` name, keeping existing configs and cache keys byte-identical.
+
+    :param metric: Base two-centre metric, ``"overlap"`` (S) or ``"coulomb"`` (J).
+    :param omega: Range-separation parameter of the long-range Coulomb kernel
+        ``erf(omega r)/r``. ``0`` disables it. Only valid with
+        ``metric="coulomb"``.
+    :param eps: Weight on the plain Coulomb term added to the long-range one,
+        i.e. ``M = eps*J + J_lr``. ``None`` uses :py:data:`DEFAULT_LR_EPS`.
+        Ignored when ``omega == 0``.
+    :param charge_weight: Weight on the rank-1 electron-count penalty
+        ``w * S_vec S_vec^T``, which adds ``w * (S_vec . dc)**2`` to the loss.
+        ``0`` disables it.
+    :return: Canonical spec string.
+    """
+    if metric not in METRICS:
+        raise ValueError(f"unknown metric {metric!r}; expected 'overlap' or 'coulomb'.")
+    if omega < 0.0:
+        raise ValueError(f"omega must be >= 0, got {omega}.")
+    if charge_weight < 0.0:
+        raise ValueError(f"charge_weight must be >= 0, got {charge_weight}.")
+    if omega > 0.0 and metric != "coulomb":
+        raise ValueError(
+            "the long-range kernel erf(omega r)/r is a Coulomb-metric option; "
+            f"got metric='{metric}' with omega={omega}."
+        )
+    if omega == 0.0 and charge_weight == 0.0:
+        return metric
+    resolved_eps = DEFAULT_LR_EPS if eps is None else float(eps)
+    if resolved_eps < 0.0:
+        raise ValueError(f"eps must be >= 0, got {resolved_eps}.")
+    return (
+        f"{metric}|omega={float(omega):.10g}"
+        f"|eps={resolved_eps:.10g}|q={float(charge_weight):.10g}"
+    )
+
+
+def parse_metric_spec(spec: str) -> Tuple[str, float, float, float]:
+    """Invert :py:func:`make_metric_spec`.
+
+    :param spec: Canonical spec string.
+    :return: ``(metric, omega, eps, charge_weight)``.
+    """
+    if "|" not in spec:
+        if spec not in METRICS:
+            raise ValueError(
+                f"unknown metric {spec!r}; expected 'overlap' or 'coulomb'."
+            )
+        return spec, 0.0, 0.0, 0.0
+    metric, *parts = spec.split("|")
+    values = dict(part.split("=") for part in parts)
+    return metric, float(values["omega"]), float(values["eps"]), float(values["q"])
+
+
 # ── extra_data key helpers ────────────────────────────────────────────────────
 
 
@@ -156,14 +234,17 @@ def metric_matrix_name(target_name: str, metric: str) -> str:
     """Return the ``extra_data`` key for a target's two-centre metric matrices.
 
     :param target_name: Name of the RI-coefficient target.
-    :param metric: ``"overlap"`` or ``"coulomb"``.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: The ``extra_data`` key.
     """
     if metric == "overlap":
         return overlap_matrix_name(target_name)
     if metric == "coulomb":
         return coulomb_matrix_name(target_name)
-    raise ValueError(f"unknown metric {metric!r}; expected one of {METRICS}.")
+    # Parse first so an unknown metric still raises the familiar error.
+    parse_metric_spec(metric)
+    suffix = re.sub(r"[^0-9a-zA-Z]+", "_", metric)
+    return f"{target_name}_metric_{suffix}"
 
 
 def ri_projections_name(target_name: str) -> str:
@@ -227,41 +308,119 @@ def build_auxiliary_molecule(system: System, aux_basis: str) -> "Mole":
     return mol
 
 
+def compute_overlap_matrix(system: System, aux_basis: str) -> torch.Tensor:
+    """Two-centre overlap matrix ``S`` (``int1e_ovlp``).
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
+    """
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    return torch.from_numpy(auxmol.intor("int1e_ovlp")).to(torch.float64)
+
+
+def compute_coulomb_matrix(system: System, aux_basis: str) -> torch.Tensor:
+    """Two-centre Coulomb matrix ``J`` (``int2c2e``).
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
+    """
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    return torch.from_numpy(auxmol.intor("int2c2e")).to(torch.float64)
+
+
+def compute_long_range_coulomb_matrix(
+    system: System, aux_basis: str, omega: float
+) -> torch.Tensor:
+    """
+    Compute the long-range two-centre Coulomb matrix for kernel ``erf(omega r)/r``.
+
+    In reciprocal space this kernel is ``4 pi/k^2 * exp(-k^2/(4 omega^2))``, i.e.
+    the Coulomb metric with short-wavelength (sharp, near-nuclear) modes
+    exponentially damped, leaving the smooth valence/far-field content that
+    dominates the electrostatic potential outside the molecule.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param omega: Range-separation parameter, in inverse Bohr.
+    :return: Dense long-range Coulomb matrix in PySCF AO order, float64.
+    """
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    with auxmol.with_range_coulomb(omega):
+        matrix = auxmol.intor("int2c2e")
+    return torch.from_numpy(matrix).to(torch.float64)
+
+
+def compute_charge_vector(system: System, aux_basis: str) -> torch.Tensor:
+    """
+    Compute the electron-count functional ``S_i = \\int chi_i(r) dr``.
+
+    Only l=0 shells integrate to something nonzero, so this vector reads off the
+    number of electrons carried by a coefficient vector: ``N = S_vec . c``. The
+    analytic form is used rather than a numerical integral: for a contracted s
+    shell with primitive exponents ``a_k`` and (PySCF-normalised) contraction
+    coefficients ``d_k``, ``\\int chi dr = sum_k d_k (pi/a_k)^{3/2} /
+    sqrt(4 pi)``, the ``1/sqrt(4 pi)`` coming from the ``Y_00`` factor carried by
+    PySCF's spherical basis functions.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :return: Charge functional in PySCF AO order, shape ``(naux,)``, float64.
+    """
+    import numpy as np
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    s_vector = np.zeros(auxmol.nao)
+    ao_loc = auxmol.ao_loc_nr()
+    for shell in range(auxmol.nbas):
+        if auxmol.bas_angular(shell) != 0:
+            continue
+        exponents = auxmol.bas_exp(shell)
+        contraction = auxmol._libcint_ctr_coeff(shell)
+        primitives = (np.pi / exponents) ** 1.5 / np.sqrt(4.0 * np.pi)
+        for i_contraction in range(contraction.shape[1]):
+            s_vector[ao_loc[shell] + i_contraction] = float(
+                np.dot(contraction[:, i_contraction], primitives)
+            )
+    return torch.from_numpy(s_vector).to(torch.float64)
+
+
 def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.Tensor:
     """
     Compute a two-centre metric matrix of the auxiliary basis for one system.
 
-    :param system: System whose positions are interpreted as Angstrom.
-    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
-    :param metric: ``"overlap"`` for S (``int1e_ovlp``) or ``"coulomb"`` for J
-        (``int2c2e``).
-    :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
-    """
-    if metric not in METRICS:
-        raise ValueError(f"unknown metric {metric!r}; expected one of {METRICS}.")
-    integral = "int1e_ovlp" if metric == "overlap" else "int2c2e"
-    auxmol = build_auxiliary_molecule(system, aux_basis)
-    return torch.from_numpy(auxmol.intor(integral)).to(torch.float64)
+    Beyond the plain ``S`` and ``J`` metrics this assembles the optional terms
+    encoded in the spec (see :py:func:`make_metric_spec`)::
 
+        M = eps * J + J_lr(omega)          if omega > 0
+        M = M + charge_weight * S_vec S_vec^T
 
-def compute_overlap_matrix(system: System, aux_basis: str) -> torch.Tensor:
-    """Two-centre overlap matrix ``S``; see :func:`compute_metric_matrix`.
+    The second term is rank-1 and contributes ``charge_weight * (S_vec . dc)**2``
+    to the loss, i.e. a penalty on the predicted density's electron-count error
+    relative to the RI reference.
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
     """
-    return compute_metric_matrix(system, aux_basis, "overlap")
+    base, omega, eps, charge_weight = parse_metric_spec(metric)
 
+    if omega > 0.0:
+        matrix = compute_long_range_coulomb_matrix(system, aux_basis, omega)
+        if eps > 0.0:
+            matrix = matrix + eps * compute_coulomb_matrix(system, aux_basis)
+    elif base == "overlap":
+        matrix = compute_overlap_matrix(system, aux_basis)
+    else:
+        matrix = compute_coulomb_matrix(system, aux_basis)
 
-def compute_coulomb_matrix(system: System, aux_basis: str) -> torch.Tensor:
-    """Two-centre Coulomb matrix ``J``; see :func:`compute_metric_matrix`.
+    if charge_weight > 0.0:
+        s_vector = compute_charge_vector(system, aux_basis)
+        matrix = matrix + charge_weight * torch.outer(s_vector, s_vector)
 
-    :param system: System whose positions are interpreted as Angstrom.
-    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
-    :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
-    """
-    return compute_metric_matrix(system, aux_basis, "coulomb")
+    return matrix
 
 
 # ── Packing ───────────────────────────────────────────────────────────────────
@@ -363,7 +522,7 @@ def _batch_metric_matrices(
     :param systems: The batch's systems, in batch order.
     :param system_ids: Native dataset ids of those systems, or ``None``.
     :param aux_basis: Auxiliary basis name.
-    :param metric: ``"overlap"`` or ``"coulomb"``.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: One dense square matrix per system, in batch order.
     """
     if system_ids is None:
@@ -371,9 +530,9 @@ def _batch_metric_matrices(
     cache = _metric_matrix_cache()
     matrices = []
     for system, system_id in zip(systems, system_ids, strict=True):
-        # The metric belongs in the key: a future metric variant (e.g. with a
-        # long-range or charge-penalty term) must not silently reuse matrices
-        # built for a different one.
+        # The full spec belongs in the key: the matrix depends on omega / eps /
+        # charge_weight, so a hyperparameter change must not silently reuse
+        # matrices built for the old one.
         key = (aux_basis, metric, system_id)
         matrix = cache.get(key)
         if matrix is None:
@@ -426,11 +585,10 @@ def get_metric_matrices_transform(
     Targets sharing an auxiliary basis share one computation per batch.
 
     :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
-    :param metric: ``"overlap"`` or ``"coulomb"``.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: A collate transform.
     """
-    if metric not in METRICS:
-        raise ValueError(f"unknown metric {metric!r}; expected one of {METRICS}.")
+    parse_metric_spec(metric)  # validate eagerly, not in the first batch
     return functools.partial(
         _metric_matrices_transform, dict(target_to_aux_basis), metric
     )

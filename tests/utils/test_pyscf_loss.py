@@ -1043,3 +1043,67 @@ def test_eval_options_accept_a_metrics_block():
         }
     )
     assert options["metrics"][TARGET][1]["aux_basis"] == AUX_BASIS
+
+
+# ── Metric-spec assembly ──────────────────────────────────────────────────────
+
+
+def test_metric_spec_assembles_from_the_primitives():
+    # The spec-driven matrix must be exactly eps*J + J_lr + w * S_vec S_vec^T:
+    # anything else means the loss optimises a different objective than the
+    # documented one.
+    from metatrain.utils.pyscf_loss import (
+        compute_charge_vector,
+        compute_coulomb_matrix,
+        compute_long_range_coulomb_matrix,
+        make_metric_spec,
+    )
+
+    system = _system()
+    omega, eps, charge_weight = 0.3, 0.05, 2.0
+    spec = make_metric_spec(
+        "coulomb", omega=omega, eps=eps, charge_weight=charge_weight
+    )
+
+    expected = (
+        compute_long_range_coulomb_matrix(system, AUX_BASIS, omega)
+        + eps * compute_coulomb_matrix(system, AUX_BASIS)
+        + charge_weight
+        * torch.outer(
+            compute_charge_vector(system, AUX_BASIS),
+            compute_charge_vector(system, AUX_BASIS),
+        )
+    )
+    torch.testing.assert_close(compute_metric_matrix(system, AUX_BASIS, spec), expected)
+
+
+def test_charge_vector_matches_a_numerical_integral():
+    # The analytic \int chi_i dr (including PySCF's Y_00 normalisation) is
+    # checked against PySCF's own quadrature; only s functions may integrate
+    # to something nonzero.
+    import numpy as np
+    from pyscf import dft
+
+    from metatrain.utils.pyscf_loss import compute_charge_vector
+
+    system = _system()
+    mol = build_auxiliary_molecule(system, AUX_BASIS)
+    grids = dft.gen_grid.Grids(mol)
+    grids.level = 5
+    grids.build()
+    numerical = dft.numint.eval_ao(mol, grids.coords).T @ grids.weights
+
+    # The quadrature converges slowly on the most diffuse s functions; the
+    # tolerance is loose against that, yet far below the sqrt(4 pi) ~ 3.5
+    # factor a Y_00 normalisation mistake would introduce.
+    s_vector = compute_charge_vector(system, AUX_BASIS).numpy()
+    np.testing.assert_allclose(s_vector, numerical, rtol=1e-4, atol=1e-5)
+
+    is_s_shell = np.zeros(mol.nao, dtype=bool)
+    ao_loc = mol.ao_loc_nr()
+    for shell in range(mol.nbas):
+        if mol.bas_angular(shell) == 0:
+            is_s_shell[ao_loc[shell] : ao_loc[shell + 1]] = True
+    # contracted s shells can integrate to either sign, but never to zero
+    assert np.all(s_vector[is_s_shell] != 0.0)
+    assert np.all(s_vector[~is_s_shell] == 0.0)
