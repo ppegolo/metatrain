@@ -151,12 +151,15 @@ def make_metric_spec(
     omega: float = 0.0,
     eps: Optional[float] = None,
     charge_weight: float = 0.0,
+    dipole_weight: float = 0.0,
+    quadrupole_weight: float = 0.0,
 ) -> str:
     """Build the canonical metric-spec string shared by the loss and the transform.
 
     The spec fully determines the matrix, so it doubles as the ``extra_data`` key
     and the cache key. With no optional term enabled it collapses to the bare
-    ``metric`` name, keeping existing configs and cache keys byte-identical.
+    ``metric`` name, and each optional term appears only when enabled, keeping
+    existing configs and cache keys byte-identical.
 
     :param metric: Base two-centre metric, ``"overlap"`` (S) or ``"coulomb"`` (J).
     :param omega: Range-separation parameter of the long-range Coulomb kernel
@@ -168,45 +171,69 @@ def make_metric_spec(
     :param charge_weight: Weight on the rank-1 electron-count penalty
         ``w * S_vec S_vec^T``, which adds ``w * (S_vec . dc)**2`` to the loss.
         ``0`` disables it.
+    :param dipole_weight: Weight on the distributed (per-atom) dipole penalty,
+        which adds ``w * sum_a |dQ_a^{l=1}|**2`` to the loss. ``0`` disables it.
+    :param quadrupole_weight: The same for the per-atom quadrupoles (l=2).
     :return: Canonical spec string.
     """
     if metric not in METRICS:
         raise ValueError(f"unknown metric {metric!r}; expected 'overlap' or 'coulomb'.")
     if omega < 0.0:
         raise ValueError(f"omega must be >= 0, got {omega}.")
-    if charge_weight < 0.0:
-        raise ValueError(f"charge_weight must be >= 0, got {charge_weight}.")
+    for weight_name, weight in (
+        ("charge_weight", charge_weight),
+        ("dipole_weight", dipole_weight),
+        ("quadrupole_weight", quadrupole_weight),
+    ):
+        if weight < 0.0:
+            raise ValueError(f"{weight_name} must be >= 0, got {weight}.")
     if omega > 0.0 and metric != "coulomb":
         raise ValueError(
             "the long-range kernel erf(omega r)/r is a Coulomb-metric option; "
             f"got metric='{metric}' with omega={omega}."
         )
     if omega == 0.0 and charge_weight == 0.0:
-        return metric
+        if dipole_weight == 0.0 and quadrupole_weight == 0.0:
+            return metric
     resolved_eps = DEFAULT_LR_EPS if eps is None else float(eps)
     if resolved_eps < 0.0:
         raise ValueError(f"eps must be >= 0, got {resolved_eps}.")
-    return (
+    spec = (
         f"{metric}|omega={float(omega):.10g}"
         f"|eps={resolved_eps:.10g}|q={float(charge_weight):.10g}"
     )
+    # Appended only when enabled, so specs (= extra_data and cache keys) from
+    # before these options existed stay byte-identical.
+    if dipole_weight > 0.0:
+        spec += f"|d={float(dipole_weight):.10g}"
+    if quadrupole_weight > 0.0:
+        spec += f"|Q={float(quadrupole_weight):.10g}"
+    return spec
 
 
-def parse_metric_spec(spec: str) -> Tuple[str, float, float, float]:
+def parse_metric_spec(spec: str) -> Tuple[str, float, float, float, float, float]:
     """Invert :py:func:`make_metric_spec`.
 
     :param spec: Canonical spec string.
-    :return: ``(metric, omega, eps, charge_weight)``.
+    :return: ``(metric, omega, eps, charge_weight, dipole_weight,
+        quadrupole_weight)``.
     """
     if "|" not in spec:
         if spec not in METRICS:
             raise ValueError(
                 f"unknown metric {spec!r}; expected 'overlap' or 'coulomb'."
             )
-        return spec, 0.0, 0.0, 0.0
+        return spec, 0.0, 0.0, 0.0, 0.0, 0.0
     metric, *parts = spec.split("|")
     values = dict(part.split("=") for part in parts)
-    return metric, float(values["omega"]), float(values["eps"]), float(values["q"])
+    return (
+        metric,
+        float(values["omega"]),
+        float(values["eps"]),
+        float(values["q"]),
+        float(values.get("d", 0.0)),
+        float(values.get("Q", 0.0)),
+    )
 
 
 # ── extra_data key helpers ────────────────────────────────────────────────────
@@ -386,6 +413,63 @@ def compute_charge_vector(system: System, aux_basis: str) -> torch.Tensor:
     return torch.from_numpy(s_vector).to(torch.float64)
 
 
+def compute_multipole_vectors(
+    system: System, aux_basis: str, angular: int
+) -> torch.Tensor:
+    """
+    Compute the per-atom multipole functionals of order ``angular``.
+
+    Row ``(a, m)`` reads off one component of atom ``a``'s multipole of the
+    fitted density about its own centre: ``Q_a^{lm} = sum_i V[(a, m), i] c_i``.
+    The operator is the Racah-normalised real solid harmonic
+    ``sqrt(4 pi/(2l+1)) r^l Y_lm`` (so l=0 gives the electron count and l=1 the
+    Cartesian dipole), under which only the aux functions on atom ``a`` with the
+    matching ``l`` (and ``m``) contribute: for such a contracted shell with
+    primitive exponents ``a_k`` and PySCF-normalised contraction coefficients
+    ``d_k`` the integral is ``sqrt(4 pi/(2l+1)) sum_k d_k Gamma(l+3/2) /
+    (2 a_k^(l+3/2))``.
+
+    The ``m`` slots follow PySCF's within-shell component order, which is
+    consistent across shells of the same ``l`` — all a rotation-invariant
+    penalty ``sum_m |Q_a^{lm}|**2`` needs, since it does not care which real
+    ``m`` each slot is.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param angular: Multipole order ``l``.
+    :return: Dense ``(n_atoms * (2l+1), naux)`` matrix in PySCF AO order,
+        float64.
+    """
+    import math
+
+    import numpy as np
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    n_components = 2 * angular + 1
+    vectors = np.zeros((auxmol.natm * n_components, auxmol.nao))
+    ao_loc = auxmol.ao_loc_nr()
+    angular_norm = np.sqrt(4.0 * np.pi / n_components)
+    for shell in range(auxmol.nbas):
+        if auxmol.bas_angular(shell) != angular:
+            continue
+        exponents = auxmol.bas_exp(shell)
+        contraction = auxmol._libcint_ctr_coeff(shell)
+        primitives = (
+            angular_norm
+            * math.gamma(angular + 1.5)
+            / (2.0 * exponents ** (angular + 1.5))
+        )
+        atom = auxmol.bas_atom(shell)
+        for i_contraction in range(contraction.shape[1]):
+            moment = float(np.dot(contraction[:, i_contraction], primitives))
+            for component in range(n_components):
+                vectors[
+                    atom * n_components + component,
+                    ao_loc[shell] + i_contraction * n_components + component,
+                ] = moment
+    return torch.from_numpy(vectors).to(torch.float64)
+
+
 def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.Tensor:
     """
     Compute a two-centre metric matrix of the auxiliary basis for one system.
@@ -393,19 +477,26 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
     Beyond the plain ``S`` and ``J`` metrics this assembles the optional terms
     encoded in the spec (see :py:func:`make_metric_spec`)::
 
-        M = eps * J + J_lr(omega)          if omega > 0
+        M = eps * J + J_lr(omega)                  if omega > 0
         M = M + charge_weight * S_vec S_vec^T
+        M = M + dipole_weight * V_1^T V_1
+        M = M + quadrupole_weight * V_2^T V_2
 
-    The second term is rank-1 and contributes ``charge_weight * (S_vec . dc)**2``
+    The charge term is rank-1 and contributes ``charge_weight * (S_vec . dc)**2``
     to the loss, i.e. a penalty on the predicted density's electron-count error
-    relative to the RI reference.
+    relative to the RI reference. The multipole terms (``V_l`` from
+    :py:func:`compute_multipole_vectors`) penalise the error in each atom's
+    distributed multipole of order ``l``, which is what determines the
+    electrostatic potential outside the charge distribution.
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
     :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: Dense ``(n_basis, n_basis)`` matrix in PySCF AO order, float64.
     """
-    base, omega, eps, charge_weight = parse_metric_spec(metric)
+    base, omega, eps, charge_weight, dipole_weight, quadrupole_weight = (
+        parse_metric_spec(metric)
+    )
 
     if omega > 0.0:
         matrix = compute_long_range_coulomb_matrix(system, aux_basis, omega)
@@ -419,6 +510,11 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
     if charge_weight > 0.0:
         s_vector = compute_charge_vector(system, aux_basis)
         matrix = matrix + charge_weight * torch.outer(s_vector, s_vector)
+
+    for weight, angular in ((dipole_weight, 1), (quadrupole_weight, 2)):
+        if weight > 0.0:
+            vectors = compute_multipole_vectors(system, aux_basis, angular)
+            matrix = matrix + weight * (vectors.T @ vectors)
 
     return matrix
 

@@ -82,7 +82,12 @@ def _pyscf_block_diagonal(mol, rotation: Rotation, inversion: int) -> np.ndarray
 
 @pytest.mark.parametrize(
     "metric",
-    ["overlap", "coulomb", make_metric_spec("coulomb", omega=0.3, charge_weight=1.0)],
+    [
+        "overlap",
+        "coulomb",
+        make_metric_spec("coulomb", omega=0.3, charge_weight=1.0),
+        make_metric_spec("overlap", dipole_weight=1.0, quadrupole_weight=1.0),
+    ],
 )
 @pytest.mark.parametrize("seed", [0, 1])
 def test_metric_matrix_rotates_with_augmenter_wigner_blocks(metric, seed):

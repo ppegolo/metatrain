@@ -1107,3 +1107,78 @@ def test_charge_vector_matches_a_numerical_integral():
     # contracted s shells can integrate to either sign, but never to zero
     assert np.all(s_vector[is_s_shell] != 0.0)
     assert np.all(s_vector[~is_s_shell] == 0.0)
+
+
+def test_multipole_vectors_match_a_numerical_integral():
+    # Entrywise check of the l=1 functionals against PySCF's own quadrature:
+    # every aux function integrated against the Cartesian dipole operator about
+    # its atom's centre. Functions with l != 1 must integrate to zero (parity /
+    # angular orthogonality), which the quadrature confirms too.
+    import numpy as np
+    from pyscf import dft
+
+    from metatrain.utils.pyscf_loss import compute_multipole_vectors
+
+    system = _system()
+    mol = build_auxiliary_molecule(system, AUX_BASIS)
+    grids = dft.gen_grid.Grids(mol)
+    grids.level = 5
+    grids.build()
+    ao = dft.numint.eval_ao(mol, grids.coords)
+
+    vectors = compute_multipole_vectors(system, AUX_BASIS, 1).numpy()
+    assert vectors.shape == (mol.natm * 3, mol.nao)
+
+    coords_of_atom = mol.atom_coords()
+    numerical = np.zeros_like(vectors)
+    for atom in range(mol.natm):
+        displaced = grids.coords - coords_of_atom[atom]
+        for component in range(3):  # PySCF p order is (x, y, z)
+            numerical[atom * 3 + component] = ao.T @ (
+                displaced[:, component] * grids.weights
+            )
+    # Only columns of functions *on* the row's atom may be nonzero in the
+    # analytic vectors; the quadrature agrees up to grid noise on the others.
+    ao_atom = np.array([mol.bas_atom(shell) for shell in range(mol.nbas)]).repeat(
+        [mol.ao_loc_nr()[i + 1] - mol.ao_loc_nr()[i] for i in range(mol.nbas)]
+    )
+    for atom in range(mol.natm):
+        on_atom = ao_atom == atom
+        rows = slice(atom * 3, atom * 3 + 3)
+        np.testing.assert_allclose(
+            vectors[rows][:, on_atom],
+            numerical[rows][:, on_atom],
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        assert np.all(vectors[rows][:, ~on_atom] == 0.0)
+
+
+def test_multipole_metric_assembles_and_is_invariant_to_conserving_errors():
+    # The dipole term must be exactly dipole_weight * V_1^T V_1 on top of the
+    # base metric, and a coefficient error with zero per-atom dipoles (e.g. a
+    # pure s-shell error) must cost nothing under the dipole term alone.
+    from metatrain.utils.pyscf_loss import (
+        compute_multipole_vectors,
+        make_metric_spec,
+    )
+
+    system = _system()
+    spec = make_metric_spec("overlap", dipole_weight=2.0, quadrupole_weight=0.5)
+    v1 = compute_multipole_vectors(system, AUX_BASIS, 1)
+    v2 = compute_multipole_vectors(system, AUX_BASIS, 2)
+    expected = (
+        compute_metric_matrix(system, AUX_BASIS, "overlap")
+        + 2.0 * v1.T @ v1
+        + 0.5 * v2.T @ v2
+    )
+    torch.testing.assert_close(compute_metric_matrix(system, AUX_BASIS, spec), expected)
+
+    # s-only error: every per-atom dipole and quadrupole of the error is zero
+    delta = torch.zeros(v1.shape[1], dtype=torch.float64)
+    mol = build_auxiliary_molecule(system, AUX_BASIS)
+    ao_loc = mol.ao_loc_nr()
+    first_s = next(s for s in range(mol.nbas) if mol.bas_angular(s) == 0)
+    delta[ao_loc[first_s]] = 1.0
+    assert torch.allclose(v1 @ delta, torch.zeros(v1.shape[0], dtype=torch.float64))
+    assert torch.allclose(v2 @ delta, torch.zeros(v2.shape[0], dtype=torch.float64))

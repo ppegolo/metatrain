@@ -558,6 +558,10 @@ class _DensityLoss(LossInterface):
       S_vec^T``, i.e. ``charge_weight * (S_vec . dc)**2``, penalising the
       predicted density's electron-count error while ignoring any redistribution
       of charge that conserves the total.
+    - ``dipole_weight > 0`` / ``quadrupole_weight > 0`` penalise the error in
+      each atom's distributed multipole of that order, which is what determines
+      the electrostatic potential outside the charge distribution — content the
+      pointwise metrics underweight.
 
     :param name: key of the coefficient target.
     :param gradient: not supported; must be ``None``.
@@ -573,6 +577,9 @@ class _DensityLoss(LossInterface):
     :param eps: weight on the plain Coulomb term added to the long-range one;
         ``None`` uses the package default. Ignored when ``omega == 0``.
     :param charge_weight: weight on the electron-count penalty; ``0`` disables it.
+    :param dipole_weight: weight on the per-atom dipole penalty; ``0`` disables it.
+    :param quadrupole_weight: weight on the per-atom quadrupole penalty; ``0``
+        disables it.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -591,6 +598,8 @@ class _DensityLoss(LossInterface):
         omega: float = 0.0,
         eps: Optional[float] = None,
         charge_weight: float = 0.0,
+        dipole_weight: float = 0.0,
+        quadrupole_weight: float = 0.0,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -607,7 +616,9 @@ class _DensityLoss(LossInterface):
         # construction rather than in the first batch. The spec doubles as the
         # extra_data key: any divergence between the two sides would lose the
         # matrix this loss asks for.
-        self.metric = make_metric_spec(metric, omega, eps, charge_weight)
+        self.metric = make_metric_spec(
+            metric, omega, eps, charge_weight, dipole_weight, quadrupole_weight
+        )
         self.aux_basis = aux_basis
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
