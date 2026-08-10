@@ -429,8 +429,9 @@ class TrainerHypers(TypedDict):
     best_model_metric: Literal["rmse_prod", "mae_prod", "loss"] = "rmse_prod"
     """Metric used to select the best model checkpoint."""
 
-    loss: str | dict[str, LossSpecification] = "mse"
-    """Loss function used for training."""
+    loss: str | dict[str, LossSpecification | list[LossSpecification]] = "mse"
+    """Loss function used for training. A target may be given a list of
+    specifications instead of one, in which case the terms are summed."""
 
     finetune: NoFinetuneHypers | FinetuneHypers = {
         "read_from": None,

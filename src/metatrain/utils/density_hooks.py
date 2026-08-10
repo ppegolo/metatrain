@@ -44,7 +44,7 @@ augmentation workflow that honours it. None of that is density-specific, and non
 it lives here.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .pyscf_loss import (
     get_ec_machinery_transform,
@@ -58,6 +58,27 @@ DENSITY_LOSS_TYPES = ("density_mse_via_c", "density_mse_via_w")
 
 #: Loss types that need the electrostatic-complementarity machinery instead.
 EC_LOSS_TYPES = ("ec_mse",)
+
+
+def _terms(specs: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Flatten a loss configuration into ``(target, specification)`` pairs.
+
+    A target carries either one specification or a list of them (see
+    :py:class:`~metatrain.utils.loss.LossAggregator`), and every term of a list
+    needs its own machinery: a density term and an EC term on the same target
+    ask for different things. Anything that is not a mapping — the ``"mse"``
+    shorthand, say — is skipped, since no density loss can be spelled that way.
+
+    :param specs: Loss specifications keyed by target name.
+    :return: One pair per term, in configuration order.
+    """
+    pairs: List[Tuple[str, Dict[str, Any]]] = []
+    for target_name, spec in specs.items():
+        entries = spec if isinstance(spec, (list, tuple)) else [spec]
+        pairs.extend(
+            (target_name, entry) for entry in entries if isinstance(entry, dict)
+        )
+    return pairs
 
 
 def _metric_transforms(
@@ -148,8 +169,8 @@ def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
         loss.
     """
     grouped: Dict[str, Dict[str, str]] = {}
-    for target_name, spec in specs.items():
-        if not isinstance(spec, dict) or spec.get("type") not in DENSITY_LOSS_TYPES:
+    for target_name, spec in _terms(specs):
+        if spec.get("type") not in DENSITY_LOSS_TYPES:
             continue
         # Must be built exactly as the loss builds it: the spec is both the
         # extra_data key and the cache key, so any divergence between the two
@@ -177,8 +198,8 @@ def _ec_targets(specs: Dict[str, Any]) -> Dict[str, str]:
     """
     return {
         target_name: spec["aux_basis"]
-        for target_name, spec in specs.items()
-        if isinstance(spec, dict) and spec.get("type") in EC_LOSS_TYPES
+        for target_name, spec in _terms(specs)
+        if spec.get("type") in EC_LOSS_TYPES
     }
 
 
@@ -192,8 +213,8 @@ def _ec_jitter(specs: Dict[str, Any]) -> float:
     """
     values = {
         float(spec.get("partner_jitter", 0.0))
-        for spec in specs.values()
-        if isinstance(spec, dict) and spec.get("type") in EC_LOSS_TYPES
+        for _, spec in _terms(specs)
+        if spec.get("type") in EC_LOSS_TYPES
     }
     if len(values) > 1:
         raise ValueError(

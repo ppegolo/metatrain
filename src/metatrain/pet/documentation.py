@@ -440,9 +440,10 @@ class TrainerHypers(TypedDict):
     """Metric used to select best checkpoint (e.g., ``rmse_prod``)"""
     grad_clip_norm: float = 1.0
     """Maximum gradient norm value."""
-    loss: str | dict[str, LossSpecification | str] = "mse"
-    """This section describes the loss function to be used. See the
-    :ref:`loss-functions` for more details."""
+    loss: str | dict[str, LossSpecification | list[LossSpecification] | str] = "mse"
+    """This section describes the loss function to be used. A target may be given
+    a list of specifications instead of one, in which case the terms are summed;
+    see the :ref:`loss-functions` for more details."""
     max_atoms_per_batch: Optional[int] = None
     """If set, use greedy atom-count packing instead of fixed ``batch_size``.
     Structures are accumulated into each batch until adding another would exceed this

@@ -468,8 +468,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 outputs_list.append(f"{target_name}_{gradient_name}_gradients")
 
         # Create a loss function:
-        loss_hypers = self.hypers["loss"]
-        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
+        loss_hypers = cast(
+            Dict[str, Union[LossSpecification, List[LossSpecification]]],
+            self.hypers["loss"],
+        )  # mypy
         loss_fn = LossAggregator(
             targets=train_targets,
             config=loss_hypers,

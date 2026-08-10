@@ -4,7 +4,17 @@
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 import metatensor.torch as mts
 import torch
@@ -1756,12 +1766,25 @@ class LossAggregator(LossInterface):
     Aggregate multiple :py:class:`LossInterface` terms with scheduled weights and
     metadata.
 
+    A target's configuration is either one specification or a **list** of them,
+    in which case every term is built and their weighted values are summed. That
+    is what lets a density target carry, say, ``density_mse_via_c`` and
+    ``ec_mse`` together: they measure different things about the same
+    coefficients. The first term is registered under the target's own name and
+    owns any gradient losses; the rest are registered as ``target[1]``,
+    ``target[2]``, ... so that they report separately.
+
     :param targets: mapping from target names to :py:class:`TargetInfo`.
-    :param config: per-target configuration dict.
+    :param config: per-target configuration: one specification, or a list of
+        them.
     """
 
     def __init__(
-        self, targets: Dict[str, TargetInfo], config: Dict[str, LossSpecification]
+        self,
+        targets: Dict[str, TargetInfo],
+        # A Mapping, not a Dict: `dict` is invariant in its value type, so a
+        # caller's plain `dict[str, LossSpecification]` would not be accepted.
+        config: Mapping[str, Union[LossSpecification, List[LossSpecification]]],
     ):
         super().__init__(name="", gradient=None, weight=0.0, reduction="mean")
         self.losses: Dict[str, LossInterface] = {}
@@ -1780,16 +1803,30 @@ class LossAggregator(LossInterface):
                 ),
             )
 
-            # Create main loss and its scheduler
-            base_loss = create_loss(
-                target_config["type"],
-                name=target_name,
-                gradient=None,
-                weight=target_config["weight"],
-                reduction=target_config["reduction"],
-                **{
+            # A target may carry several terms, given as a list: the density
+            # losses and the EC loss measure different things about the same
+            # coefficients and are meant to be summed. The first term keeps the
+            # target's own name, so a single-term configuration -- by far the
+            # common one -- registers and reports exactly as it did before.
+            specs = (
+                list(target_config)
+                if isinstance(target_config, (list, tuple))
+                else [target_config]
+            )
+            if len(specs) == 0:
+                raise ValueError(
+                    f"target '{target_name}' has an empty list of loss terms; "
+                    "give it at least one."
+                )
+            target_config = specs[0]
+
+            for position, spec in enumerate(specs):
+                # Only the first term is reached by the hypers machinery that
+                # fills in defaults, so read every field defensively.
+                key = target_name if position == 0 else f"{target_name}[{position}]"
+                extra = {
                     pname: pval
-                    for pname, pval in target_config.items()
+                    for pname, pval in spec.items()
                     if pname
                     not in (
                         "type",
@@ -1797,26 +1834,27 @@ class LossAggregator(LossInterface):
                         "reduction",
                         "gradients",
                     )
-                },
-            )
-            self.losses[target_name] = base_loss
-            self.metadata[target_name] = {
-                "type": target_config["type"],
-                "weight": base_loss.weight,
-                "reduction": base_loss.reduction,
-                "gradients": {},
-            }
-            for pname, pval in target_config.items():
-                if pname not in (
-                    "type",
-                    "weight",
-                    "reduction",
-                    "gradients",
-                ):
-                    self.metadata[target_name][pname] = pval
+                }
+                loss = create_loss(
+                    spec.get("type", "mse"),
+                    name=target_name,
+                    gradient=None,
+                    weight=spec.get("weight", 1.0),
+                    reduction=spec.get("reduction", "mean"),
+                    **extra,
+                )
+                self.losses[key] = loss
+                self.metadata[key] = {
+                    "type": spec.get("type", "mse"),
+                    "weight": loss.weight,
+                    "reduction": loss.reduction,
+                    "gradients": {},
+                    **extra,
+                }
 
-            # Create gradient-based losses
-            gradient_config = target_config["gradients"]
+            # Create gradient-based losses. They hang off the first term, the
+            # one that carries the target's own name.
+            gradient_config = target_config.get("gradients", {})
             for gradient_name in target_info.layout[0].gradients_list():
                 gradient_key = f"{target_name}_grad_{gradient_name}"
 
@@ -1968,6 +2006,16 @@ def build_reported_losses(
     """
     aggregators = {}
     for target_name, spec in specs.items():
+        if isinstance(spec, (list, tuple)):
+            # One reported number per aggregator, and the report label is built
+            # from the target name alone (see ``cli.eval`` and the trainers), so
+            # a list here would collide with itself. Training-side lists are
+            # supported; see :py:class:`LossAggregator`.
+            raise ValueError(
+                f"the metric on target '{target_name}' is a list of "
+                f"{len(spec)} specifications; a reported metric must be a "
+                "single one, since each is reported under its target's name."
+            )
         # These specifications are not reached by the hypers machinery that fills in
         # defaults for the top-level ones, so complete them here.
         complete = LossSpecification(
