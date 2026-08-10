@@ -3,7 +3,7 @@
 The density losses build the two-centre metric M on the *unaugmented* geometry
 and evaluate coefficients in that same frame. That scheme — and any future
 optimisation that un-rotates residuals instead — rests on one identity: the
-Wigner convention of metatomic's O3Transformation (which the augmenter uses)
+Wigner convention of metatomic's O3Transformations (which the augmenter uses)
 must match how PySCF's real spherical auxiliary functions transform, i.e.
 (with D the block-diagonal per-shell Wigner matrix in PySCF AO order):
 
@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 from metatomic.torch import System
-from metatomic.torch.o3 import O3Transformation
+from metatomic.torch.o3 import O3Transformations
 from scipy.spatial.transform import Rotation
 
 from metatrain.utils.pyscf_loss import (
@@ -56,11 +56,11 @@ def _pyscf_block_diagonal(mol, rotation: Rotation, inversion: int) -> np.ndarray
     """Per-shell Wigner blocks, as the augmenter builds them, in full AO order."""
     lmax = max(mol.bas_angular(shell) for shell in range(mol.nbas))
     assert lmax >= 4, "test should exercise high-l shells"
-    transformation = O3Transformation(
-        torch.tensor(rotation.as_matrix(), dtype=torch.float64), lmax
+    transformation = O3Transformations(
+        torch.tensor(rotation.as_matrix(), dtype=torch.float64).unsqueeze(0), lmax
     )
     wigner = {
-        ell: transformation.wigner_D_matrix(ell).numpy() for ell in range(lmax + 1)
+        ell: transformation.wigner_D_matrices(ell)[0].numpy() for ell in range(lmax + 1)
     }
 
     n = mol.nao
