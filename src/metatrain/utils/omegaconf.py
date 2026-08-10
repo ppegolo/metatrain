@@ -481,7 +481,22 @@ def expand_loss_config(conf: DictConfig) -> DictConfig:
        * ``forces`` expands to ``gradients.positions``
        * ``stress`` and ``virial`` expand to ``gradients.strain``
 
-    4. Explicit gradient configuration
+    4. Several terms on one target
+
+       .. code-block:: yaml
+
+          loss:
+            <target>:
+              - type: <loss_type_1>
+                weight: ...
+              - type: <loss_type_2>
+                weight: ...
+
+       The terms are summed. Each is expanded on its own; the first one owns any
+       gradient losses, exactly as
+       :py:class:`~metatrain.utils.loss.LossAggregator` builds them.
+
+    5. Explicit gradient configuration
 
        .. code-block:: yaml
 
@@ -603,6 +618,23 @@ def expand_loss_config(conf: DictConfig) -> DictConfig:
             if isinstance(val, str):
                 # type-only shorthand on target
                 node = OmegaConf.create({"type": val})
+            elif isinstance(val, (list, ListConfig)):
+                # Several terms on one target, summed by the aggregator: expand
+                # each, keeping their order, since the first one owns the
+                # gradients.
+                if len(val) == 0:
+                    raise ValueError(
+                        f"Target '{tname}' has an empty list of loss terms; "
+                        "give it at least one."
+                    )
+                node = OmegaConf.create(
+                    [
+                        OmegaConf.create({"type": term})
+                        if isinstance(term, str)
+                        else OmegaConf.create(term)
+                        for term in val
+                    ]
+                )
             else:
                 node = OmegaConf.create(val)
 
@@ -629,6 +661,15 @@ def expand_loss_config(conf: DictConfig) -> DictConfig:
         gradients = base["gradients"]
 
         raw = per_target_raw.get(tname)
+
+        # A list of terms is expanded term by term. Everything below applies to
+        # the first one -- gradients included, matching
+        # :py:class:`~metatrain.utils.loss.LossAggregator`, which hangs them off
+        # the term that keeps the target's own name.
+        extra_terms: list = []
+        if isinstance(raw, ListConfig):
+            terms = list(raw)
+            raw, extra_terms = terms[0], terms[1:]
 
         # Override target fields from per-target config
         if raw is not None:
@@ -718,7 +759,18 @@ def expand_loss_config(conf: DictConfig) -> DictConfig:
         for gcfg in gradients.values():
             _add_defaults_in_place(gcfg)
 
-        final_loss[tname] = base
+        if extra_terms:
+            expanded = [base]
+            for term in extra_terms:
+                # No gradients section: those belong to the first term only, and
+                # an empty one here would build a second copy of every gradient
+                # loss.
+                node = OmegaConf.create(OmegaConf.to_container(term, resolve=False))
+                _add_defaults_in_place(node)
+                expanded.append(node)
+            final_loss[tname] = expanded
+        else:
+            final_loss[tname] = base
 
     conf["architecture"]["training"]["loss"] = final_loss
     return conf

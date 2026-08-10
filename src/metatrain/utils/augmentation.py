@@ -319,11 +319,18 @@ def original_frame_targets(loss_hypers: Union[str, Dict[str, Any], None]) -> Set
 
     names = set()
     for target_name, spec in loss_hypers.items():
-        loss_type = spec.get("type") if isinstance(spec, dict) else None
-        if loss_type is None:
-            continue
-        if LossType.from_key(loss_type).cls.evaluate_in_original_frame:
-            names.add(target_name)
+        # A target may carry several terms; one of them asking for the original
+        # frame settles it for the target. Missing this would not raise -- the
+        # loss would simply be evaluated against a metric built for a different
+        # orientation -- so the list case is handled here rather than left to
+        # the `isinstance(spec, dict)` guard.
+        terms = spec if isinstance(spec, (list, tuple)) else [spec]
+        for term in terms:
+            loss_type = term.get("type") if isinstance(term, dict) else None
+            if loss_type is None:
+                continue
+            if LossType.from_key(loss_type).cls.evaluate_in_original_frame:
+                names.add(target_name)
     return names
 
 

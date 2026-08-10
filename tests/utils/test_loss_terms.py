@@ -178,6 +178,118 @@ def test_the_options_validation_accepts_a_list():
         check_architecture_options("pet", options)
 
 
+def test_the_config_expansion_handles_a_list():
+    """``expand_loss_config`` runs before anything else reads the loss block.
+
+    It fills in defaults per target, and it saw only mappings, so a list reached
+    ``raw.items()`` and died with "ListConfig does not support attribute
+    access". Each term must come out fully specified.
+    """
+    from omegaconf import OmegaConf
+
+    from metatrain.utils.omegaconf import expand_loss_config
+
+    conf = OmegaConf.create(
+        {
+            "training_set": {"targets": {"mtt::rho": {}}},
+            "architecture": {
+                "training": {
+                    "loss": {
+                        "mtt::rho": [
+                            {"type": "density_mse_via_c", "aux_basis": "x"},
+                            {"type": "ec_mse", "aux_basis": "x", "weight": 1.0e4},
+                        ]
+                    }
+                }
+            },
+        }
+    )
+    terms = OmegaConf.to_container(
+        expand_loss_config(conf)["architecture"]["training"]["loss"]["mtt::rho"],
+        resolve=True,
+    )
+
+    assert isinstance(terms, list) and len(terms) == 2
+    # Defaults filled on every term, not only the first.
+    assert terms[0]["type"] == "density_mse_via_c"
+    assert terms[0]["weight"] == 1.0
+    assert terms[0]["reduction"] == "mean"
+    assert terms[0]["aux_basis"] == "x"
+    assert terms[1]["type"] == "ec_mse"
+    assert terms[1]["weight"] == 1.0e4
+    assert terms[1]["reduction"] == "mean"
+    # Gradients belong to the first term alone; a second empty section would
+    # build a duplicate of every gradient loss.
+    assert "gradients" in terms[0]
+    assert "gradients" not in terms[1]
+
+    # A string term keeps its shorthand meaning inside a list.
+    conf["architecture"]["training"]["loss"] = {"mtt::rho": ["mse", {"type": "mae"}]}
+    terms = OmegaConf.to_container(
+        expand_loss_config(conf)["architecture"]["training"]["loss"]["mtt::rho"],
+        resolve=True,
+    )
+    assert [t["type"] for t in terms] == ["mse", "mae"]
+
+    conf["architecture"]["training"]["loss"] = {"mtt::rho": []}
+    with pytest.raises(ValueError, match="empty list of loss terms"):
+        expand_loss_config(conf)
+
+
+def test_the_expanded_list_builds_an_aggregator(target_info, predictions_and_targets):
+    """End to end: what the expansion writes must be what the aggregator eats."""
+    from omegaconf import OmegaConf
+
+    from metatrain.utils.omegaconf import expand_loss_config
+
+    conf = OmegaConf.create(
+        {
+            "training_set": {"targets": {"output": {}}},
+            "architecture": {
+                "training": {
+                    "loss": {
+                        "output": [
+                            {"type": "mse", "weight": 1.0, "reduction": "sum"},
+                            {"type": "mae", "weight": 0.5, "reduction": "sum"},
+                        ]
+                    }
+                }
+            },
+        }
+    )
+    expanded = OmegaConf.to_container(
+        expand_loss_config(conf)["architecture"]["training"]["loss"], resolve=True
+    )
+    loss = LossAggregator(targets={"output": target_info}, config=expanded)
+
+    predictions, targets = predictions_and_targets
+    assert list(loss.losses) == ["output", "output[1]"]
+    torch.testing.assert_close(
+        loss(predictions, targets), torch.tensor(6.5, dtype=torch.float64)
+    )
+
+
+def test_the_original_frame_is_claimed_from_any_term():
+    """Missing this would not raise -- it would silently rotate the metric.
+
+    The density and EC losses are evaluated against machinery built on the
+    unaugmented geometry, so they must opt out of the rotational augmentation.
+    A target that carries the density term second would otherwise be augmented.
+    """
+    from metatrain.utils.augmentation import original_frame_targets
+
+    density = {"type": "density_mse_via_c", "aux_basis": "x"}
+    assert original_frame_targets({"a": density}) == {"a"}
+    assert original_frame_targets({"a": [density]}) == {"a"}
+    assert original_frame_targets({"a": [{"type": "mse"}, density]}) == {"a"}
+    assert original_frame_targets({"a": [{"type": "ec_mse", "aux_basis": "x"}]}) == {
+        "a"
+    }
+    # ... and a list of ordinary losses still claims nothing
+    assert original_frame_targets({"a": [{"type": "mse"}, {"type": "mae"}]}) == set()
+    assert original_frame_targets("mse") == set()
+
+
 def test_the_shorthand_string_form_still_passes_through():
     """``loss: mse`` reaches the helpers as a string and configures no hooks."""
     assert _aux_bases_by_metric({"output": "mse"}) == {}
