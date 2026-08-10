@@ -227,6 +227,41 @@ def test_loss_is_zero_for_an_exact_prediction():
     assert float(value) == 0.0
 
 
+def test_dense_prediction_matches_a_padded_one():
+    # The model's output carries no NaN padding: only the densified *target*
+    # marks which coefficients an element actually has. A prediction flattened
+    # on its own would therefore count every padded slot as a real coefficient
+    # and disagree with the target on any batch mixing element basis sizes, so
+    # the loss must take its layout from the target. HF has two element types,
+    # which is what makes the padding non-trivial here.
+    systems = [_hf_chain(2)]
+    reference, prediction = _random_vectors(systems, seed=11), None
+    prediction = [reference[0] + 0.05]
+    target = _densified_batch(systems, reference)
+    padded = _densified_batch(systems, prediction)
+
+    dense = TensorMap(
+        padded.keys,
+        [
+            TensorBlock(
+                values=torch.nan_to_num(padded.block(key).values, nan=7.5),
+                samples=padded.block(key).samples,
+                components=padded.block(key).components,
+                properties=padded.block(key).properties,
+            )
+            for key in padded.keys
+        ],
+    )
+    assert torch.isnan(padded.block(padded.keys[0]).values).any()
+    assert not torch.isnan(dense.block(dense.keys[0]).values).any()
+
+    extra = _extra_via_transform(systems, [2])
+    loss = _loss()
+    assert float(loss.compute({TARGET: dense}, {TARGET: target}, extra)) == pytest.approx(
+        float(loss.compute({TARGET: padded}, {TARGET: target}, extra))
+    )
+
+
 @pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
 def test_batch_with_mixed_naux_matches_per_system(reduction):
     # Two systems with different naux: the loss must reduce exactly the

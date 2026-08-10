@@ -1123,13 +1123,23 @@ class ECMSELoss(LossInterface):
         )
 
         prediction_map = predictions[self.target]
-        predicted, counts = _flatten_to_pyscf_order(prediction_map)
-        reference, reference_counts = _flatten_to_pyscf_order(targets[self.target])
-        if not torch.equal(counts, reference_counts):
+        # Only the target carries the NaN padding that marks which coefficients
+        # an element actually has; the model's output is dense. Flattening the
+        # prediction on its own would therefore count every padded slot as a
+        # real coefficient and disagree with the target on any batch mixing
+        # elements of different basis sizes. Flattening the *residual* borrows
+        # the target's mask -- NaN propagates through the subtraction -- and
+        # the prediction is recovered exactly, with its autograd graph intact.
+        reference, counts = _flatten_to_pyscf_order(targets[self.target])
+        residual, residual_counts = _flatten_to_pyscf_order(
+            targets[self.target], subtract=prediction_map
+        )
+        if not torch.equal(counts, residual_counts):
             raise ValueError(
                 f"target '{self.target}': predictions and targets disagree on "
                 "the per-atom coefficient counts; they must share one layout."
             )
+        predicted = reference - residual
 
         # The trainer's scale-removal transform hands this loss coefficients
         # divided by the fitted per-target scales and records their reciprocal;
