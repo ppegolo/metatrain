@@ -1402,6 +1402,36 @@ def _batch_group_charge_factors(
     return factors
 
 
+def _split_per_atom_labels(
+    block: "TensorBlock", n_systems: int
+) -> List["numpy.ndarray"]:
+    """Split a per-atom extra-data block into one label array per batch system.
+
+    The values of the ``"system"`` sample dimension are the *original dataset*
+    indices, not batch positions, so they must not be used to index the batch
+    list. ``group_and_join`` concatenates the per-sample blocks in batch order,
+    so the systems are the runs of equal ids, in order of first appearance.
+
+    :param block: A per-atom block with a ``"system"`` sample dimension.
+    :param n_systems: Number of systems in the batch.
+    :return: One label array per system, in batch order.
+    :raises RuntimeError: If the block does not cover exactly the batch.
+    """
+    import numpy as np
+
+    labels = block.values.reshape(-1).to(torch.int64).cpu().numpy()
+    index = block.samples.column("system").cpu().numpy()
+    # Boundaries of the runs of equal ids; ``group_and_join`` never interleaves
+    # two systems' rows, so a run is exactly one system.
+    starts = np.flatnonzero(np.r_[True, index[1:] != index[:-1]])
+    if len(starts) != n_systems:
+        raise RuntimeError(
+            f"per-atom extra data covers {len(starts)} systems, but the batch "
+            f"has {n_systems}; the field is malformed or was reordered"
+        )
+    return [np.asarray(part) for part in np.split(labels, starts[1:])]
+
+
 def _batch_charge_groups(
     target_name: str, systems: List[System], extra: Dict[str, TensorMap]
 ) -> List["numpy.ndarray"]:
@@ -1416,15 +1446,10 @@ def _batch_charge_groups(
     :return: One label array per system.
     :raises RuntimeError: If neither field is present.
     """
-    import numpy as np
-
     for key in (charge_group_name(target_name), ec_fragment_name(target_name)):
         if key not in extra:
             continue
-        block = extra[key][0]
-        labels = block.values.reshape(-1).to(torch.int64).cpu().numpy()
-        index = block.samples.column("system").cpu().numpy()
-        return [np.asarray(labels[index == i]) for i in range(len(systems))]
+        return _split_per_atom_labels(extra[key][0], len(systems))
 
     raise RuntimeError(
         f"the per-group charge penalty on target '{target_name}' requires "
@@ -1608,14 +1633,9 @@ def _ec_batch_splits(
     :return: One specification per system.
     :raises RuntimeError: If neither field is present.
     """
-    import numpy as np
-
     atom_key = ec_fragment_name(target_name)
     if atom_key in extra:
-        block = extra[atom_key][0]
-        labels = block.values.reshape(-1).to(torch.int64).cpu().numpy()
-        index = block.samples.column("system").cpu().numpy()
-        return [np.asarray(labels[index == i]) for i in range(len(systems))]
+        return _split_per_atom_labels(extra[atom_key][0], len(systems))
 
     split_key = ec_fragment_split_name(target_name)
     if split_key in extra:

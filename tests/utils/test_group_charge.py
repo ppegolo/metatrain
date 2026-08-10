@@ -266,3 +266,43 @@ def test_the_groups_fall_back_to_the_ec_fragments():
 
     with pytest.raises(RuntimeError, match="per-atom group labels"):
         _batch_charge_groups(TARGET, systems, {})
+
+
+def test_the_groups_are_split_by_batch_order_not_by_dataset_index():
+    """The "system" sample values are dataset indices, not batch positions.
+
+    An index-selected training set numbers its systems anything at all, so
+    splitting on ``system == i`` silently hands every system an empty label
+    array.
+    """
+    from metatrain.utils.pyscf_loss import (
+        _batch_charge_groups,
+        _split_per_atom_labels,
+        ec_fragment_name,
+    )
+
+    ids = [1743, 2901]  # nothing like range(len(systems))
+    sizes = [3, 2]
+    block = TensorBlock(
+        values=torch.tensor([0, 0, 1, 0, 1], dtype=torch.float64).reshape(-1, 1),
+        samples=Labels(
+            ["system", "atom"],
+            torch.tensor(
+                [
+                    [i, a]
+                    for i, count in zip(ids, sizes, strict=True)
+                    for a in range(count)
+                ],
+                dtype=torch.int32,
+            ),
+        ),
+        components=[],
+        properties=Labels("label", torch.zeros((1, 1), dtype=torch.int32)),
+    )
+    extra = {ec_fragment_name(TARGET): TensorMap(Labels.single(), [block])}
+
+    groups = _batch_charge_groups(TARGET, [None, None], extra)
+    assert [g.tolist() for g in groups] == [[0, 0, 1], [0, 1]]
+
+    with pytest.raises(RuntimeError, match="covers 2 systems, but the batch has 3"):
+        _split_per_atom_labels(extra[ec_fragment_name(TARGET)][0], 3)
