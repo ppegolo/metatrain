@@ -46,11 +46,18 @@ it lives here.
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .pyscf_loss import get_metric_matrices_transform, make_metric_spec
+from .pyscf_loss import (
+    get_ec_machinery_transform,
+    get_metric_matrices_transform,
+    make_metric_spec,
+)
 
 
 #: Loss types that need auxiliary-basis metric matrices attached to each batch.
 DENSITY_LOSS_TYPES = ("density_mse_via_c", "density_mse_via_w")
+
+#: Loss types that need the electrostatic-complementarity machinery instead.
+EC_LOSS_TYPES = ("ec_mse",)
 
 
 def _metric_transforms(
@@ -77,15 +84,26 @@ class DensityLossHooks:
     :param trained: Mapping from metric name to the ``{target: aux_basis}`` served by
         it, for losses that are trained on.
     :param reported: The same, for losses that are only reported as metrics.
+    :param ec_trained: ``{target: aux_basis}`` of the EC losses that are trained on.
+    :param ec_reported: The same, for EC losses only reported as metrics.
+    :param ec_jitter: Standard deviation in Angstrom of the random partner shift
+        applied to training batches. Validation always uses the true placement,
+        so a reported EC stays the real score.
     """
 
     def __init__(
         self,
         trained: Dict[str, Dict[str, str]],
         reported: Dict[str, Dict[str, str]],
+        ec_trained: Optional[Dict[str, str]] = None,
+        ec_reported: Optional[Dict[str, str]] = None,
+        ec_jitter: float = 0.0,
     ) -> None:
         self._trained = trained
         self._reported = reported
+        self._ec_trained = ec_trained or {}
+        self._ec_reported = ec_reported or {}
+        self._ec_jitter = float(ec_jitter)
 
     def training_collate_transforms(self) -> List[Callable]:
         """
@@ -93,7 +111,12 @@ class DensityLossHooks:
 
         :return: Collate transforms; empty when nothing is trained on a density loss.
         """
-        return _metric_transforms(self._trained)
+        transforms = _metric_transforms(self._trained)
+        if self._ec_trained:
+            transforms.append(
+                get_ec_machinery_transform(self._ec_trained, self._ec_jitter)
+            )
+        return transforms
 
     def validation_collate_transforms(self) -> List[Callable]:
         """
@@ -109,7 +132,12 @@ class DensityLossHooks:
         }
         for metric, targets_map in self._reported.items():
             combined.setdefault(metric, {}).update(targets_map)
-        return _metric_transforms(combined)
+        transforms = _metric_transforms(combined)
+        ec_combined = dict(self._ec_trained)
+        ec_combined.update(self._ec_reported)
+        if ec_combined:
+            transforms.append(get_ec_machinery_transform(ec_combined))  # jitter=0
+        return transforms
 
 
 def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
@@ -140,6 +168,42 @@ def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     return grouped
 
 
+def _ec_targets(specs: Dict[str, Any]) -> Dict[str, str]:
+    """The ``{target: aux_basis}`` of the EC losses among ``specs``.
+
+    :param specs: Loss specifications keyed by target name.
+    :return: Mapping for the EC machinery transform, empty when none is an EC
+        loss.
+    """
+    return {
+        target_name: spec["aux_basis"]
+        for target_name, spec in specs.items()
+        if isinstance(spec, dict) and spec.get("type") in EC_LOSS_TYPES
+    }
+
+
+def _ec_jitter(specs: Dict[str, Any]) -> float:
+    """The partner jitter configured by the EC losses among ``specs``.
+
+    :param specs: Loss specifications keyed by target name.
+    :return: The jitter in Angstrom, 0 when unset.
+    :raises ValueError: If two EC losses ask for different jitters; the shift is
+        a property of the geometry, so one batch cannot honour two of them.
+    """
+    values = {
+        float(spec.get("partner_jitter", 0.0))
+        for spec in specs.values()
+        if isinstance(spec, dict) and spec.get("type") in EC_LOSS_TYPES
+    }
+    if len(values) > 1:
+        raise ValueError(
+            "the EC losses ask for different 'partner_jitter' values "
+            f"({sorted(values)}); the partner shift is one property of the "
+            "geometry and cannot differ between targets of the same batch."
+        )
+    return values.pop() if values else 0.0
+
+
 def get_density_hooks(
     loss_hypers: Union[str, Dict[str, Any], None],
     metrics: Optional[Dict[str, Any]] = None,
@@ -156,4 +220,11 @@ def get_density_hooks(
     :return: The hooks for this configuration.
     """
     trained = _aux_bases_by_metric(loss_hypers) if isinstance(loss_hypers, dict) else {}
-    return DensityLossHooks(trained, _aux_bases_by_metric(metrics or {}))
+    ec_trained = _ec_targets(loss_hypers) if isinstance(loss_hypers, dict) else {}
+    return DensityLossHooks(
+        trained,
+        _aux_bases_by_metric(metrics or {}),
+        ec_trained,
+        _ec_targets(metrics or {}),
+        _ec_jitter(loss_hypers) if isinstance(loss_hypers, dict) else 0.0,
+    )

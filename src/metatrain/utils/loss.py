@@ -16,6 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from metatrain.utils.data import TargetInfo
 from metatrain.utils.pyscf_loss import (
+    ec_machinery_name,
     esp_factor_name,
     make_metric_spec,
     metric_matrix_name,
@@ -912,6 +913,252 @@ class DensityMSELossViaW(_DensityLoss):
         return self._reduce(per_system)
 
 
+#: Patch variances below this carry no correlation contrast; the structure
+#: then contributes zero to the EC loss rather than a division by ~zero.
+_EC_VARIANCE_FLOOR = 1e-14
+
+
+class ECMSELoss(LossInterface):
+    """
+    Squared error of the electrostatic complementarity: ``L = (EC_pred - EC_ref)^2``.
+
+    EC is the area-weighted anticorrelation of the two fragments' electrostatic
+    potentials on fragment 0's solvent-excluded contact patch,
+    ``EC = -corr(v_0, v_1)``. Both potentials are affine in the coefficients, so
+    EC is evaluated exactly — no linearisation — from geometry-only tensors the
+    collate transform precontracts once per structure (see the EC section of
+    :py:mod:`metatrain.utils.pyscf_loss`): per structure and per coefficient
+    vector the cost is two ``(naux, naux)`` matrix-vector products and a
+    handful of dots, with autograd supplying the exact EC gradient. Systems in
+    a batch stay ragged, exactly as in the density losses: the term is a
+    per-system scalar, so padding would buy nothing, and a structure without a
+    usable patch contributes exactly zero.
+
+    ``EC_ref`` is recomputed from the reference coefficients in the batch every
+    step rather than stored: nothing reference-derived lives in the dataset,
+    only the fragment split (geometry metadata, see
+    :py:func:`~metatrain.utils.pyscf_loss.ec_fragment_split_name`).
+
+    Both EC values are dimensionless correlations in ``[-1, 1]``, so the term
+    is bounded by 4 and ``weight`` trades an absolute EC error directly against
+    the other loss terms. It composes with the Coulomb density loss as an added
+    weighted term, or serves as a validation-only metric via the ``metrics``
+    block.
+
+    **Partner jitter.** With ``partner_jitter`` above zero the trainer displaces
+    the partner fragment by a fresh random shift for every structure at every
+    training step, and evaluates this term at the displaced placement. This is
+    augmentation of the *measurement*, not of the data: no new reference density
+    is implied, because the prediction and the reference are read through the
+    identical displaced functional. Its purpose is transfer. The EC gradient is
+    a fixed local operator contracted with the partner's field, so a single
+    placement teaches one direction per structure, while many placements teach
+    the operator. Validation never jitters, so a reported EC stays the true
+    score.
+
+    **Honest limits.** Without jitter the patch and the partner potential are
+    those of the *reference* dimer, and nothing is claimed to generalise to an
+    unseen partner. With jitter the partner is displaced rigidly, so the
+    reference density does not repolarise; this costs nothing here, because the
+    displaced structure is never treated as a physical system, but it does mean
+    the family of placements is not a family of physical dimers. No model has
+    yet been trained with this term, so its effect is unmeasured.
+
+    **Scale convention.** Unlike the quadratic density losses, EC is *not*
+    invariant under a per-target scaling of the coefficients: the nuclear part
+    of the potentials is fixed while the electronic part scales. The trainer's
+    scale-removal transform records the reciprocal of every scale it applies
+    (see :py:func:`~metatrain.utils.scaler.remove.removed_scale_name`), and
+    this loss undoes it exactly — whatever the scale structure — before
+    evaluating EC, so it is correct with ``scale_targets`` on or off. When no
+    record is present the coefficients are taken as physical, which holds for
+    every metatrain trainer (they all remove scales through that transform);
+    a pipeline that scales this target through some other route would evaluate
+    the EC of the scaled density.
+
+    :param name: key of the coefficient target.
+    :param gradient: not supported; must be ``None``.
+    :param weight: weight of this term in the aggregated loss.
+    :param reduction: ``"mean"``, ``"sum"`` or ``"none"``.
+    :param aux_basis: auxiliary basis the coefficients live in. Read by the
+        trainer to build the machinery transform, and kept here so the loss
+        configuration is self-contained.
+    :param partner_jitter: standard deviation in Angstrom of the random partner
+        shift applied to training batches; 0 keeps the true placement. Read by
+        the trainer, for the same reason as ``aux_basis``.
+    """
+
+    #: The machinery is built on the unaugmented geometry, the frame the
+    #: reference coefficients were fitted in; see :py:class:`_DensityLoss`.
+    evaluate_in_original_frame = True
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        aux_basis: Optional[str] = None,
+        partner_jitter: float = 0.0,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+        if gradient is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support gradients of the coefficients."
+            )
+        if aux_basis is None:
+            raise ValueError(
+                f"the EC loss on target '{name}' requires 'aux_basis', the "
+                "auxiliary basis the coefficients live in."
+            )
+        if partner_jitter < 0.0:
+            raise ValueError(
+                f"'partner_jitter' must not be negative; got {partner_jitter}."
+            )
+        self.aux_basis = aux_basis
+        # Read by the trainer's density hooks, not here: the shift changes the
+        # machinery the collate transform builds, and this class only consumes
+        # whatever machinery arrives.
+        self.partner_jitter = float(partner_jitter)
+
+    def _require(self, extra_data: Optional[Any], key: str) -> Any:
+        if extra_data is None or key not in extra_data:
+            raise RuntimeError(
+                f"'{type(self).__name__}' on target '{self.target}' requires "
+                f"'{key}' in extra_data; it is added by the EC machinery collate "
+                "transform that the trainer installs."
+            )
+        return extra_data[key]
+
+    @staticmethod
+    def _ec(
+        coefficients: torch.Tensor,
+        moments: torch.Tensor,
+        vectors: torch.Tensor,
+        constants: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """EC of one coefficient vector, or ``None`` when the patch has no contrast.
+
+        Evaluates ``A_fg = s_fg - y_g.t_f - y_f.t_g + y_f^T M y_g`` (the
+        centred, area-weighted inner products of the two fragment potentials;
+        the minus signs because electrons lower the potential) and returns
+        ``-A_01 / sqrt(A_00 A_11)``.
+
+        :param coefficients: One system's coefficient vector.
+        :param moments: ``M = V K V^T``.
+        :param vectors: Rows ``t_0, t_1, mask_0, mask_1``.
+        :param constants: ``s_fg``.
+        :return: The EC value, carrying the autograd graph of ``coefficients``.
+        """
+        c = coefficients.to(moments.dtype)
+        t_0, t_1, mask_0, mask_1 = vectors
+        y_0 = mask_0 * c
+        y_1 = mask_1 * c
+        z_0 = torch.mv(moments, y_0)
+        z_1 = torch.mv(moments, y_1)
+        a_00 = constants[0, 0] - 2.0 * torch.dot(y_0, t_0) + torch.dot(y_0, z_0)
+        a_11 = constants[1, 1] - 2.0 * torch.dot(y_1, t_1) + torch.dot(y_1, z_1)
+        a_01 = (
+            constants[0, 1]
+            - torch.dot(y_1, t_0)
+            - torch.dot(y_0, t_1)
+            + torch.dot(y_0, z_1)
+        )
+        if a_00 <= _EC_VARIANCE_FLOOR or a_11 <= _EC_VARIANCE_FLOOR:
+            return None
+        return -a_01 / torch.sqrt(a_00 * a_11)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        moments = unpack_metric_matrices(
+            self._require(extra_data, ec_machinery_name(self.target, "moments"))
+        )
+        vectors = unpack_metric_matrices(
+            self._require(extra_data, ec_machinery_name(self.target, "vectors"))
+        )
+        constants = unpack_metric_matrices(
+            self._require(extra_data, ec_machinery_name(self.target, "constants"))
+        )
+
+        prediction_map = predictions[self.target]
+        predicted, counts = _flatten_to_pyscf_order(prediction_map)
+        reference, reference_counts = _flatten_to_pyscf_order(targets[self.target])
+        if not torch.equal(counts, reference_counts):
+            raise ValueError(
+                f"target '{self.target}': predictions and targets disagree on "
+                "the per-atom coefficient counts; they must share one layout."
+            )
+
+        # The trainer's scale-removal transform hands this loss coefficients
+        # divided by the fitted per-target scales and records their reciprocal;
+        # EC is not homogeneous in the coefficients, so undo the scaling
+        # exactly, entry by entry, through the same flattening.
+        scale_key = removed_scale_name(self.target)
+        if extra_data is not None and scale_key in extra_data:
+            inverse, inverse_counts = _flatten_to_pyscf_order(extra_data[scale_key])
+            if not torch.equal(counts, inverse_counts.to(counts.device)):
+                raise ValueError(
+                    f"target '{self.target}': the recorded removed scale does "
+                    "not share the coefficients' layout."
+                )
+            inverse = inverse.to(dtype=predicted.dtype, device=predicted.device)
+            predicted = predicted / inverse
+            reference = reference / inverse
+
+        system_of_atom = (
+            prediction_map.block(prediction_map.keys[0])
+            .samples.values[:, 0]
+            .to(torch.int64)
+        )
+        sizes = (
+            torch.zeros(len(moments), dtype=counts.dtype, device=counts.device)
+            .scatter_add_(0, system_of_atom, counts)
+            .tolist()
+        )
+
+        per_system = []
+        zero = predicted.new_zeros(())
+        for c_pred, c_ref, moment, vector, constant in zip(
+            torch.split(predicted, sizes),
+            torch.split(reference, sizes),
+            moments,
+            vectors,
+            constants,
+            strict=True,
+        ):
+            if vector.shape[1] != len(c_pred):
+                # The no-patch placeholder is recognised by its shape; any
+                # other width is a basis mismatch and must not pass silently.
+                if vector.shape[1] == 1 and not bool(constant.any()):
+                    per_system.append(zero)
+                    continue
+                raise ValueError(
+                    f"target '{self.target}' has {len(c_pred)} coefficients for "
+                    f"a system whose EC machinery expects {vector.shape[1]}. "
+                    f"Check that 'aux_basis' ('{self.aux_basis}') matches the "
+                    "basis the dataset was fitted in."
+                )
+            ec_pred = self._ec(c_pred, moment, vector, constant)
+            ec_ref = self._ec(c_ref, moment, vector, constant)
+            if ec_pred is None or ec_ref is None:
+                per_system.append(zero)
+                continue
+            per_system.append((ec_pred - ec_ref).square().to(zero.dtype))
+
+        stacked = torch.stack(per_system)
+        if self.reduction == "mean":
+            return stacked.mean()
+        elif self.reduction == "sum":
+            return stacked.sum()
+        elif self.reduction == "none":
+            return stacked
+        raise ValueError(f"unknown reduction '{self.reduction}'")
+
+
 class ShiftAgnosticMSE(LossInterface):
     """
     Shift agnostic MSE loss on :py:class:`TensorMap` entries.
@@ -1673,6 +1920,7 @@ class LossType(Enum):
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
     DENSITY_MSE_VIA_C = ("density_mse_via_c", DensityMSELossViaC)
     DENSITY_MSE_VIA_W = ("density_mse_via_w", DensityMSELossViaW)
+    EC_MSE = ("ec_mse", ECMSELoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key

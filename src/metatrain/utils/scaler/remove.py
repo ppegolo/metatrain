@@ -18,8 +18,9 @@ def removed_scale_name(target_name: str) -> str:
     and what it applies is a *diagonal* factor, not a scalar: a per-atom target
     is scaled per atomic type. That includes losses which would be invariant
     under a scalar (e.g. the quadratic density losses, whose metric would
-    otherwise become ``D^-1 M D^-1``) as well as any loss that is not
-    homogeneous in the target at all.
+    otherwise become ``D^-1 M D^-1``) as well as those that are not homogeneous
+    in the target at all (e.g. the EC loss, whose nuclear potentials do not scale
+    with the coefficients).
 
     :param target_name: Name of the target.
     :return: The ``extra_data`` key.

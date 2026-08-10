@@ -32,9 +32,9 @@ import copy
 import functools
 import importlib
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
@@ -50,6 +50,7 @@ from .data.byte_budget_cache import (
 if TYPE_CHECKING:
     from types import ModuleType
 
+    import numpy
     from pyscf.gto import Mole
 
 
@@ -309,6 +310,53 @@ def esp_factor_name(target_name: str, metric: str) -> str:
     :return: The ``extra_data`` key.
     """
     return f"{metric_matrix_name(target_name, metric)}_esp_factor"
+
+
+def ec_fragment_name(target_name: str) -> str:
+    """Return the dataset field / ``extra_data`` key for per-atom fragment labels.
+
+    The general spelling of the fragment specification: one 0/1 label per atom,
+    stored per atom in the same shape as any other per-atom extra-data field. 0
+    marks the fragment whose surface carries the interface patch — the ligand in
+    a ligand-in-pocket structure — and 1 marks its partner.
+
+    Prefer this over :py:func:`ec_fragment_split_name`, which can only describe
+    a structure whose two fragments occupy contiguous ranges of the atom order.
+    When both are present, this one wins.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The field / ``extra_data`` key.
+    """
+    return f"{target_name}_fragment"
+
+
+def ec_fragment_split_name(target_name: str) -> str:
+    """Return the dataset field / ``extra_data`` key for a target's fragment split.
+
+    The number of atoms in the first fragment of each dimer, stored per system
+    in the same shape as the ``charge`` conditioning field. It is geometry
+    metadata — nothing reference-derived — and it is the one per-structure
+    input the EC machinery cannot compute from the system itself.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The field / ``extra_data`` key.
+    """
+    return f"{target_name}_fragment_split"
+
+
+def ec_machinery_name(target_name: str, part: str) -> str:
+    """Return the ``extra_data`` key for one part of a target's EC machinery.
+
+    The machinery is the geometry-only precontraction of the interface-patch
+    ESP evaluation (see :py:func:`compute_ec_machinery`); it travels as three
+    ragged TensorMaps — ``"moments"``, ``"vectors"`` and ``"constants"`` —
+    packed like the metric matrices.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param part: ``"moments"``, ``"vectors"`` or ``"constants"``.
+    :return: The ``extra_data`` key.
+    """
+    return f"{target_name}_ec_machinery_{part}"
 
 
 def ri_projections_name(target_name: str) -> str:
@@ -628,6 +676,340 @@ def compute_esp_metric(
     return factor.T @ factor
 
 
+# ── Electrostatic-complementarity machinery ───────────────────────────────────
+#
+# EC compares the two fragments' electrostatic potentials on the interface
+# patch: ``EC = -corr(v_0, v_1)``, area-weighted, on fragment 0's
+# solvent-excluded contact patch. Both potentials are affine in the RI
+# coefficients, ``v_f = n_f - V_f^T c``, so every ingredient of the correlation
+# is a quadratic form in ``c`` whose geometry-dependent parts can be contracted
+# once per structure. With ``w`` the normalised area weights and
+# ``K = diag(w) - w w^T`` (the weighted-centring kernel), the centred weighted
+# inner products are
+#
+#     A_fg = v_f^T K v_g
+#          = s_fg - y_g . t_f - y_f . t_g + y_f^T M y_g ,   y_f = mask_f * c
+#
+# with the geometry-only ``M = V K V^T`` (naux x naux), ``t_f = V K n_f`` and
+# ``s_fg = n_f^T K n_g``, and ``EC = -A_01 / sqrt(A_00 A_11)``. The per-step
+# cost is two ``naux x naux`` matrix-vector products per structure and
+# coefficient vector — no surface points, no PySCF — and everything contracted
+# here depends only on the geometry and the fragment split, never on any
+# coefficient vector.
+
+#: Probe radius of the EC interface patch: a water probe, 1.4 Angstrom in Bohr.
+EC_PROBE_RADIUS = 1.4 / 0.52917721092
+
+#: Points per atomic sphere for the EC patch. Denser than the ESP loss grid
+#: because the patch is a small cutout of the surface; matches the grid the EC
+#: benchmark itself is evaluated on, so the trained quantity is the scored one.
+EC_POINTS_PER_ATOM = 200
+
+#: Patches with fewer points than this carry no meaningful correlation; the
+#: structure then contributes zero to the EC loss (monomers, split dimers).
+EC_MIN_PATCH_POINTS = 10
+
+#: Closest approach in Angstrom that a jittered placement must respect. A shift
+#: bringing any ligand-partner pair below this is drawn again; see
+#: :py:func:`_ec_partner_shifts` for why the patch cannot catch this by itself.
+EC_JITTER_MIN_CONTACT = 1.0
+
+#: Draws allowed before the true placement is used instead.
+EC_JITTER_ATTEMPTS = 8
+
+
+def _ec_fibonacci_sphere(count: int) -> "numpy.ndarray":
+    """Near-uniform points on the unit sphere, deterministic.
+
+    :param count: Number of points.
+    :return: Numpy array of shape ``(count, 3)``.
+    """
+    import numpy as np
+
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - (2.0 * np.arange(count) + 1.0) / count
+    rho = np.sqrt(1.0 - z * z)
+    phi = golden * np.arange(count)
+    return np.stack([rho * np.cos(phi), rho * np.sin(phi), z], axis=1)
+
+
+def ec_fragment_indices(
+    split: Union[int, Sequence[int], "numpy.ndarray"], n_atoms: int
+) -> Tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Resolve a fragment specification into the two groups of atom indices.
+
+    Two spellings are accepted, and they mean the same thing whenever both can
+    express it:
+
+    * an ``int`` — the number of leading atoms that form fragment 0, the shape a
+      dimer file already has, where the two molecules are stored one after the
+      other;
+    * a per-atom sequence of 0/1 labels — the general spelling, which does not
+      require the two fragments to occupy contiguous ranges. A ligand inside a
+      pocket is the case that needs it: the ligand's atoms may sit anywhere in
+      the file, and the pocket's atoms around them.
+
+    Fragment 0 is the one whose surface carries the patch — the ligand, in the
+    ligand-in-pocket reading.
+
+    :param split: Leading-atom count, or per-atom 0/1 labels.
+    :param n_atoms: Number of atoms in the structure.
+    :return: ``(own, partner)``, index arrays into the atoms.
+    :raises ValueError: If the labels are not 0/1, or are the wrong length.
+    """
+    import numpy as np
+
+    if isinstance(split, (int, np.integer)):
+        labels = (np.arange(n_atoms) >= int(split)).astype(int)
+    else:
+        labels = np.asarray(split, dtype=int).reshape(-1)
+        if len(labels) != n_atoms:
+            raise ValueError(
+                f"fragment labels have length {len(labels)}, expected one per "
+                f"atom ({n_atoms})."
+            )
+        if not np.isin(labels, (0, 1)).all():
+            raise ValueError(
+                "fragment labels must be 0 (the patch-carrying fragment) or 1 "
+                f"(its partner); got values {sorted(set(labels.tolist()))}."
+            )
+    return np.where(labels == 0)[0], np.where(labels == 1)[0]
+
+
+def _ec_interface_patch(
+    centres: "numpy.ndarray",
+    charges: "numpy.ndarray",
+    split: Union[int, Sequence[int], "numpy.ndarray"],
+) -> Tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Fragment 0's solvent-excluded contact patch with a partner.
+
+    Fragment 0's own SES is built as if the partner were absent — SAS points
+    over its own atoms, projected back to the van der Waals sphere of the atom
+    that generated them — and a contact point is kept when the partner buries
+    the *probe centre* that generated it, since it is the probe, not the
+    contact point on the vdW surface, that the partner blocks.
+
+    :param centres: All atom positions in Bohr, shape ``(n_atoms, 3)``.
+    :param charges: Atomic numbers of all atoms.
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :return: ``(points, areas)`` in Bohr and Bohr^2, possibly empty.
+    """
+    import numpy as np
+
+    radii = importlib.import_module("pyscf.data.radii")
+
+    vdw = radii.VDW[charges]
+    accessible = vdw + EC_PROBE_RADIUS
+    own, partner = ec_fragment_indices(split, len(centres))
+
+    # SAS of fragment 0 alone: burial judged among its own atoms only.
+    unit = _ec_fibonacci_sphere(EC_POINTS_PER_ATOM)
+    points, areas, owner = [], [], []
+    for atom in own:
+        candidates = centres[atom] + accessible[atom] * unit
+        buried = np.zeros(len(candidates), dtype=bool)
+        for other in own:
+            if other == atom:
+                continue
+            distance = np.linalg.norm(candidates - centres[other], axis=1)
+            buried |= distance < accessible[other]
+        kept = candidates[~buried]
+        points.append(kept)
+        areas.append(
+            np.full(len(kept), 4.0 * np.pi * accessible[atom] ** 2 / EC_POINTS_PER_ATOM)
+        )
+        owner.append(np.full(len(kept), atom, dtype=int))
+    if not points:
+        return np.zeros((0, 3)), np.zeros(0)
+    probe_centres = np.concatenate(points)
+    areas = np.concatenate(areas)
+    owner = np.concatenate(owner)
+    if len(probe_centres) == 0:
+        return np.zeros((0, 3)), np.zeros(0)
+
+    # Project onto the vdW sphere (the SES contact patch), shrink the area
+    # elements accordingly, and drop points that fall inside another own atom.
+    direction = probe_centres - centres[owner]
+    direction /= np.linalg.norm(direction, axis=1)[:, None]
+    contact = centres[owner] + vdw[owner][:, None] * direction
+    contact_areas = areas * (vdw[owner] / accessible[owner]) ** 2
+    distances = np.linalg.norm(contact[:, None, :] - centres[own][None, :, :], axis=2)
+    inside = distances < vdw[own][None, :] - 1e-9
+    # ``owner`` holds atom indices; the column of that atom within ``own``.
+    column = np.searchsorted(own, owner)
+    inside[np.arange(len(contact)), column] = False
+    kept = ~inside.any(axis=1)
+    contact, contact_areas, probe_centres = (
+        contact[kept],
+        contact_areas[kept],
+        probe_centres[kept],
+    )
+
+    # The patch: contact points whose probe centre the partner buries.
+    distances = np.linalg.norm(
+        probe_centres[:, None, :] - centres[partner][None, :, :], axis=2
+    )
+    buried = (distances < accessible[partner][None, :]).any(axis=1)
+    return contact[buried], contact_areas[buried]
+
+
+def _ec_displaced_system(
+    system: System,
+    split: Union[int, Sequence[int], "numpy.ndarray"],
+    displacement: "numpy.ndarray",
+) -> System:
+    """Return a copy of ``system`` with the partner fragment rigidly shifted.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :param displacement: Shift in Angstrom, shape ``(3,)``.
+    :return: A new System; the input is not modified.
+    """
+    _, partner = ec_fragment_indices(split, len(system.positions))
+    positions = system.positions.clone()
+    shift = torch.as_tensor(
+        displacement, dtype=positions.dtype, device=positions.device
+    )
+    positions[torch.as_tensor(partner, device=positions.device)] += shift
+    return System(
+        types=system.types,
+        positions=positions,
+        cell=system.cell,
+        pbc=system.pbc,
+    )
+
+
+def ec_pointwise_pieces(
+    system: System,
+    aux_basis: str,
+    split: Union[int, Sequence[int], "numpy.ndarray"],
+    displacement: Optional["numpy.ndarray"] = None,
+) -> Optional[Dict[str, Any]]:
+    """The point-space ingredients of EC for one structure, before contraction.
+
+    Everything here depends only on the geometry, the auxiliary basis and the
+    fragment split. Exposed separately from :py:func:`compute_ec_machinery` so
+    tests can evaluate EC pointwise and pin the contraction identity down.
+
+    ``displacement`` rigidly moves the partner fragment — its nuclei and the
+    auxiliary functions centred on them — before anything is built. This changes
+    the *measurement*, not the data: the resulting EC is a different functional
+    of the same coefficients, and both the prediction and the reference are read
+    through it, so no new reference density is implied. See
+    :py:func:`get_ec_machinery_transform` for why that is the point.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :param displacement: Rigid shift of the partner fragment in Angstrom, shape
+        ``(3,)``, or ``None`` for the true placement.
+    :return: ``None`` when the patch has fewer than
+        :py:data:`EC_MIN_PATCH_POINTS` points; otherwise a dict with the ESP
+        operator ``V[P, p]`` (naux x npoints), normalised area ``weights``,
+        the two fragments' ``nuclear`` potentials at the points, and the two
+        aux-function ownership ``masks``, all float64 numpy arrays.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+
+    if displacement is not None:
+        system = _ec_displaced_system(system, split, displacement)
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    own, partner = ec_fragment_indices(split, auxmol.natm)
+    if len(own) == 0 or len(partner) == 0:
+        return None
+    centres = auxmol.atom_coords()
+    charges = auxmol.atom_charges()
+
+    points, areas = _ec_interface_patch(centres, charges, split)
+    if len(points) < EC_MIN_PATCH_POINTS:
+        return None
+    weights = areas / areas.sum()
+
+    blocks = []
+    for start in range(0, len(points), 2000):
+        fake = gto.fakemol_for_charges(points[start : start + 2000])
+        blocks.append(gto.mole.intor_cross("int2c2e", auxmol, fake))
+    operator = np.concatenate(blocks, axis=1)
+
+    nuclear = []
+    for atoms in (own, partner):
+        distances = np.linalg.norm(
+            points[:, None, :] - centres[atoms][None, :, :], axis=2
+        )
+        nuclear.append((charges[atoms].astype(float)[None, :] / distances).sum(axis=1))
+
+    owner = np.empty(auxmol.nao, dtype=int)
+    ao_loc = auxmol.ao_loc_nr()
+    for shell in range(auxmol.nbas):
+        owner[ao_loc[shell] : ao_loc[shell + 1]] = auxmol.bas_atom(shell)
+    masks = [
+        np.isin(owner, own).astype(float),
+        np.isin(owner, partner).astype(float),
+    ]
+
+    return {
+        "operator": operator,
+        "weights": weights,
+        "nuclear": nuclear,
+        "masks": masks,
+    }
+
+
+def compute_ec_machinery(
+    system: System,
+    aux_basis: str,
+    split: Union[int, Sequence[int], "numpy.ndarray"],
+    displacement: Optional["numpy.ndarray"] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Contract the EC patch evaluation into geometry-only per-structure tensors.
+
+    See the section comment above for the algebra. The electronic potential is
+    ``-V_f^T c`` (electrons lower the potential), so with ``v_f = n_f - V_f^T c``
+    the cross terms of ``A_fg`` enter with a minus sign, which is what the loss
+    side applies.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :param displacement: Rigid shift of the partner fragment in Angstrom, or
+        ``None`` for the true placement.
+    :return: ``None`` when the structure has no usable patch; otherwise
+        ``(moments, vectors, constants)``: ``M = V K V^T`` of shape
+        ``(naux, naux)``; the rows ``t_0, t_1, mask_0, mask_1`` of shape
+        ``(4, naux)``; and ``s_fg = n_f^T K n_g`` of shape ``(2, 2)``. All
+        float64.
+    """
+    import numpy as np
+
+    pieces = ec_pointwise_pieces(system, aux_basis, split, displacement)
+    if pieces is None:
+        return None
+    operator, weights = pieces["operator"], pieces["weights"]
+    n0, n1 = pieces["nuclear"]
+
+    # V K x = (V W x) - (V w)(w . x): the centring never needs the
+    # (npoints x npoints) kernel formed explicitly.
+    weighted = operator * weights[None, :]
+    mean_column = operator @ weights
+    moments = weighted @ operator.T - np.outer(mean_column, mean_column)
+    t_vectors = [weighted @ n - mean_column * (weights @ n) for n in (n0, n1)]
+    constants = np.array(
+        [
+            [weights @ (na * nb) - (weights @ na) * (weights @ nb) for nb in (n0, n1)]
+            for na in (n0, n1)
+        ]
+    )
+
+    vectors = np.stack(t_vectors + pieces["masks"])
+    return (
+        torch.from_numpy(np.ascontiguousarray(moments)).to(torch.float64),
+        torch.from_numpy(vectors).to(torch.float64),
+        torch.from_numpy(constants).to(torch.float64),
+    )
+
+
 def strip_esp_from_spec(spec: str) -> Tuple[str, float, float]:
     """
     Split a metric spec into its dense part and its factored ESP part.
@@ -873,6 +1255,88 @@ def _batch_esp_factors(
     return factors
 
 
+#: Placeholder machinery for structures with no usable patch: recognisably
+#: wrong shapes (the loss checks the mask width against ``naux``) and zero
+#: constants, so such a structure contributes exactly zero to the EC loss.
+_EC_NO_PATCH = (
+    torch.zeros((1, 1), dtype=torch.float64),
+    torch.zeros((4, 1), dtype=torch.float64),
+    torch.zeros((2, 2), dtype=torch.float64),
+)
+
+
+def _ec_split_tag(split: Any) -> str:
+    """A short, stable cache tag for a fragment specification.
+
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :return: A string that distinguishes it from any other specification.
+    """
+    if isinstance(split, int):
+        return str(split)
+    return "|".join(str(int(v)) for v in split)
+
+
+def _batch_ec_machinery(
+    systems: List[System],
+    system_ids: Optional[List[int]],
+    aux_basis: str,
+    splits: List[Any],
+    displacements: Optional[List[Optional["numpy.ndarray"]]] = None,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """EC machinery for one batch, through the cache when ids are available.
+
+    Without a displacement the machinery is built on first touch inside the
+    dataloader worker and cached across epochs, exactly like the metric
+    matrices: it depends only on the unaugmented geometry and the fragment
+    split, both identical every epoch. Memory per structure is dominated by the
+    ``(naux, naux)`` moment matrix, i.e. the same footprint as one metric
+    matrix.
+
+    With a displacement the machinery is **not** cached and not reused. A fresh
+    partner placement is drawn for every structure at every step, so a cache
+    entry would never be read a second time; caching would only evict the
+    metric matrices, which are reused.
+
+    :param systems: The batch's systems, in batch order.
+    :param system_ids: Native dataset ids of those systems, or ``None``.
+    :param aux_basis: Auxiliary basis name.
+    :param splits: Fragment specification per system, see
+        :py:func:`ec_fragment_indices`.
+    :param displacements: Per-system partner shift in Angstrom, or ``None`` for
+        an unaugmented batch.
+    :return: One ``(moments, vectors, constants)`` triple per system.
+    """
+    if system_ids is None:
+        system_ids = [None] * len(systems)  # type: ignore[list-item]
+    if displacements is None:
+        displacements = [None] * len(systems)
+    # The cache holds single tensors, so the three parts live under three keys;
+    # they are written together, so either all are present or none is.
+    parts = ("moments", "vectors", "constants")
+    cache = _metric_matrix_cache()
+    machinery = []
+    for system, system_id, split, shift in zip(
+        systems, system_ids, splits, displacements, strict=True
+    ):
+        cacheable = system_id is not None and shift is None
+        keys = [
+            (aux_basis, f"ec-machinery-{part}|split={_ec_split_tag(split)}", system_id)
+            for part in parts
+        ]
+        cached = [cache.get(key) for key in keys] if cacheable else [None]
+        if all(tensor is not None for tensor in cached):
+            machinery.append((cached[0], cached[1], cached[2]))
+            continue
+        entry = compute_ec_machinery(system, aux_basis, split, shift)
+        if entry is None:
+            entry = _EC_NO_PATCH
+        if cacheable:
+            for key, tensor in zip(keys, entry, strict=True):
+                cache.put(key, tensor)
+        machinery.append(entry)
+    return machinery
+
+
 # ── Collate transforms ────────────────────────────────────────────────────────
 
 
@@ -934,6 +1398,186 @@ def get_metric_matrices_transform(
     parse_metric_spec(metric)  # validate eagerly, not in the first batch
     return functools.partial(
         _metric_matrices_transform, dict(target_to_aux_basis), metric
+    )
+
+
+def _ec_batch_splits(
+    target_name: str, systems: List[System], extra: Dict[str, TensorMap]
+) -> List[Any]:
+    """The fragment specification of every system in the batch.
+
+    Per-atom labels win when present; otherwise the per-system leading-atom
+    count is accepted, so datasets written before the general spelling existed
+    keep working.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param systems: The batch's systems, in batch order.
+    :param extra: The batch's extra data.
+    :return: One specification per system.
+    :raises RuntimeError: If neither field is present.
+    """
+    import numpy as np
+
+    atom_key = ec_fragment_name(target_name)
+    if atom_key in extra:
+        block = extra[atom_key][0]
+        labels = block.values.reshape(-1).to(torch.int64).cpu().numpy()
+        index = block.samples.column("system").cpu().numpy()
+        return [np.asarray(labels[index == i]) for i in range(len(systems))]
+
+    split_key = ec_fragment_split_name(target_name)
+    if split_key in extra:
+        return [int(v) for v in extra[split_key][0].values.reshape(-1)]
+
+    raise RuntimeError(
+        f"the EC loss on target '{target_name}' requires a fragment "
+        f"specification: either the per-atom field '{atom_key}' (0 for the "
+        f"patch-carrying fragment, 1 for its partner) or the per-system field "
+        f"'{split_key}' (the number of atoms in the first fragment, for "
+        "structures whose fragments are contiguous). Add one to the dataset "
+        "like the 'charge' field and declare it in the options file's "
+        "extra_data section."
+    )
+
+
+def _ec_partner_shifts(
+    jitter: float,
+    system_ids: Optional[List[int]],
+    systems: List[System],
+    splits: List[Any],
+) -> Optional[List[Optional["numpy.ndarray"]]]:
+    """Draw one rigid partner shift per system, or ``None`` when disabled.
+
+    A shift that drives the two fragments into each other is rejected and drawn
+    again. This matters in dense structures: a protein pocket already holds the
+    ligand at hydrogen-bond range, about 1.5-1.8 Angstrom, so a shift of a few
+    tenths can push a pair of atoms to within a fraction of an Angstrom. The
+    patch does not notice — its size stays within a few per cent of normal — so
+    the term would be evaluated on overlapping nuclei with nothing reporting it.
+    Measured on OMol25 pockets and interfaces, a 0.4 Angstrom shift does this to
+    2-4% of draws, which is the fraction rejected here.
+
+    The floor never demands more than the structure already achieves: a
+    structure whose fragments are closer than
+    :py:data:`EC_JITTER_MIN_CONTACT` to begin with is only required not to get
+    worse. After :py:data:`EC_JITTER_ATTEMPTS` failures the true placement is
+    used, which costs one augmented sample and never a wrong geometry.
+
+    The draw is seeded from one fresh value consumed from the worker's own
+    torch generator per batch, combined with the system id. Consuming the
+    generator is what makes the shifts fresh at every step: the worker's
+    *seed* is constant for the whole run whenever workers persist across
+    epochs (the trainers set ``persistent_workers``) and always in the
+    main process (``num_workers=0``), so anything derived from the seed
+    alone would hand every system one fixed placement for all of training.
+    A run remains reproducible from its global seed, because the generator
+    itself is seeded from it.
+
+    :param jitter: Standard deviation of the shift in Angstrom; 0 disables it.
+    :param system_ids: Native dataset ids, or ``None`` when unavailable.
+    :param systems: The batch's systems, in batch order.
+    :param splits: Fragment specification per system, see
+        :py:func:`ec_fragment_indices`.
+    :return: One shift per system, or ``None``.
+    """
+    import numpy as np
+
+    if jitter <= 0.0:
+        return None
+    base = int(torch.randint(0, 2**62, (1,)).item())
+    ids = system_ids if system_ids is not None else list(range(len(systems)))
+
+    shifts = []
+    for system_id, system, split in zip(ids, systems, splits, strict=True):
+        generator = np.random.default_rng((base, int(system_id)))
+        positions = system.positions.detach().cpu().double().numpy()
+        own, partner = ec_fragment_indices(split, len(positions))
+        if len(own) == 0 or len(partner) == 0:
+            shifts.append(generator.normal(0.0, jitter, size=3))
+            continue
+        here, there = positions[own], positions[partner]
+        gaps = np.linalg.norm(here[:, None, :] - there[None, :, :], axis=2)
+        floor = min(EC_JITTER_MIN_CONTACT, float(gaps.min()))
+
+        chosen = np.zeros(3)
+        for _ in range(EC_JITTER_ATTEMPTS):
+            shift = generator.normal(0.0, jitter, size=3)
+            moved = np.linalg.norm(
+                here[:, None, :] - (there + shift)[None, :, :], axis=2
+            ).min()
+            if moved >= floor:
+                chosen = shift
+                break
+        shifts.append(chosen)
+    return shifts
+
+
+def _ec_machinery_transform(
+    target_to_aux_basis: Mapping[str, str],
+    jitter: float,
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    extra: Dict[str, TensorMap],
+) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+    system_ids = batch_system_ids(extra)
+    packed_by_basis: Dict[str, List[TensorMap]] = {}
+    for target_name, aux_basis in target_to_aux_basis.items():
+        splits = _ec_batch_splits(target_name, systems, extra)
+        # The shift depends on the fragments, so it is drawn per target here;
+        # every EC target of a batch shares one geometry, and the generator is
+        # seeded the same way, so they all receive the same placement.
+        shifts = _ec_partner_shifts(jitter, system_ids, systems, splits)
+        share_key = f"{aux_basis}|{[_ec_split_tag(s) for s in splits]}"
+        if share_key not in packed_by_basis:
+            machinery = _batch_ec_machinery(
+                systems, system_ids, aux_basis, splits, shifts
+            )
+            packed_by_basis[share_key] = [
+                pack_metric_matrices([entry[i] for entry in machinery])
+                for i in range(3)
+            ]
+        for part, packed in zip(
+            ("moments", "vectors", "constants"),
+            packed_by_basis[share_key],
+            strict=True,
+        ):
+            extra[ec_machinery_name(target_name, part)] = packed
+    return systems, targets, extra
+
+
+def get_ec_machinery_transform(
+    target_to_aux_basis: Mapping[str, str],
+    jitter: float = 0.0,
+) -> Callable:
+    """
+    Build a collate transform attaching per-target EC machinery.
+
+    Like :py:func:`get_metric_matrices_transform`, **this must run before the
+    augmenter**: the machinery is built on the unaugmented geometry, the frame
+    the reference coefficients were fitted in, and the EC loss declares
+    ``evaluate_in_original_frame`` accordingly. Entries are cached across
+    epochs in the same worker-level byte-budgeted cache as the metric matrices.
+
+    **Partner jitter.** With ``jitter > 0`` the partner fragment is rigidly
+    displaced by a fresh random shift for every structure at every step, and the
+    machinery is rebuilt rather than cached. This is augmentation of the
+    *measurement*, not of the data: the displaced structure is never claimed to
+    be a physical system, no new reference density is needed, and the prediction
+    and the reference are read through the identical displaced functional, so
+    their difference remains a true error of the model. Its purpose is to stop
+    the EC term from teaching one fixed direction per structure — the direction
+    is a fixed local operator contracted with the partner's field, so varying
+    the field forces the model to learn the operator instead of the direction.
+    The average over steps plays the role of an average over placements, at one
+    placement's cost.
+
+    :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
+    :param jitter: Standard deviation in Angstrom of the partner shift; 0
+        disables the augmentation and restores caching.
+    :return: A collate transform.
+    """
+    return functools.partial(
+        _ec_machinery_transform, dict(target_to_aux_basis), float(jitter)
     )
 
 
