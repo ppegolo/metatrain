@@ -165,6 +165,7 @@ def make_metric_spec(
     quadrupole_weight: float = 0.0,
     esp_weight: float = 0.0,
     esp_shell: Optional[float] = None,
+    group_charge_weight: float = 0.0,
 ) -> str:
     """Build the canonical metric-spec string shared by the loss and the transform.
 
@@ -192,6 +193,12 @@ def make_metric_spec(
     :param esp_shell: Scaling of the van der Waals radii defining that surface.
         ``None`` uses :py:data:`DEFAULT_ESP_SHELL`. Ignored when
         ``esp_weight == 0``.
+    :param group_charge_weight: Weight on the per-group electron-count penalty,
+        ``w * sum_g (S_g . dc)**2``, where ``S_g`` is the electron-count
+        functional restricted to the atoms of group ``g`` (see
+        :py:func:`compute_group_charge_factor`). ``0`` disables it. Unlike
+        ``charge_weight``, this sees charge moved *between* groups, which
+        leaves the total untouched.
     :return: Canonical spec string.
     """
     if metric not in METRICS:
@@ -203,6 +210,7 @@ def make_metric_spec(
         ("dipole_weight", dipole_weight),
         ("quadrupole_weight", quadrupole_weight),
         ("esp_weight", esp_weight),
+        ("group_charge_weight", group_charge_weight),
     ):
         if weight < 0.0:
             raise ValueError(f"{weight_name} must be >= 0, got {weight}.")
@@ -212,7 +220,12 @@ def make_metric_spec(
             f"got metric='{metric}' with omega={omega}."
         )
     if omega == 0.0 and charge_weight == 0.0:
-        if dipole_weight == 0.0 and quadrupole_weight == 0.0 and esp_weight == 0.0:
+        if (
+            dipole_weight == 0.0
+            and quadrupole_weight == 0.0
+            and esp_weight == 0.0
+            and group_charge_weight == 0.0
+        ):
             return metric
     resolved_eps = DEFAULT_LR_EPS if eps is None else float(eps)
     if resolved_eps < 0.0:
@@ -232,7 +245,26 @@ def make_metric_spec(
         if resolved_shell <= 0.0:
             raise ValueError(f"esp_shell must be > 0, got {resolved_shell}.")
         spec += f"|esp={float(esp_weight):.10g}|shell={resolved_shell:.10g}"
+    if group_charge_weight > 0.0:
+        spec += f"|gq={float(group_charge_weight):.10g}"
     return spec
+
+
+def parse_group_charge_weight(spec: str) -> float:
+    """Read the per-group electron-count weight out of a metric spec.
+
+    Kept apart from :py:func:`parse_metric_spec`, whose tuple is the documented
+    return of a public function: this term arrived later, and widening that
+    tuple would break every caller that unpacks it.
+
+    :param spec: Canonical spec string.
+    :return: The weight, ``0`` when the term is absent.
+    """
+    if "|" not in spec:
+        return 0.0
+    _, *parts = spec.split("|")
+    values = dict(part.split("=") for part in parts)
+    return float(values.get("gq", 0.0))
 
 
 def parse_metric_spec(
@@ -310,6 +342,35 @@ def esp_factor_name(target_name: str, metric: str) -> str:
     :return: The ``extra_data`` key.
     """
     return f"{metric_matrix_name(target_name, metric)}_esp_factor"
+
+
+def group_charge_factor_name(target_name: str, metric: str) -> str:
+    """Return the ``extra_data`` key for a target's per-group charge factors.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
+    :return: The ``extra_data`` key.
+    """
+    return f"{metric_matrix_name(target_name, metric)}_group_charge_factor"
+
+
+def charge_group_name(target_name: str) -> str:
+    """Return the dataset field / ``extra_data`` key for per-atom charge groups.
+
+    One integer label per atom, in the same shape as any other per-atom
+    extra-data field. The labels name the pieces whose electron counts are
+    penalised separately: the two partners of a complex, or the charged ends of
+    a zwitterion. They need not be contiguous, and any number of groups is
+    allowed.
+
+    When this field is absent the per-atom EC fragment labels
+    (:py:func:`ec_fragment_name`) are used, so a dataset prepared for the EC
+    loss needs nothing added to penalise its two fragments' charges.
+
+    :param target_name: Name of the RI-coefficient target.
+    :return: The field / ``extra_data`` key.
+    """
+    return f"{target_name}_charge_group"
 
 
 def ec_fragment_name(target_name: str) -> str:
@@ -553,6 +614,57 @@ def compute_multipole_vectors(
                     ao_loc[shell] + i_contraction * n_components + component,
                 ] = moment
     return torch.from_numpy(vectors).to(torch.float64)
+
+
+def compute_group_charge_factor(
+    system: System, aux_basis: str, groups: "numpy.ndarray"
+) -> torch.Tensor:
+    """
+    Compute the per-group electron-count factor ``F_q``.
+
+    Row ``g`` is the electron-count functional
+    :py:func:`compute_charge_vector` masked to the auxiliary functions of the
+    atoms in group ``g``, so ``|F_q dc|**2 = sum_g (S_g . dc)**2`` is the summed
+    squared error of the groups' electron counts.
+
+    The whole-system ``charge_weight`` cannot see this error: charge moved from
+    one group to another leaves ``S . dc`` at zero while shifting each group's
+    potential, which on a binding interface is a first-order error in every
+    electrostatic quantity, and in a zwitterion is the difference between the
+    neutral and the charge-separated form.
+
+    Carried as a factor rather than folded into the dense metric because it
+    depends on the groups, which are per-system data the metric-matrix cache is
+    not keyed on -- and because it is a rank-``K`` term with ``K`` at two or
+    three, so forming ``F_q^T F_q`` would cost far more than applying it.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param groups: One integer label per atom; the distinct labels, in ascending
+        order, index the rows.
+    :return: Dense ``(n_groups, n_basis)`` matrix in PySCF AO order, float64.
+    """
+    import numpy as np
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    labels = np.asarray(groups).reshape(-1)
+    if len(labels) != auxmol.natm:
+        raise ValueError(
+            f"the charge groups have {len(labels)} labels for a system of "
+            f"{auxmol.natm} atoms; there must be exactly one label per atom."
+        )
+
+    owner = np.empty(auxmol.nao, dtype=int)
+    ao_loc = auxmol.ao_loc_nr()
+    for shell in range(auxmol.nbas):
+        owner[ao_loc[shell] : ao_loc[shell + 1]] = auxmol.bas_atom(shell)
+
+    charge = compute_charge_vector(system, aux_basis).numpy()
+    rows = [
+        charge * np.isin(owner, np.flatnonzero(labels == label))
+        for label in np.unique(labels)
+    ]
+    return torch.from_numpy(np.ascontiguousarray(np.stack(rows))).to(torch.float64)
 
 
 def compute_surface_points(
@@ -1255,6 +1367,74 @@ def _batch_esp_factors(
     return factors
 
 
+def _batch_group_charge_factors(
+    systems: List[System],
+    system_ids: Optional[List[int]],
+    aux_basis: str,
+    groups: List["numpy.ndarray"],
+) -> List[torch.Tensor]:
+    """Per-group charge factors for one batch, through the cache when ids exist.
+
+    The factor depends on the geometry *and* on the grouping, so the grouping
+    goes in the cache key: two runs that split the same structures differently
+    must not share entries.
+
+    :param systems: The batch's systems, in batch order.
+    :param system_ids: Native dataset ids of those systems, or ``None``.
+    :param aux_basis: Auxiliary basis name.
+    :param groups: Per-atom group labels of each system, in batch order.
+    :return: One ``(n_groups_i, n_basis_i)`` factor per system, in batch order.
+    """
+    if system_ids is None:
+        return [
+            compute_group_charge_factor(system, aux_basis, label)
+            for system, label in zip(systems, groups, strict=True)
+        ]
+    cache = _metric_matrix_cache()
+    factors = []
+    for system, system_id, label in zip(systems, system_ids, groups, strict=True):
+        key = (aux_basis, f"group-charge|groups={_ec_split_tag(label)}", system_id)
+        factor = cache.get(key)
+        if factor is None:
+            factor = compute_group_charge_factor(system, aux_basis, label)
+            cache.put(key, factor)
+        factors.append(factor)
+    return factors
+
+
+def _batch_charge_groups(
+    target_name: str, systems: List[System], extra: Dict[str, TensorMap]
+) -> List["numpy.ndarray"]:
+    """The per-atom charge-group labels of every system in the batch.
+
+    The target's own field wins; the EC fragment labels are the fallback, so a
+    dataset prepared for the EC loss needs nothing added.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param systems: The batch's systems, in batch order.
+    :param extra: The batch's extra data.
+    :return: One label array per system.
+    :raises RuntimeError: If neither field is present.
+    """
+    import numpy as np
+
+    for key in (charge_group_name(target_name), ec_fragment_name(target_name)):
+        if key not in extra:
+            continue
+        block = extra[key][0]
+        labels = block.values.reshape(-1).to(torch.int64).cpu().numpy()
+        index = block.samples.column("system").cpu().numpy()
+        return [np.asarray(labels[index == i]) for i in range(len(systems))]
+
+    raise RuntimeError(
+        f"the per-group charge penalty on target '{target_name}' requires "
+        f"per-atom group labels: the field '{charge_group_name(target_name)}', "
+        f"or '{ec_fragment_name(target_name)}' if the groups are the EC "
+        "fragments. Add one to the dataset like the 'charge' field and declare "
+        "it in the options file's extra_data section."
+    )
+
+
 #: Placeholder machinery for structures with no usable patch: recognisably
 #: wrong shapes (the loss checks the mask width against ``naux``) and zero
 #: constants, so such a structure contributes exactly zero to the EC loss.
@@ -1353,6 +1533,7 @@ def _metric_matrices_transform(
     # key the loss looks up — carries the base terms, and the factor travels
     # alongside it under esp_factor_name for the loss to apply itself.
     base_metric, esp_weight, esp_shell = strip_esp_from_spec(metric)
+    group_charge_weight = parse_group_charge_weight(metric)
     packed_by_basis: Dict[str, TensorMap] = {}
     factors_by_basis: Dict[str, TensorMap] = {}
     for target_name, aux_basis in target_to_aux_basis.items():
@@ -1367,6 +1548,17 @@ def _metric_matrices_transform(
         extra[metric_matrix_name(target_name, metric)] = packed_by_basis[aux_basis]
         if esp_weight > 0.0:
             extra[esp_factor_name(target_name, metric)] = factors_by_basis[aux_basis]
+        if group_charge_weight > 0.0:
+            # Per target, not per basis: the grouping is a property of the
+            # target's own field, so two targets on one basis may disagree.
+            extra[group_charge_factor_name(target_name, metric)] = pack_metric_matrices(
+                _batch_group_charge_factors(
+                    systems,
+                    system_ids,
+                    aux_basis,
+                    _batch_charge_groups(target_name, systems, extra),
+                )
+            )
     return systems, targets, extra
 
 

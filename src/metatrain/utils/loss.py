@@ -28,6 +28,7 @@ from metatrain.utils.data import TargetInfo
 from metatrain.utils.pyscf_loss import (
     ec_machinery_name,
     esp_factor_name,
+    group_charge_factor_name,
     make_metric_spec,
     metric_matrix_name,
     ri_density_fit_constant_name,
@@ -579,6 +580,13 @@ class _DensityLoss(LossInterface):
       accessible-surface grid (``esp_shell`` times the van der Waals radii),
       which traces cavity and pocket walls without any per-system region
       choices.
+    - ``group_charge_weight > 0`` penalises each *group's* electron-count error,
+      ``sum_g (S_g . dc)**2``, with the groups read from a per-atom field (see
+      :py:func:`~metatrain.utils.pyscf_loss.charge_group_name`). ``charge_weight``
+      is blind to charge moved between groups, because the total is unchanged;
+      across a binding interface that misplaced charge shifts each partner's
+      potential by roughly ``dq/r``, and in a zwitterion it is the difference
+      between the neutral and the charge-separated form.
 
     :param name: key of the coefficient target.
     :param gradient: not supported; must be ``None``.
@@ -601,6 +609,8 @@ class _DensityLoss(LossInterface):
         disables it.
     :param esp_shell: van der Waals scaling of the ESP surface; ``None`` uses
         the package default. Ignored when ``esp_weight == 0``.
+    :param group_charge_weight: weight on the per-group electron-count penalty;
+        ``0`` disables it. Needs per-atom group labels in the dataset.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -623,6 +633,7 @@ class _DensityLoss(LossInterface):
         quadrupole_weight: float = 0.0,
         esp_weight: float = 0.0,
         esp_shell: Optional[float] = None,
+        group_charge_weight: float = 0.0,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -648,12 +659,15 @@ class _DensityLoss(LossInterface):
             quadrupole_weight,
             esp_weight,
             esp_shell,
+            group_charge_weight,
         )
         self.aux_basis = aux_basis
-        # Applied by the loss itself: the ESP term travels as a factor rather
-        # than folded into the metric matrix (see
-        # metatrain.utils.pyscf_loss.compute_esp_factor).
+        # Applied by the loss itself: these terms travel as factors rather than
+        # folded into the metric matrix (see
+        # metatrain.utils.pyscf_loss.compute_esp_factor and
+        # compute_group_charge_factor).
         self.esp_weight = float(esp_weight)
+        self.group_charge_weight = float(group_charge_weight)
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
         if extra_data is None or key not in extra_data:
@@ -820,6 +834,20 @@ class DensityMSELossViaC(_DensityLoss):
             factors = unpack_metric_matrices(packed)
             per_system = [
                 value + self.esp_weight * torch.mv(factor, delta).square().sum()
+                for value, delta, factor in zip(
+                    per_system, deltas, factors, strict=True
+                )
+            ]
+        if self.group_charge_weight > 0.0:
+            # Same shape as the ESP term, at a fraction of the cost: the factor
+            # has one row per group, not one per surface point.
+            packed = self._require(
+                extra_data, group_charge_factor_name(self.target, self.metric)
+            )
+            factors = unpack_metric_matrices(packed)
+            per_system = [
+                value
+                + self.group_charge_weight * torch.mv(factor, delta).square().sum()
                 for value, delta, factor in zip(
                     per_system, deltas, factors, strict=True
                 )
