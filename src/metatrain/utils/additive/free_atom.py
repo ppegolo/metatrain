@@ -198,10 +198,20 @@ def set_free_atom_composition_weights(
     base = composition_model.model
     atomic_types: List[int] = [int(t) for t in base.atomic_types]
 
-    coefficients = {
-        atomic_type: free_atom_coefficients(atomic_type, basis, aux_basis)
-        for atomic_type in atomic_types
-    }
+    # The atomic SCF runs in a disposable *spawned* subprocess, never in this
+    # process: PySCF initializes OpenMP/BLAS thread state, and the dataloader
+    # workers forked later from this process can deadlock in the child if that
+    # state is live at fork time (the classic fork-in-a-threaded-process
+    # hazard; observed as a hang before the first batch on multi-GPU nodes).
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(processes=1) as pool:
+        results = pool.starmap(
+            free_atom_coefficients,
+            [(atomic_type, basis, aux_basis) for atomic_type in atomic_types],
+        )
+    coefficients = dict(zip(atomic_types, results, strict=True))
 
     for target_name in base.target_names:
         weights = base.weights[target_name]

@@ -74,6 +74,11 @@ def train_or_load_composition_model(
             Trainer(hypers=hypers).save_checkpoint(
                 composition_model, Path(checkpoint_dir) / "composition_model.ckpt"
             )
+        # The fitted path ends in collective all_reduces, so every rank leaves
+        # it in lockstep; mirror that here rather than letting rank 0 (which
+        # also wrote the checkpoint) trail the others into the next stage.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         return
 
     if isinstance(atomic_baseline, str):

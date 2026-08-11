@@ -257,9 +257,9 @@ def test_dense_prediction_matches_a_padded_one():
 
     extra = _extra_via_transform(systems, [2])
     loss = _loss()
-    assert float(loss.compute({TARGET: dense}, {TARGET: target}, extra)) == pytest.approx(
-        float(loss.compute({TARGET: padded}, {TARGET: target}, extra))
-    )
+    assert float(
+        loss.compute({TARGET: dense}, {TARGET: target}, extra)
+    ) == pytest.approx(float(loss.compute({TARGET: padded}, {TARGET: target}, extra)))
 
 
 @pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
