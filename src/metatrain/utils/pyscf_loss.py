@@ -156,6 +156,43 @@ DEFAULT_ESP_SHELL = 1.4
 ESP_POINTS_PER_ATOM = 50
 
 
+def _canonical_shells(
+    esp_shell: Optional[Union[float, Sequence[float]]],
+) -> Tuple[float, ...]:
+    """Normalise an ESP shell specification to a sorted tuple of scalings.
+
+    :param esp_shell: A single van der Waals scaling, a sequence of them (a
+        RESP-style multi-shell surface), or ``None`` for the package default.
+    :return: The shells, ascending and deduplicated.
+    """
+    if esp_shell is None:
+        return (DEFAULT_ESP_SHELL,)
+    if isinstance(esp_shell, (int, float)):
+        shells: Tuple[float, ...] = (float(esp_shell),)
+    else:
+        shells = tuple(sorted({float(s) for s in esp_shell}))
+    if len(shells) == 0:
+        raise ValueError("esp_shell must name at least one shell.")
+    for shell in shells:
+        if shell <= 0.0:
+            raise ValueError(f"esp_shell must be > 0, got {shell}.")
+    return shells
+
+
+def _shell_tag(esp_shell: Union[float, Sequence[float]]) -> str:
+    """The canonical string form of a shell specification, for specs and keys.
+
+    A single shell renders exactly as it always did, so specs and cache keys
+    from before multi-shell surfaces existed stay byte-identical.
+
+    :param esp_shell: A single scaling or a sequence of them.
+    :return: Comma-joined ``%.10g`` values, ascending.
+    """
+    if isinstance(esp_shell, (int, float)):
+        return f"{float(esp_shell):.10g}"
+    return ",".join(f"{s:.10g}" for s in _canonical_shells(esp_shell))
+
+
 def make_metric_spec(
     metric: str,
     omega: float = 0.0,
@@ -164,8 +201,9 @@ def make_metric_spec(
     dipole_weight: float = 0.0,
     quadrupole_weight: float = 0.0,
     esp_weight: float = 0.0,
-    esp_shell: Optional[float] = None,
+    esp_shell: Optional[Union[float, Sequence[float]]] = None,
     group_charge_weight: float = 0.0,
+    interface_esp_weight: float = 0.0,
 ) -> str:
     """Build the canonical metric-spec string shared by the loss and the transform.
 
@@ -190,7 +228,9 @@ def make_metric_spec(
     :param esp_weight: Weight on the surface-ESP penalty, an area-weighted sum
         of ``|dV(r_g)|**2`` over an accessible-surface grid (see
         :py:func:`compute_surface_points`). ``0`` disables it.
-    :param esp_shell: Scaling of the van der Waals radii defining that surface.
+    :param esp_shell: Scaling of the van der Waals radii defining that surface —
+        a single value, or a sequence of values for a RESP-style multi-shell
+        surface (e.g. ``(1.0, 1.4, 2.0)``), whose grids are concatenated.
         ``None`` uses :py:data:`DEFAULT_ESP_SHELL`. Ignored when
         ``esp_weight == 0``.
     :param group_charge_weight: Weight on the per-group electron-count penalty,
@@ -199,6 +239,10 @@ def make_metric_spec(
         :py:func:`compute_group_charge_factor`). ``0`` disables it. Unlike
         ``charge_weight``, this sees charge moved *between* groups, which
         leaves the total untouched.
+    :param interface_esp_weight: Weight on the interface-ESP penalty, an
+        area-weighted sum of ``|dV(r_g)|**2`` over the two fragments' buried
+        contact patches (see :py:func:`compute_interface_esp_factor`). ``0``
+        disables it. Needs the same per-atom fragment labels as the EC loss.
     :return: Canonical spec string.
     """
     if metric not in METRICS:
@@ -211,6 +255,7 @@ def make_metric_spec(
         ("quadrupole_weight", quadrupole_weight),
         ("esp_weight", esp_weight),
         ("group_charge_weight", group_charge_weight),
+        ("interface_esp_weight", interface_esp_weight),
     ):
         if weight < 0.0:
             raise ValueError(f"{weight_name} must be >= 0, got {weight}.")
@@ -225,6 +270,7 @@ def make_metric_spec(
             and quadrupole_weight == 0.0
             and esp_weight == 0.0
             and group_charge_weight == 0.0
+            and interface_esp_weight == 0.0
         ):
             return metric
     resolved_eps = DEFAULT_LR_EPS if eps is None else float(eps)
@@ -241,12 +287,12 @@ def make_metric_spec(
     if quadrupole_weight > 0.0:
         spec += f"|Q={float(quadrupole_weight):.10g}"
     if esp_weight > 0.0:
-        resolved_shell = DEFAULT_ESP_SHELL if esp_shell is None else float(esp_shell)
-        if resolved_shell <= 0.0:
-            raise ValueError(f"esp_shell must be > 0, got {resolved_shell}.")
-        spec += f"|esp={float(esp_weight):.10g}|shell={resolved_shell:.10g}"
+        shells = _canonical_shells(esp_shell)
+        spec += f"|esp={float(esp_weight):.10g}|shell={_shell_tag(shells)}"
     if group_charge_weight > 0.0:
         spec += f"|gq={float(group_charge_weight):.10g}"
+    if interface_esp_weight > 0.0:
+        spec += f"|iesp={float(interface_esp_weight):.10g}"
     return spec
 
 
@@ -267,14 +313,35 @@ def parse_group_charge_weight(spec: str) -> float:
     return float(values.get("gq", 0.0))
 
 
+def parse_interface_esp_weight(spec: str) -> float:
+    """Read the interface-ESP weight out of a metric spec.
+
+    Kept apart from :py:func:`parse_metric_spec` for the same reason as
+    :py:func:`parse_group_charge_weight`: widening that documented tuple would
+    break every caller that unpacks it.
+
+    :param spec: Canonical spec string.
+    :return: The weight, ``0`` when the term is absent.
+    """
+    if "|" not in spec:
+        return 0.0
+    _, *parts = spec.split("|")
+    values = dict(part.split("=") for part in parts)
+    return float(values.get("iesp", 0.0))
+
+
 def parse_metric_spec(
     spec: str,
-) -> Tuple[str, float, float, float, float, float, float, float]:
+) -> Tuple[
+    str, float, float, float, float, float, float, Union[float, Tuple[float, ...]]
+]:
     """Invert :py:func:`make_metric_spec`.
 
     :param spec: Canonical spec string.
     :return: ``(metric, omega, eps, charge_weight, dipole_weight,
-        quadrupole_weight, esp_weight, esp_shell)``.
+        quadrupole_weight, esp_weight, esp_shell)``. ``esp_shell`` is a float
+        for a single-shell surface — the historical shape — and a tuple of
+        floats for a multi-shell one.
     """
     if "|" not in spec:
         if spec not in METRICS:
@@ -284,6 +351,12 @@ def parse_metric_spec(
         return spec, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, DEFAULT_ESP_SHELL
     metric, *parts = spec.split("|")
     values = dict(part.split("=") for part in parts)
+    raw_shell = values.get("shell")
+    if raw_shell is None:
+        shell: Union[float, Tuple[float, ...]] = DEFAULT_ESP_SHELL
+    else:
+        shells = tuple(float(part) for part in raw_shell.split(","))
+        shell = shells[0] if len(shells) == 1 else shells
     return (
         metric,
         float(values["omega"]),
@@ -292,7 +365,7 @@ def parse_metric_spec(
         float(values.get("d", 0.0)),
         float(values.get("Q", 0.0)),
         float(values.get("esp", 0.0)),
-        float(values.get("shell", DEFAULT_ESP_SHELL)),
+        shell,
     )
 
 
@@ -342,6 +415,16 @@ def esp_factor_name(target_name: str, metric: str) -> str:
     :return: The ``extra_data`` key.
     """
     return f"{metric_matrix_name(target_name, metric)}_esp_factor"
+
+
+def interface_esp_factor_name(target_name: str, metric: str) -> str:
+    """Return the ``extra_data`` key for a target's interface-ESP factors.
+
+    :param target_name: Name of the RI-coefficient target.
+    :param metric: Metric spec, as built by :py:func:`make_metric_spec`.
+    :return: The ``extra_data`` key.
+    """
+    return f"{metric_matrix_name(target_name, metric)}_interface_esp_factor"
 
 
 def group_charge_factor_name(target_name: str, metric: str) -> str:
@@ -668,7 +751,7 @@ def compute_group_charge_factor(
 
 
 def compute_surface_points(
-    system: System, aux_basis: str, shell_scale: float
+    system: System, aux_basis: str, shell_scale: Union[float, Sequence[float]]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Build an accessible-surface point grid with area weights.
@@ -680,6 +763,13 @@ def compute_surface_points(
     that is what "accessible" means. Each point carries its share of its
     sphere's area, so the ESP penalty approximates a surface integral.
 
+    A sequence of scalings builds a RESP-style multi-shell surface: one grid
+    per shell, each culled against its own scaled spheres, concatenated in
+    ascending shell order. The outer shells sample the far field, where the
+    low multipoles of the density dominate the potential, so a single tight
+    shell under-constrains exactly the content that a molecule's neighbours
+    feel.
+
     The sphere orientations are fixed in space, so the grid is *not* exactly
     equivariant under rotations of the system (discretisation-level anisotropy
     only). That is harmless here: metrics are built on the unaugmented geometry
@@ -688,7 +778,8 @@ def compute_surface_points(
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"`` (used
         only to build the molecule, i.e. for the atomic numbers/positions).
-    :param shell_scale: Scaling of the van der Waals radii.
+    :param shell_scale: Scaling of the van der Waals radii — one value, or a
+        sequence of values whose grids are concatenated.
     :return: ``(coords, weights)``: points in Bohr, shape ``(n, 3)``, and their
         area weights in Bohr^2, shape ``(n,)``, both float64.
     """
@@ -699,7 +790,6 @@ def compute_surface_points(
     auxmol = build_auxiliary_molecule(system, aux_basis)
     centres = auxmol.atom_coords()  # Bohr
     charges = auxmol.atom_charges()
-    sphere_radii = shell_scale * radii.VDW[charges]
 
     n = ESP_POINTS_PER_ATOM
     # Fibonacci sphere: near-uniform, deterministic.
@@ -710,18 +800,20 @@ def compute_surface_points(
     unit = np.stack([rho * np.cos(phi), rho * np.sin(phi), z], axis=1)
 
     coords, weights = [], []
-    for atom in range(auxmol.natm):
-        points = centres[atom] + sphere_radii[atom] * unit
-        buried = np.zeros(n, dtype=bool)
-        for other in range(auxmol.natm):
-            if other == atom:
-                continue
-            distances = np.linalg.norm(points - centres[other], axis=1)
-            buried |= distances < sphere_radii[other]
-        kept = points[~buried]
-        coords.append(kept)
-        area_per_point = 4.0 * np.pi * sphere_radii[atom] ** 2 / n
-        weights.append(np.full(len(kept), area_per_point))
+    for shell in _canonical_shells(shell_scale):
+        sphere_radii = shell * radii.VDW[charges]
+        for atom in range(auxmol.natm):
+            points = centres[atom] + sphere_radii[atom] * unit
+            buried = np.zeros(n, dtype=bool)
+            for other in range(auxmol.natm):
+                if other == atom:
+                    continue
+                distances = np.linalg.norm(points - centres[other], axis=1)
+                buried |= distances < sphere_radii[other]
+            kept = points[~buried]
+            coords.append(kept)
+            area_per_point = 4.0 * np.pi * sphere_radii[atom] ** 2 / n
+            weights.append(np.full(len(kept), area_per_point))
     coords = np.concatenate(coords)
     weights = np.concatenate(weights)
     return (
@@ -731,7 +823,7 @@ def compute_surface_points(
 
 
 def compute_esp_factor(
-    system: System, aux_basis: str, shell_scale: float
+    system: System, aux_basis: str, shell_scale: Union[float, Sequence[float]]
 ) -> torch.Tensor:
     """
     Compute the surface-ESP factor ``F = W^(1/2) A^T``.
@@ -750,7 +842,8 @@ def compute_esp_factor(
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
-    :param shell_scale: Scaling of the van der Waals radii for the surface.
+    :param shell_scale: Scaling of the van der Waals radii for the surface —
+        one value, or a sequence for a multi-shell surface.
     :return: Dense ``(n_points, n_basis)`` matrix in PySCF AO order, float64.
     """
     import numpy as np
@@ -765,8 +858,69 @@ def compute_esp_factor(
     return torch.from_numpy(np.ascontiguousarray(factor)).to(torch.float64)
 
 
+def compute_interface_esp_factor(
+    system: System,
+    aux_basis: str,
+    split: Union[int, Sequence[int], "numpy.ndarray"],
+) -> torch.Tensor:
+    """
+    Compute the interface-ESP factor ``F = W^(1/2) A^T`` on the contact patches.
+
+    The points are the union of the two fragments' solvent-excluded contact
+    patches (:py:func:`_ec_interface_patch`, evaluated once per orientation), so
+    ``|F dc|**2`` is the area-weighted squared ESP error of the fitted density
+    exactly where the accessible-surface grid of :py:func:`compute_esp_factor`
+    has no points: the culling that traces "accessible" removes the buried
+    interface, yet the interface is where binding electrostatics is decided and
+    where the potential is a deep cancellation between the two partners'
+    nuclear and electronic terms. Nothing but explicit sampling constrains it.
+
+    Areas are raw (Bohr^2), the same convention as the surface factor, so
+    ``interface_esp_weight`` trades off against ``esp_weight`` directly — a
+    ratio of 3-10 upweights each buried surface element by that factor.
+
+    :param system: System whose positions are interpreted as Angstrom.
+    :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :return: Dense ``(n_points, n_basis)`` matrix in PySCF AO order, float64.
+        Zero rows when either fragment is empty or no patch exists (monomers),
+        making the structure's contribution to the penalty exactly zero.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+
+    auxmol = build_auxiliary_molecule(system, aux_basis)
+    own, partner = ec_fragment_indices(split, auxmol.natm)
+    empty = torch.zeros((0, auxmol.nao), dtype=torch.float64)
+    if len(own) == 0 or len(partner) == 0:
+        return empty
+    centres = auxmol.atom_coords()
+    charges = auxmol.atom_charges()
+
+    labels = np.zeros(auxmol.natm, dtype=int)
+    labels[partner] = 1
+    pieces = []
+    for orientation in (labels, 1 - labels):
+        points, areas = _ec_interface_patch(centres, charges, orientation)
+        if len(points):
+            pieces.append((points, areas))
+    if not pieces:
+        return empty
+    points = np.concatenate([p for p, _ in pieces])
+    areas = np.concatenate([a for _, a in pieces])
+
+    blocks = []
+    for start in range(0, len(points), 2000):
+        fake = gto.fakemol_for_charges(points[start : start + 2000])
+        blocks.append(gto.mole.intor_cross("int2c2e", auxmol, fake))
+    integrals = np.concatenate(blocks, axis=1)  # (naux, n)
+    factor = np.sqrt(areas)[:, None] * integrals.T
+    return torch.from_numpy(np.ascontiguousarray(factor)).to(torch.float64)
+
+
 def compute_esp_metric(
-    system: System, aux_basis: str, shell_scale: float
+    system: System, aux_basis: str, shell_scale: Union[float, Sequence[float]]
 ) -> torch.Tensor:
     """
     Compute the surface-ESP quadratic form ``A W A^T = F^T F``.
@@ -1122,14 +1276,21 @@ def compute_ec_machinery(
     )
 
 
-def strip_esp_from_spec(spec: str) -> Tuple[str, float, float]:
+def strip_esp_from_spec(
+    spec: str,
+) -> Tuple[str, float, Union[float, Tuple[float, ...]]]:
     """
     Split a metric spec into its dense part and its factored ESP part.
+
+    The factored terms — surface ESP, per-group charge, interface ESP — all
+    drop out of the dense part, which is what the metric-matrix cache is keyed
+    on and shared across.
 
     :param spec: Metric spec, as built by :py:func:`make_metric_spec`.
     :return: ``(base_spec, esp_weight, esp_shell)``: the spec with the ESP term
         removed (everything that lives in the dense metric matrix), and the ESP
-        parameters carried separately.
+        parameters carried separately; ``esp_shell`` is a float or, for a
+        multi-shell surface, a tuple of floats.
     """
     metric, omega, eps, charge, dipole, quadrupole, esp_weight, esp_shell = (
         parse_metric_spec(spec)
@@ -1165,6 +1326,10 @@ def compute_metric_matrix(system: System, aux_basis: str, metric: str) -> torch.
     :py:func:`compute_esp_factor` separately and the loss adds
     ``esp_weight * |F dc|**2`` itself, avoiding the ``naux^2 * n_points``
     assembly cost. This function assembles everything for standalone use.)
+    The per-group charge and interface-ESP terms are **not** assembled here:
+    both depend on per-system fragment labels, which no spec string carries,
+    so they travel as factors only (:py:func:`compute_group_charge_factor`,
+    :py:func:`compute_interface_esp_factor`).
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
@@ -1339,7 +1504,7 @@ def _batch_esp_factors(
     systems: List[System],
     system_ids: Optional[List[int]],
     aux_basis: str,
-    esp_shell: float,
+    esp_shell: Union[float, Sequence[float]],
 ) -> List[torch.Tensor]:
     """Surface-ESP factors for one batch, through the cache when ids exist.
 
@@ -1358,10 +1523,45 @@ def _batch_esp_factors(
     cache = _metric_matrix_cache()
     factors = []
     for system, system_id in zip(systems, system_ids, strict=True):
-        key = (aux_basis, f"esp-factor|shell={esp_shell:.10g}", system_id)
+        key = (aux_basis, f"esp-factor|shell={_shell_tag(esp_shell)}", system_id)
         factor = cache.get(key)
         if factor is None:
             factor = compute_esp_factor(system, aux_basis, esp_shell)
+            cache.put(key, factor)
+        factors.append(factor)
+    return factors
+
+
+def _batch_interface_esp_factors(
+    systems: List[System],
+    system_ids: Optional[List[int]],
+    aux_basis: str,
+    splits: List[Any],
+) -> List[torch.Tensor]:
+    """Interface-ESP factors for one batch, through the cache when ids exist.
+
+    The factor depends on the geometry *and* the fragment split, so the split
+    goes in the cache key, exactly as for the per-group charge factors.
+
+    :param systems: The batch's systems, in batch order.
+    :param system_ids: Native dataset ids of those systems, or ``None``.
+    :param aux_basis: Auxiliary basis name.
+    :param splits: Fragment specification per system, see
+        :py:func:`ec_fragment_indices`.
+    :return: One ``(n_points_i, n_basis_i)`` factor per system, in batch order.
+    """
+    if system_ids is None:
+        return [
+            compute_interface_esp_factor(system, aux_basis, split)
+            for system, split in zip(systems, splits, strict=True)
+        ]
+    cache = _metric_matrix_cache()
+    factors = []
+    for system, system_id, split in zip(systems, system_ids, splits, strict=True):
+        key = (aux_basis, f"interface-esp|split={_ec_split_tag(split)}", system_id)
+        factor = cache.get(key)
+        if factor is None:
+            factor = compute_interface_esp_factor(system, aux_basis, split)
             cache.put(key, factor)
         factors.append(factor)
     return factors
@@ -1559,6 +1759,7 @@ def _metric_matrices_transform(
     # alongside it under esp_factor_name for the loss to apply itself.
     base_metric, esp_weight, esp_shell = strip_esp_from_spec(metric)
     group_charge_weight = parse_group_charge_weight(metric)
+    interface_esp_weight = parse_interface_esp_weight(metric)
     packed_by_basis: Dict[str, TensorMap] = {}
     factors_by_basis: Dict[str, TensorMap] = {}
     for target_name, aux_basis in target_to_aux_basis.items():
@@ -1582,6 +1783,18 @@ def _metric_matrices_transform(
                     system_ids,
                     aux_basis,
                     _batch_charge_groups(target_name, systems, extra),
+                )
+            )
+        if interface_esp_weight > 0.0:
+            # Also per target: the patches follow the target's fragment labels.
+            extra[interface_esp_factor_name(target_name, metric)] = (
+                pack_metric_matrices(
+                    _batch_interface_esp_factors(
+                        systems,
+                        system_ids,
+                        aux_basis,
+                        _ec_batch_splits(target_name, systems, extra),
+                    )
                 )
             )
     return systems, targets, extra

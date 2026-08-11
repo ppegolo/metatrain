@@ -11,6 +11,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -29,6 +30,7 @@ from metatrain.utils.pyscf_loss import (
     ec_machinery_name,
     esp_factor_name,
     group_charge_factor_name,
+    interface_esp_factor_name,
     make_metric_spec,
     metric_matrix_name,
     ri_density_fit_constant_name,
@@ -577,9 +579,17 @@ class _DensityLoss(LossInterface):
       pointwise metrics underweight.
     - ``esp_weight > 0`` penalises the electrostatic-potential error directly,
       as an area-weighted integral over an automatically constructed
-      accessible-surface grid (``esp_shell`` times the van der Waals radii),
-      which traces cavity and pocket walls without any per-system region
-      choices.
+      accessible-surface grid (``esp_shell`` times the van der Waals radii;
+      a sequence of scalings builds a RESP-style multi-shell surface whose
+      outer shells constrain the far field), which traces cavity and pocket
+      walls without any per-system region choices.
+    - ``interface_esp_weight > 0`` penalises the potential error on the two
+      fragments' buried contact patches — the region the accessible-surface
+      grid culls by construction, and the one binding electrostatics is
+      decided on. It needs the same per-atom fragment labels as the EC loss
+      (see :py:func:`~metatrain.utils.pyscf_loss.ec_fragment_name`). Both
+      area conventions match, so this weight upweights each buried surface
+      element by ``interface_esp_weight / esp_weight``.
     - ``group_charge_weight > 0`` penalises each *group's* electron-count error,
       ``sum_g (S_g . dc)**2``, with the groups read from a per-atom field (see
       :py:func:`~metatrain.utils.pyscf_loss.charge_group_name`). ``charge_weight``
@@ -607,10 +617,13 @@ class _DensityLoss(LossInterface):
         disables it.
     :param esp_weight: weight on the accessible-surface ESP penalty; ``0``
         disables it.
-    :param esp_shell: van der Waals scaling of the ESP surface; ``None`` uses
-        the package default. Ignored when ``esp_weight == 0``.
+    :param esp_shell: van der Waals scaling of the ESP surface — one value or
+        a sequence of values (multi-shell); ``None`` uses the package default.
+        Ignored when ``esp_weight == 0``.
     :param group_charge_weight: weight on the per-group electron-count penalty;
         ``0`` disables it. Needs per-atom group labels in the dataset.
+    :param interface_esp_weight: weight on the buried-interface ESP penalty;
+        ``0`` disables it. Needs per-atom fragment labels in the dataset.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -632,8 +645,9 @@ class _DensityLoss(LossInterface):
         dipole_weight: float = 0.0,
         quadrupole_weight: float = 0.0,
         esp_weight: float = 0.0,
-        esp_shell: Optional[float] = None,
+        esp_shell: Optional[Union[float, Sequence[float]]] = None,
         group_charge_weight: float = 0.0,
+        interface_esp_weight: float = 0.0,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -660,6 +674,7 @@ class _DensityLoss(LossInterface):
             esp_weight,
             esp_shell,
             group_charge_weight,
+            interface_esp_weight,
         )
         self.aux_basis = aux_basis
         # Applied by the loss itself: these terms travel as factors rather than
@@ -668,6 +683,7 @@ class _DensityLoss(LossInterface):
         # compute_group_charge_factor).
         self.esp_weight = float(esp_weight)
         self.group_charge_weight = float(group_charge_weight)
+        self.interface_esp_weight = float(interface_esp_weight)
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
         if extra_data is None or key not in extra_data:
@@ -848,6 +864,20 @@ class DensityMSELossViaC(_DensityLoss):
             per_system = [
                 value
                 + self.group_charge_weight * torch.mv(factor, delta).square().sum()
+                for value, delta, factor in zip(
+                    per_system, deltas, factors, strict=True
+                )
+            ]
+        if self.interface_esp_weight > 0.0:
+            # Factored like the surface-ESP term; a structure with no usable
+            # interface patch ships a zero-row factor and contributes nothing.
+            packed = self._require(
+                extra_data, interface_esp_factor_name(self.target, self.metric)
+            )
+            factors = unpack_metric_matrices(packed)
+            per_system = [
+                value
+                + self.interface_esp_weight * torch.mv(factor, delta).square().sum()
                 for value, delta, factor in zip(
                     per_system, deltas, factors, strict=True
                 )
