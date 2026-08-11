@@ -50,6 +50,32 @@ def train_or_load_composition_model(
     :param is_distributed: Whether training is distributed
     :param checkpoint_dir: Directory to save the composition model checkpoint
     """
+    from metatrain.utils.additive.free_atom import (
+        is_free_atom_spec,
+        parse_free_atom_spec,
+        set_free_atom_composition_weights,
+    )
+
+    if is_free_atom_spec(atomic_baseline):
+        assert isinstance(atomic_baseline, str)
+        basis, aux_basis = parse_free_atom_spec(atomic_baseline)
+        logging.info(
+            f"Computing free-atom baseline (orbital basis '{basis}', "
+            f"auxiliary basis '{aux_basis}') instead of fitting composition "
+            "weights"
+        )
+        set_free_atom_composition_weights(composition_model, basis, aux_basis)
+        if checkpoint_dir and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            from pathlib import Path
+
+            hypers = get_default_hypers("composition")["training"]
+            Trainer(hypers=hypers).save_checkpoint(
+                composition_model, Path(checkpoint_dir) / "composition_model.ckpt"
+            )
+        return
+
     if isinstance(atomic_baseline, str):
         logging.info(f"Loading composition model from {atomic_baseline}")
         loaded = load_model(atomic_baseline)

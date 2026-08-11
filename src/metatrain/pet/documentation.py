@@ -388,6 +388,14 @@ class TrainerHypers(TypedDict):
       target to 0.0, effectively disabling the atomic baseline for that target.
     - ``atomic_baseline: "/path/to/model.ckpt"`` loads a pre-trained
       composition model checkpoint, overriding the default least-squares fit.
+    - ``atomic_baseline: "free_atom:def2-svp:def2-universal-jfit"`` computes a
+      free-atom (promolecule) baseline for atomic-basis density targets: one
+      neutral, spherically-averaged atomic density per element, RI-fitted in
+      the given auxiliary basis (second field) from an atomic HF density in
+      the given orbital basis (first field). The model then learns the
+      deformation density, whose far-field electrostatics no longer hinges on
+      a near-total nuclear/electronic cancellation. See
+      :py:mod:`metatrain.utils.additive.free_atom`.
 
     This atomic baseline is substracted from the targets during training, which
     avoids the main model needing to learn atomic contributions, and likely makes

@@ -217,6 +217,29 @@ class Trainer(TrainerInterface[TrainerHypers]):
             get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
         )
 
+        # The free-atom baseline turns the targets into deformation densities.
+        # Quadratic density losses are invariant (they act on the prediction-
+        # minus-reference difference), but losses evaluating a single density
+        # in absolute terms are not, and would silently score the wrong field.
+        from metatrain.utils.additive.free_atom import is_free_atom_spec
+
+        if is_free_atom_spec(self.hypers["atomic_baseline"]):
+            configured_losses = self.hypers["loss"]
+            if isinstance(configured_losses, dict):
+                for target_name, spec in configured_losses.items():
+                    if not isinstance(spec, dict):
+                        continue
+                    if spec.get("type") in ("density_mse_via_w", "ec_mse"):
+                        raise ValueError(
+                            f"loss '{spec.get('type')}' on target "
+                            f"'{target_name}' evaluates absolute densities and "
+                            "is not supported with the free-atom baseline: "
+                            "'via_w' compares against stored total-density "
+                            "projections and the EC loss evaluates absolute "
+                            "potentials. Use 'density_mse_via_c', or drop the "
+                            "free-atom baseline."
+                        )
+
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
             atomic_baseline=self.hypers["atomic_baseline"],
