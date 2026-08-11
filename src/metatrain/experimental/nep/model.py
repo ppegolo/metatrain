@@ -141,6 +141,40 @@ def _permute_type_params(params: NepParameters, perm: List[int]) -> NepParameter
     )
 
 
+def _promote_params_to_v5(params: NepParameters) -> NepParameters:
+    """Rewrite NEP3/NEP4 parameters as an equivalent NEP5 potential.
+
+    NEP5 evaluates ``e_t = h @ w1_t - type_bias_t - b1``, i.e. NEP4 with an
+    extra per-type bias appended to each ANN block.  Setting all the per-type
+    biases to zero (and replicating the shared network of NEP3 across the
+    types) gives a NEP5 potential with identical predictions, whose per-type
+    bias can then absorb per-type composition baselines on export.
+
+    :param params: NEP3 or NEP4 parameters (regular NEP, not NEP-Charge).
+    :return: Equivalent NEP5 parameters.
+    """
+    if params.charge_mode != 0:
+        raise ValueError("NEP-Charge potentials cannot be promoted to NEP5.")
+    if params.version not in (3, 4):
+        raise ValueError(f"cannot promote a NEP{params.version} model to NEP5.")
+
+    num_types = params.num_types
+    neurons = params.num_neurons1
+    block = neurons * params.dim + 2 * neurons
+    ann = params.ann.to(torch.float64)
+    if params.version == 3:
+        blocks = ann[:block].reshape(1, block).expand(num_types, block)
+    else:
+        blocks = ann[: block * num_types].reshape(num_types, block)
+    type_biases = ann.new_zeros(num_types, 1)
+    b1 = ann[block if params.version == 3 else block * num_types].reshape(1)
+    return dataclasses.replace(
+        params,
+        version=5,
+        ann=torch.cat([torch.cat([blocks, type_biases], dim=1).reshape(-1), b1]),
+    )
+
+
 def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
     """Load an existing ``nep.txt`` for fine-tuning.
 
@@ -643,7 +677,7 @@ class NEP(ModelInterface[ModelHypers]):
         )
 
     @torch.jit.unused
-    def export_nep(self, path: Union[str, Path]) -> None:
+    def export_nep(self, path: Union[str, Path], version: Optional[int] = None) -> None:
         """Write a GPUMD-compatible ``nep.txt`` file for this model.
 
         The target scale and per-type composition baseline are folded into the
@@ -651,8 +685,20 @@ class NEP(ModelInterface[ModelHypers]):
         (NEP3/4 with non-uniform folded constants, qNEP with non-unit scale).
 
         :param path: Output path for the ``nep.txt`` file.
+        :param version: NEP version to write.  Defaults to the model's own
+            version.  A NEP3 or NEP4 model can be written as ``5``, which is
+            the same potential with an extra per-type bias; the bias then
+            absorbs per-type composition baselines that NEP3/NEP4 cannot
+            represent.
         """
         params = self.potential.to_nep_parameters()
+        if version is not None and version != params.version:
+            if version != 5:
+                raise ValueError(
+                    f"Cannot export a NEP{params.version} model as NEP{version}: "
+                    "only exporting NEP3 and NEP4 models as NEP5 is supported."
+                )
+            params = _promote_params_to_v5(params)
         num_types = params.num_types
         neurons = params.num_neurons1
         dim = params.dim
@@ -712,8 +758,9 @@ class NEP(ModelInterface[ModelHypers]):
                 raise ValueError(
                     f"NEP{version} has a single global bias, but the folded "
                     f"per-type constants differ (spread {spread:.3e}). "
-                    "Use `version: 5`, whose per-type bias makes the "
-                    "composition fold exact for multi-element models."
+                    "Export this model as NEP5 with "
+                    "`export_nep(path, version=5)`, whose per-type bias makes "
+                    "the composition fold exact for multi-element models."
                 )
             ann[b1_index] = float(d.mean())
         elif version == 5:

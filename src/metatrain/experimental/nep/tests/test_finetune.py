@@ -7,7 +7,10 @@ from torchnep import write_nep
 
 from metatrain.experimental.nep.model import NEP, _permute_type_params
 from metatrain.experimental.nep.trainer import Trainer
-from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.architectures import (
+    check_architecture_options,
+    get_default_hypers,
+)
 from metatrain.utils.data import get_atomic_types, get_dataset
 from metatrain.utils.data.dataset import DatasetInfo
 from metatrain.utils.hypers import init_with_defaults
@@ -155,3 +158,103 @@ def test_finetune_training(tmp_path):
     assert torch.all(comp_block.values == 0.0)
     scales_block = model.scaler.model.scales["energy"].block()
     assert torch.all(scales_block.values == 1.0)
+
+
+def _qm9_dataset_and_info():
+    targets = {
+        "energy": {
+            "quantity": "energy",
+            "read_from": DATASET_PATH,
+            "reader": "ase",
+            "key": "U0",
+            "unit": "eV",
+            "type": "scalar",
+            "sample_kind": "system",
+            "num_subtargets": 1,
+            "forces": False,
+            "stress": False,
+            "virial": False,
+        }
+    }
+    dataset, targets_info, _ = get_dataset(
+        {"systems": {"read_from": DATASET_PATH, "reader": "ase"}, "targets": targets}
+    )
+    atomic_types = get_atomic_types(dataset)
+    dataset_info = DatasetInfo(
+        length_unit="angstrom", atomic_types=atomic_types, targets=targets_info
+    )
+    return dataset, dataset_info
+
+
+def _train_hypers(**overrides):
+    hypers = copy.deepcopy(get_default_hypers("experimental.nep")["training"])
+    hypers["num_epochs"] = 1
+    hypers["batch_size"] = 10
+    hypers["loss"] = {"energy": init_with_defaults(LossSpecification)}
+    hypers.update(overrides)
+    return hypers
+
+
+def test_finetune_hypers_are_valid_options():
+    """`training.finetune.read_from` passes architecture option validation."""
+    options = copy.deepcopy(get_default_hypers("experimental.nep"))
+    options["training"]["finetune"] = {"read_from": "model.ckpt"}
+    check_architecture_options("experimental.nep", options)
+
+
+def test_finetune_from_checkpoint(tmp_path):
+    """Fine-tuning from a metatrain checkpoint keeps the pretrained composition
+    weights, target scales and descriptor normalisation."""
+    dataset, dataset_info = _qm9_dataset_and_info()
+
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers["cutoff_radial"] = 5.0
+    hypers["cutoff_angular"] = 4.0
+    pretrained = NEP(hypers, dataset_info).to(torch.float64)
+    (tmp_path / "pretrain").mkdir()
+    (tmp_path / "finetune").mkdir()
+
+    # pretrain on the first half of the dataset, so that the composition
+    # weights, the scales and the descriptor normalisation are all fitted
+    pretrain_subset = torch.utils.data.Subset(dataset, list(range(10)))
+    Trainer(_train_hypers()).train(
+        pretrained,
+        torch.float64,
+        [torch.device("cpu")],
+        [pretrain_subset],
+        [pretrain_subset],
+        str(tmp_path / "pretrain"),
+    )
+    checkpoint = pretrained.get_checkpoint()
+
+    q_scaler = pretrained.potential.q_scaler.clone()
+    composition = (
+        pretrained.additive_models[0].model.weights["energy"].block().values.clone()
+    )
+    scales = pretrained.scaler.model.scales["energy"].block().values.clone()
+    assert not torch.all(composition == 0.0)
+    assert not torch.all(q_scaler == 1.0)
+
+    # fine-tune on the second half
+    model = NEP.load_checkpoint(checkpoint, "finetune").to(torch.float64)
+    model = model.restart(dataset_info)
+    ann_before = model.potential.ann.clone()
+
+    finetune_subset = torch.utils.data.Subset(dataset, list(range(10, 20)))
+    trainer = Trainer(_train_hypers(finetune={"read_from": "unused.ckpt"}))
+    trainer.train(
+        model,
+        torch.float64,
+        [torch.device("cpu")],
+        [finetune_subset],
+        [finetune_subset],
+        str(tmp_path / "finetune"),
+    )
+
+    assert torch.all(model.potential.q_scaler == q_scaler)
+    comp_block = model.additive_models[0].model.weights["energy"].block()
+    assert torch.all(comp_block.values == composition)
+    scales_block = model.scaler.model.scales["energy"].block()
+    assert torch.all(scales_block.values == scales)
+    # the network itself was trained further
+    assert not torch.all(model.potential.ann == ann_before)

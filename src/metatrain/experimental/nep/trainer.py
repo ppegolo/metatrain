@@ -96,7 +96,7 @@ def _compute_q_scaler(
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
 
     def __init__(self, hypers: TrainerHypers):
         super().__init__(hypers)
@@ -179,7 +179,18 @@ class Trainer(TrainerInterface[TrainerHypers]):
         for additive_model in model.additive_models:
             additive_model.to(dtype=torch.float64)
 
-        if self.hypers["compute_q_scaler"] and not model.loaded_nep:
+        is_finetuning = self.hypers["finetune"]["read_from"] is not None
+        if is_finetuning:
+            logging.info(
+                "Fine-tuning a pretrained checkpoint: keeping its descriptor "
+                "normalisation, composition baselines and target scales"
+            )
+
+        if (
+            self.hypers["compute_q_scaler"]
+            and not model.loaded_nep
+            and not is_finetuning
+        ):
             _compute_q_scaler(model, train_datasets, device, dtype)
 
         num_workers = self.hypers["num_workers"]

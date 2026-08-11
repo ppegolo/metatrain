@@ -128,8 +128,9 @@ def test_export_nep4_nonuniform_composition_raises(tmp_path):
     model = _make_model([6, 14], 4, scale=0.6, composition={6: -2.0, 14: -7.5})
     message = (
         "NEP4 has a single global bias, but the folded per-type constants "
-        "differ (spread 5.500e+00). Use `version: 5`, whose per-type bias "
-        "makes the composition fold exact for multi-element models."
+        "differ (spread 5.500e+00). Export this model as NEP5 with "
+        "`export_nep(path, version=5)`, whose per-type bias makes the "
+        "composition fold exact for multi-element models."
     )
     with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         model.export_nep(tmp_path / "nep.txt")
@@ -166,3 +167,47 @@ def test_zbl_torchscript():
     # close pairs in the random box give large ZBL energies; the TorchScript
     # executor introduces ~1e-8 relative noise
     assert torch.allclose(e_eager, e_scripted, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("version", [3, 4])
+def test_export_as_nep5_folds_per_type_composition(tmp_path, version, caplog):
+    """NEP3/NEP4 models can be written as NEP5, whose per-type bias absorbs
+    per-type composition baselines that NEP3/NEP4 cannot represent."""
+    atomic_types = [6, 14]
+    model = _make_model(
+        atomic_types, version, scale=0.6, composition={6: -2.0, 14: -7.5}
+    )
+    path = tmp_path / "nep.txt"
+    model.export_nep(path, version=5)
+
+    assert load_nep(str(path)).version == 5
+    system = _test_system(atomic_types)
+    e_model = _model_per_atom_energies(model, system)
+    e_native = _nep_txt_per_atom_energies(path, system, atomic_types)
+    assert torch.allclose(
+        e_model, e_native, rtol=1e-6, atol=1e-5 * float(e_model.abs().max())
+    )
+
+
+def test_export_as_nep5_is_the_same_potential(tmp_path):
+    """Promoting to NEP5 does not change the potential itself."""
+    model = _make_model([6, 14], 4, scale=1.0, composition={6: 0.0, 14: 0.0})
+    plain = tmp_path / "nep4.txt"
+    promoted = tmp_path / "nep5.txt"
+    model.export_nep(plain)
+    model.export_nep(promoted, version=5)
+
+    system = _test_system([6, 14])
+    e_plain = _nep_txt_per_atom_energies(plain, system, [6, 14])
+    e_promoted = _nep_txt_per_atom_energies(promoted, system, [6, 14])
+    assert torch.allclose(e_plain, e_promoted, rtol=1e-10, atol=1e-10)
+
+
+def test_export_unsupported_version_raises(tmp_path):
+    model = _make_model([6], 4, scale=1.0, composition={6: 0.0})
+    message = (
+        "Cannot export a NEP4 model as NEP3: only exporting NEP3 and NEP4 "
+        "models as NEP5 is supported."
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        model.export_nep(tmp_path / "nep.txt", version=3)

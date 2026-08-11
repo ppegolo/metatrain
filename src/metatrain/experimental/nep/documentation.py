@@ -70,6 +70,27 @@ one, and the stored descriptor normalisation is kept.  Regular NEP3/NEP4/NEP5
 and NEP-Charge potentials (optionally with universal ZBL) are supported;
 flexible-ZBL files are not.
 
+Fine-tuning a metatrain checkpoint
+----------------------------------
+
+To continue training from a metatrain NEP checkpoint on a new dataset, set
+``finetune.read_from`` in the ``training`` section:
+
+.. code-block:: yaml
+
+    training:
+      finetune:
+        read_from: path/to/model.ckpt
+
+The model architecture and weights are taken from the checkpoint, together with
+its composition baselines, target scales and descriptor normalisation, which
+are all kept fixed instead of being refitted on the new dataset.  The dataset
+may not introduce new atomic types, but new targets are allowed: their output
+layers, composition weights and scales are initialised and fitted as usual.
+Unlike the ``nep_model`` route, this preserves the model exactly, without going
+through the limited precision and the composition fold of the ``nep.txt``
+format.
+
 Exporting to GPUMD
 ------------------
 
@@ -83,8 +104,11 @@ file format's 7-digit precision).  The fold is gated on the NEP ``version``:
 - ``version: 5`` has a per-element bias, so the fold is always exact;
 - ``version: 3`` and ``version: 4`` only have a global bias, so the fold is
   exact only when the folded per-type constants coincide (e.g. single-element
-  models or uniform composition weights) — otherwise ``export_nep`` raises and
-  suggests ``version: 5``;
+  models or uniform composition weights).  Otherwise, export the model as a
+  NEP5 file with ``model.export_nep("nep.txt", version=5)``: NEP5 is the same
+  potential with an extra per-type bias (set to zero on promotion), so the
+  predictions are unchanged and the per-type composition fold becomes exact.
+  The resulting file is a regular ``nep5`` potential usable by GPUMD;
 - ZBL models export with any scale, since the ZBL term is an additive
   contribution excluded from the scaler (as in GPUMD);
 - NEP-Charge (qNEP) models require ``scale_targets: false``, since the Ewald
@@ -167,6 +191,24 @@ class ModelHypers(TypedDict):
 ##############################
 
 
+class NoFinetuneHypers(TypedDict):
+    """Hypers that indicate that no fine-tuning is to be applied."""
+
+    read_from: None = None
+    """No fine-tuning is indicated by setting this argument to None."""
+
+
+class FinetuneHypers(TypedDict):
+    """Hyperparameters to fine-tune a NEP model from a metatrain checkpoint.
+
+    All model parameters are trainable; the architecture hyperparameters, the
+    composition baselines and the target scales are taken from the checkpoint.
+    """
+
+    read_from: str
+    """Path to the metatrain NEP checkpoint (``.ckpt``) to fine-tune."""
+
+
 class TrainerHypers(TypedDict):
     """Hyperparameters for training NEP models."""
 
@@ -198,6 +240,13 @@ class TrainerHypers(TypedDict):
     per descriptor dimension over the training set) before training starts.
     Only applied to freshly initialised models; restarted or fine-tuned models
     keep their stored normalisation."""
+
+    finetune: NoFinetuneHypers | FinetuneHypers = {"read_from": None}
+    """Parameters for fine-tuning a trained NEP model from a metatrain
+    checkpoint.  Set ``read_from`` to the checkpoint path; the model
+    architecture, weights, composition baselines, target scales and descriptor
+    normalisation are taken from it.  To fine-tune a GPUMD ``nep.txt`` file
+    instead, use the ``nep_model`` model hyperparameter."""
 
     scheduler_patience: int = 100
     """Number of epochs with no improvement before reducing the learning rate."""
