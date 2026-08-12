@@ -160,3 +160,50 @@ def test_precomputed_charges_from_extra_data_win():
     q1 = systems[1].get_data("mtt::oracle_charges").block().values.reshape(-1)
     torch.testing.assert_close(q0, values[:3])
     torch.testing.assert_close(q1, values[3:])
+
+
+def test_precomputed_nan_entry_never_falls_back_to_tblite(monkeypatch):
+    # A NaN chunk means "oracle failed offline": the system must run
+    # oracle-free without touching the on-the-fly GFN2 path, which is
+    # unavailable on platforms without tblite (regression: job 3063242).
+    import builtins
+
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+
+    from metatrain.utils.oracle_charges import _oracle_charges_transform
+
+    real_import = builtins.__import__
+
+    def poisoned(name, *args, **kwargs):
+        if name.startswith("tblite"):
+            raise ModuleNotFoundError("No module named 'tblite'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", poisoned)
+
+    systems = [
+        _system([8, 1, 1], WATER.positions.tolist()),
+        _system([1, 1], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.75]]),
+    ]
+    values = torch.tensor([-0.6, 0.3, 0.3, torch.nan, torch.nan], dtype=torch.float64)
+    packed = TensorMap(
+        keys=Labels.single(),
+        blocks=[
+            TensorBlock(
+                values=values.reshape(-1, 1),
+                samples=Labels(
+                    ["system", "atom"],
+                    torch.tensor(
+                        [[1743, 0], [1743, 1], [1743, 2], [3980, 0], [3980, 1]],
+                        dtype=torch.int32,
+                    ),
+                ),
+                components=[],
+                properties=Labels("charge", torch.zeros((1, 1), dtype=torch.int32)),
+            )
+        ],
+    )
+    _oracle_charges_transform(systems, {}, {"mtt::oracle_charges": packed})
+    q0 = systems[0].get_data("mtt::oracle_charges").block().values.reshape(-1)
+    torch.testing.assert_close(q0, values[:3])
+    assert "mtt::oracle_charges" not in systems[1].known_data()

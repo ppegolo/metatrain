@@ -203,11 +203,14 @@ def _oracle_charges_transform(
     targets: Dict[str, TensorMap],
     extra: Dict[str, TensorMap],
 ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-    # Precomputed charges shipped with the dataset win: no tblite
-    # dependency and no SCF cost in the workers. Anything not covered
-    # falls through to the on-the-fly GFN2 path below.
+    # Precomputed charges shipped with the dataset are authoritative for
+    # every system in the batch: real values get attached, NaN entries mean
+    # "oracle failed offline, run oracle-free". Never fall through to the
+    # on-the-fly path here — it would recompute known failures and requires
+    # tblite, which is unavailable on some training platforms.
     if ORACLE_CHARGES_KEY in extra:
         _attach_precomputed(systems, extra[ORACLE_CHARGES_KEY])
+        return systems, targets, extra
     system_ids = batch_system_ids(extra)
     cache = _oracle_cache()
     for row, system in enumerate(systems):
