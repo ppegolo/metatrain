@@ -158,11 +158,56 @@ def _oracle_cache() -> ByteBudgetCache:
 _FAILED = torch.full((1,), torch.nan, dtype=torch.float64)
 
 
+def _attach_precomputed(systems: List[System], packed: TensorMap) -> None:
+    """Attach dataset-precomputed oracle charges to the batch's systems.
+
+    The field arrives like any per-atom extra-data block (samples
+    ``["system", "atom"]``, concatenated in batch order by
+    ``group_and_join``; the ``"system"`` values are dataset indices, not
+    batch positions), so the systems are the runs of equal ids, in order
+    of first appearance.
+
+    :param systems: The batch's systems, in batch order.
+    :param packed: The batched per-atom oracle-charge TensorMap.
+    """
+    block = packed.block(0)
+    index = block.samples.column("system")
+    boundaries = [0]
+    for i in range(1, len(index)):
+        if int(index[i]) != int(index[i - 1]):
+            boundaries.append(i)
+    boundaries.append(len(index))
+    if len(boundaries) - 1 != len(systems):
+        raise RuntimeError(
+            f"precomputed oracle charges cover {len(boundaries) - 1} "
+            f"systems, but the batch has {len(systems)}; the field is "
+            "malformed."
+        )
+    values = block.values.reshape(-1)
+    for row, system in enumerate(systems):
+        if ORACLE_CHARGES_KEY in system.known_data():
+            continue
+        chunk = values[boundaries[row] : boundaries[row + 1]]
+        if len(chunk) != len(system):
+            raise RuntimeError(
+                f"precomputed oracle charges give {len(chunk)} values "
+                f"for a system of {len(system)} atoms."
+            )
+        if torch.isnan(chunk).any():
+            continue  # NaN marks "oracle failed offline": run oracle-free
+        attach_oracle_charges(system, chunk, system.positions.dtype)
+
+
 def _oracle_charges_transform(
     systems: List[System],
     targets: Dict[str, TensorMap],
     extra: Dict[str, TensorMap],
 ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+    # Precomputed charges shipped with the dataset win: no tblite
+    # dependency and no SCF cost in the workers. Anything not covered
+    # falls through to the on-the-fly GFN2 path below.
+    if ORACLE_CHARGES_KEY in extra:
+        _attach_precomputed(systems, extra[ORACLE_CHARGES_KEY])
     system_ids = batch_system_ids(extra)
     cache = _oracle_cache()
     for row, system in enumerate(systems):

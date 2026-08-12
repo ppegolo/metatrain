@@ -124,3 +124,39 @@ def test_v17_checkpoints_upgrade_with_the_feature_off():
     hypers = checkpoint["model_data"]["model_hypers"]
     assert hypers["atomic_charge_conditioning"] is False
     assert hypers["atomic_charge_dropout"] == 0.0
+
+
+def test_precomputed_charges_from_extra_data_win():
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+
+    from metatrain.utils.oracle_charges import _oracle_charges_transform
+
+    systems = [
+        _system([8, 1, 1], WATER.positions.tolist()),
+        _system([1, 1], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.75]]),
+    ]
+    values = torch.tensor([-0.6, 0.3, 0.3, -0.1, 0.1], dtype=torch.float64)
+    packed = TensorMap(
+        keys=Labels.single(),
+        blocks=[
+            TensorBlock(
+                values=values.reshape(-1, 1),
+                # dataset indices, deliberately not batch positions
+                samples=Labels(
+                    ["system", "atom"],
+                    torch.tensor(
+                        [[1743, 0], [1743, 1], [1743, 2], [2901, 0], [2901, 1]],
+                        dtype=torch.int32,
+                    ),
+                ),
+                components=[],
+                properties=Labels("charge", torch.zeros((1, 1), dtype=torch.int32)),
+            )
+        ],
+    )
+    # No tblite fallback should be needed: everything is covered.
+    _oracle_charges_transform(systems, {}, {"mtt::oracle_charges": packed})
+    q0 = systems[0].get_data("mtt::oracle_charges").block().values.reshape(-1)
+    q1 = systems[1].get_data("mtt::oracle_charges").block().values.reshape(-1)
+    torch.testing.assert_close(q0, values[:3])
+    torch.testing.assert_close(q1, values[3:])

@@ -311,7 +311,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         # Create collate functions
 
-        conditioning_keys = list(model.requested_inputs().keys())
+        # Per-system inputs are attached by get_system_data_transform; the
+        # per-atom oracle-charge field travels through its own transform below.
+        conditioning_keys = [
+            key
+            for key, output in model.requested_inputs().items()
+            if output.sample_kind == "system"
+        ]
         if conditioning_keys:
             splits = [("training", train_datasets), ("validation", val_datasets)]
             for split, datasets in splits:
