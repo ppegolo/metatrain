@@ -14,13 +14,14 @@ from omegaconf import OmegaConf
 
 from metatrain.llpr import LLPRUncertaintyModel
 from metatrain.llpr import Trainer as LLPRTrainer
-from metatrain.llpr.model import _get_uncertainty_name
+from metatrain.llpr.model import get_uncertainty_name
 from metatrain.pet import PET
 from metatrain.pet import Trainer as PETTrainer
 from metatrain.utils.data import DatasetInfo, get_atomic_types, get_dataset
 from metatrain.utils.data.readers import read_systems
 from metatrain.utils.data.target_info import get_generic_target_info
 from metatrain.utils.hypers import init_with_defaults
+from metatrain.utils.last_layer import SHARED_FEATURE_KEY
 from metatrain.utils.loss import LossSpecification
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
@@ -382,10 +383,9 @@ def untrained_llpr_model(target_name, quantity, num_subtargets=1):
     model.set_wrapped_model(PET(pet_hypers, dataset_info).to(DTYPE))
     model = model.to(DTYPE)
 
-    uncertainty_name = _get_uncertainty_name(target_name)
-    model._get_cholesky(uncertainty_name)[:] = torch.eye(
-        model.ll_feat_size, dtype=DTYPE
-    )
+    uncertainty_name = get_uncertainty_name(target_name)
+    cholesky = model._get_cholesky(uncertainty_name, SHARED_FEATURE_KEY)
+    cholesky[:] = torch.eye(cholesky.shape[0], dtype=DTYPE)
     model.generate_ensemble()
 
     return model, uncertainty_name.replace("_uncertainty", "_ensemble")

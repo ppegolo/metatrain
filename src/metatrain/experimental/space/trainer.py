@@ -58,7 +58,6 @@ def _get_requested_outputs(targets, target_info_dict):
     requested_outputs = {}
     for name, target in targets.items():
         requested_outputs[name] = ModelOutput(
-            quantity=target_info_dict[name].quantity,
             unit=target_info_dict[name].unit,
             sample_kind=target_info_dict[name].sample_kind,
             explicit_gradients=target.block(0).gradients_list(),
@@ -144,7 +143,7 @@ def get_scheduler(
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 3
+    __checkpoint_version__ = 4
 
     def __init__(self, hypers: TrainerHypers) -> None:
         super().__init__(hypers)
@@ -668,11 +667,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         # if any atomic basis outputs are present and metrics are to be
                         # reported per-block, reverse the transform (i.e. sparsify)
                         # before calculating metrics
-                        systems, targets, extra_data = atomic_basis_reverse_transform(
-                            systems, targets, extra_data
+                        systems, scaled_targets, extra_data = (
+                            atomic_basis_reverse_transform(
+                                systems, scaled_targets, extra_data
+                            )
                         )
-                        systems, predictions, _ = atomic_basis_reverse_transform(
-                            systems, predictions, {}
+                        systems, scaled_predictions, _ = atomic_basis_reverse_transform(
+                            systems, scaled_predictions, {}
                         )
                     val_rmse_calculator.update(
                         scaled_predictions, scaled_targets, extra_data

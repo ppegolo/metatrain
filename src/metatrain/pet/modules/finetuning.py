@@ -1,6 +1,7 @@
 # mypy: disable-error-code=misc
 # We ignore misc errors in this file because TypedDict
 # with default values is not allowed by mypy.
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -58,7 +59,10 @@ class FullFinetuneHypers(TypedDict):
     """Mapping from new trainable targets (keys) to the existing targets
     in the model (values).
     This allows for copying weights from the corresponding
-    source heads to the destination heads instead of random initialization."""
+    source heads to the destination heads instead of random initialization.
+    A destination target also inherits the scaler scales of its source target,
+    rather than having them fitted on this run's data, since the copied weights
+    predict in units of the source target's scales."""
 
 
 class LoRaFinetuneHypers(TypedDict):
@@ -77,7 +81,10 @@ class LoRaFinetuneHypers(TypedDict):
     """Mapping from new trainable targets (keys) to the existing targets
     in the model (values).
     This allows for copying weights from the corresponding
-    source heads to the destination heads instead of random initialization."""
+    source heads to the destination heads instead of random initialization.
+    A destination target also inherits the scaler scales of its source target,
+    rather than having them fitted on this run's data, since the copied weights
+    predict in units of the source target's scales."""
 
 
 class HeadsFinetuneHypers(TypedDict):
@@ -97,7 +104,10 @@ class HeadsFinetuneHypers(TypedDict):
     """Mapping from new trainable targets (keys) to the existing targets
     in the model (values).
     This allows for copying weights from the corresponding
-    source heads to the destination heads instead of random initialization."""
+    source heads to the destination heads instead of random initialization.
+    A destination target also inherits the scaler scales of its source target,
+    rather than having them fitted on this run's data, since the copied weights
+    predict in units of the source target's scales."""
 
 
 FinetuneHypers = FullFinetuneHypers | LoRaFinetuneHypers | HeadsFinetuneHypers
@@ -159,6 +169,42 @@ def copy_head_weights(
                 raise ValueError(
                     f"Destination head '{dest_head_name}' not found in model."
                 )
+
+
+def inherit_scaler_scales(
+    model: nn.Module, source_head_name: str, dest_head_name: str
+) -> None:
+    """Make a target whose head was inherited reuse the source target's scales.
+
+    The weights copied by :func:`copy_head_weights` were trained to predict the
+    source target divided by the source target's scaler scales, so the destination
+    target has to keep those same scales: otherwise the warm start is off by
+    ``scale_dest / scale_source``, a gain that (for per-atom targets, where scales
+    are per atomic type) the type-independent readout weights cannot absorb. The
+    destination is therefore also dropped from the scaler's list of targets to fit,
+    which is what would otherwise refit its scales on the new data.
+
+    No-op for models without a scaler, or when either target is unknown to it.
+
+    :param model: The model whose head weights are being inherited.
+    :param source_head_name: Name of the target the weights are copied from.
+    :param dest_head_name: Name of the target the weights are copied into.
+    """
+    scaler = getattr(model, "scaler", None)
+    if scaler is None:
+        return
+    if any(
+        name not in scaler.model.scales for name in (source_head_name, dest_head_name)
+    ):
+        return
+
+    scaler.inherit_scales(dest_head_name, source_head_name)
+    if dest_head_name in scaler.new_outputs:
+        scaler.new_outputs.remove(dest_head_name)
+    logging.info(
+        f"Target '{dest_head_name}' inherits the scaler scales of "
+        f"'{source_head_name}' along with its head weights"
+    )
 
 
 def _add_backend_prefix(model: nn.Module, module_names: list[str]) -> list[str]:
@@ -294,6 +340,7 @@ def apply_finetuning_strategy(
     if apply_inherit_heads and inherit_heads_config:
         for dest_head_name, source_head_name in inherit_heads_config.items():
             copy_head_weights(model, source_head_name, dest_head_name)
+            inherit_scaler_scales(model, source_head_name, dest_head_name)
 
     # Targets not part of this run's dataset are dropped now that weight
     # inheritance (if any) has had a chance to copy from their heads: with

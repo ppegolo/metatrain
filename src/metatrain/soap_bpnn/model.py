@@ -29,6 +29,7 @@ from metatrain.utils.data.atomic_basis_helpers import (
 )
 from metatrain.utils.data.dataset import DatasetInfo
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.last_layer import declare_shared_last_layer_features
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
@@ -373,7 +374,10 @@ class SoapBpnn(ModelInterface[ModelHypers]):
         self.key_labels: Dict[str, Labels] = {}
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.property_labels: Dict[str, List[Labels]] = {}
-        self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
+        # for LLPR: target name -> block key -> last-layer parameter names
+        self.last_layer_parameter_names: Dict[str, Dict[str, List[str]]] = {}
+        self.last_layer_feature_sizes: Dict[str, Dict[str, int]] = {}
+        self.last_layer_feature_map: Dict[str, List[str]] = {}
         self.cartesian_rank1_targets: List[str] = []
         self.cartesian_rank2_targets: List[str] = []
         for target_name, target in train_dataset_info.targets.items():
@@ -1179,6 +1183,7 @@ class SoapBpnn(ModelInterface[ModelHypers]):
 
         # last linear layers, one per block
         self.last_layers[target_name] = torch.nn.ModuleDict({})
+        self.last_layer_parameter_names[target_name] = {}
         for key, block in layout_for_layers.items():
             dict_key = target_name
             for n, k in zip(key.names, key.values, strict=True):
@@ -1217,11 +1222,18 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                 bias=False,
                 out_properties=out_properties_list,
             )
-            self.last_layer_parameter_names[target_name] = [
-                f"last_layers.{target_name}.{dict_key}." + n
-                for n in self.last_layers[target_name][dict_key].state_dict().keys()
-                if n.endswith("weight")
-            ]
+            # only basis_size == 1 blocks are a direct readout of the last-layer
+            # features; the others contract a geometry-dependent tensor basis
+            if basis_size == 1:
+                self.last_layer_parameter_names[target_name][dict_key] = [
+                    f"last_layers.{target_name}.{dict_key}." + n
+                    for n in self.last_layers[target_name][dict_key].state_dict().keys()
+                    if n.endswith("weight")
+                ]
+
+        declare_shared_last_layer_features(
+            self, target_name, target.layout.keys, self.last_layer_feature_size
+        )
 
         self.key_labels[target_name] = layout_for_layers.keys
         self.component_labels[target_name] = [
@@ -1232,7 +1244,6 @@ class SoapBpnn(ModelInterface[ModelHypers]):
         ]
 
         self.outputs[target_name] = ModelOutput(
-            quantity=target.quantity,
             unit=target.unit,
             sample_kind="atom",
             description=target.description,

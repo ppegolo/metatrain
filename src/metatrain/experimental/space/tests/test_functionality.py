@@ -159,7 +159,7 @@ def test_multiple_targets():
     model = SPACE(hypers, dataset_info)
     system = _make_system(model)
     outputs = {
-        "energy": ModelOutput(quantity="energy", unit="eV", sample_kind="system"),
+        "energy": ModelOutput(unit="eV", sample_kind="system"),
         "dipole": ModelOutput(sample_kind="system"),
         "non_conservative_stress": ModelOutput(sample_kind="system"),
     }
@@ -172,3 +172,37 @@ def test_multiple_targets():
     stress = result["non_conservative_stress"].block().values
     assert stress.shape == (1, 3, 3, 1)
     assert torch.allclose(stress, stress.transpose(-3, -2))
+
+
+def test_mlp_heads_do_not_leak_between_targets():
+    """Check each head reads the shared backbone features, not another head's
+    output (regression: heads used to compose through the shared list)."""
+    hypers = _make_hypers()
+    targets = {
+        name: get_generic_target_info(
+            name,
+            {
+                "quantity": "",
+                "unit": "",
+                "num_subtargets": 1,
+                "type": "scalar",
+                "sample_kind": "system",
+            },
+        )
+        for name in ("mtt::scalar_a", "mtt::scalar_b")
+    }
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom",
+        atomic_types=[6],
+        targets=targets,
+    )
+    model = SPACE(hypers, dataset_info)
+    system = _make_system(model)
+    outputs = {
+        "mtt::aux::scalar_a_last_layer_features": ModelOutput(sample_kind="atom"),
+        "mtt::aux::scalar_b_last_layer_features": ModelOutput(sample_kind="atom"),
+    }
+    result = model([system], outputs)
+    llf_a = result["mtt::aux::scalar_a_last_layer_features"].block(0)
+    llf_b = result["mtt::aux::scalar_b_last_layer_features"].block(0)
+    assert not torch.allclose(llf_a.values, llf_b.values)

@@ -98,6 +98,75 @@ def model_update_v3_v4(checkpoint: dict) -> None:
     checkpoint["model_state_dict"] = new_state_dict
 
 
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update a v4 checkpoint to v5.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # v5 keys the LLPR buffers and ensemble layers per block; a v4 model could only
+    # wrap single-block targets, so every old buffer maps onto that single block.
+    from metatrain.utils.last_layer import SHARED_FEATURE_KEY, block_key_name
+
+    from .model import get_uncertainty_name
+
+    # Block keys come from the *wrapped model's* targets, like in
+    # `set_wrapped_model`: the LLPR's own dataset info may cover fewer targets
+    # than the model registered buffers for (e.g. PET-MAD, calibrated on `energy`
+    # alone while the wrapped PET also predicts non-conservative outputs).
+    dataset_info = checkpoint["wrapped_model_checkpoint"]["model_data"]["dataset_info"]
+
+    block_keys = {
+        target_name: block_key_name(target_name, target_info.layout.keys.entry(0))
+        for target_name, target_info in dataset_info.targets.items()
+    }
+    multiplier_block_keys = {
+        get_uncertainty_name(target_name): block_key
+        for target_name, block_key in block_keys.items()
+    }
+
+    def rename(state_dict: dict) -> dict:
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("covariance_") or key.startswith("cholesky_"):
+                # the covariance is a property of the last-layer features, which are
+                # a single invariant block for any model a v4 LLPR could wrap
+                new_state_dict[f"{key}_{SHARED_FEATURE_KEY}"] = value
+            elif key.startswith("multiplier_"):
+                uncertainty_name = key[len("multiplier_") :]
+                if uncertainty_name not in multiplier_block_keys:
+                    raise RuntimeError(
+                        f"Unable to upgrade the checkpoint: no target in the "
+                        f"wrapped model's dataset info corresponds to the buffer "
+                        f"'{key}'."
+                    )
+                new_key = f"{key}_{multiplier_block_keys[uncertainty_name]}"
+                new_state_dict[new_key] = value
+            elif key.startswith("llpr_ensemble_layers."):
+                target_name, parameter = key[len("llpr_ensemble_layers.") :].rsplit(
+                    ".", 1
+                )
+                if target_name not in block_keys:
+                    raise RuntimeError(
+                        f"Unable to upgrade the checkpoint: no target in the "
+                        f"wrapped model's dataset info corresponds to the ensemble "
+                        f"layer '{key}'."
+                    )
+                new_key = (
+                    f"llpr_ensemble_layers.{target_name}::"
+                    f"{block_keys[target_name]}.{parameter}"
+                )
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    for state_dict_name in ("model_state_dict", "best_model_state_dict"):
+        state_dict = checkpoint.get(state_dict_name)
+        if state_dict is not None:
+            checkpoint[state_dict_name] = rename(state_dict)
+
+
 def trainer_update_v1_v2(checkpoint: dict) -> None:
     """
     Update trainer checkpoint from version 1 to version 2.
@@ -161,3 +230,17 @@ def trainer_update_v5_v6(checkpoint: dict) -> None:
         min_bound, max_bound = train_hypers.pop("batch_atom_bounds", [None, None])
         train_hypers["max_atoms_per_batch"] = max_bound
         train_hypers["min_atoms_per_batch"] = min_bound if min_bound is not None else 0
+
+
+def trainer_update_v6_v7(checkpoint: dict) -> None:
+    """
+    Deprecate the ``distributed`` hyperparameter.
+
+    So that it doesn't show up in the restarting options.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "train_hypers" in checkpoint:
+        train_hypers = checkpoint["train_hypers"]
+        if "distributed" in train_hypers and train_hypers["distributed"] is None:
+            train_hypers.pop("distributed")

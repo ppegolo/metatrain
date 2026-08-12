@@ -30,6 +30,7 @@ from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
 from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.last_layer import declare_shared_last_layer_features
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
@@ -144,6 +145,8 @@ class FlashMD(ModelInterface[ModelHypers]):
         self.edge_heads = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
+        self.last_layer_feature_sizes: Dict[str, Dict[str, int]] = {}
+        self.last_layer_feature_map: Dict[str, List[str]] = {}
         self.last_layer_feature_size = (
             self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
         )
@@ -306,10 +309,8 @@ class FlashMD(ModelInterface[ModelHypers]):
 
     def requested_inputs(self) -> Dict[str, ModelOutput]:
         return {
-            "momentum": ModelOutput(
-                quantity="momentum", unit="(eV*u)^(1/2)", sample_kind="atom"
-            ),
-            "mass": ModelOutput(quantity="mass", unit="u", sample_kind="atom"),
+            "momentum": ModelOutput(unit="(eV*u)^(1/2)", sample_kind="atom"),
+            "mass": ModelOutput(unit="u", sample_kind="atom"),
         }
 
     def forward(
@@ -1256,7 +1257,6 @@ class FlashMD(ModelInterface[ModelHypers]):
             ] + [len(block.properties.values)]
 
         self.outputs[target_name] = ModelOutput(
-            quantity=target_info.quantity,
             unit=target_info.unit,
             sample_kind="atom",
             description=target_info.description,
@@ -1322,6 +1322,9 @@ class FlashMD(ModelInterface[ModelHypers]):
         self.outputs[ll_features_name] = ModelOutput(
             sample_kind="atom", description=f"last-layer features for {target_name}"
         )
+        declare_shared_last_layer_features(
+            self, target_name, target_info.layout.keys, self.last_layer_feature_size
+        )
         self.key_labels[target_name] = target_info.layout.keys
         self.component_labels[target_name] = [
             block.components for block in target_info.layout.blocks()
@@ -1342,6 +1345,8 @@ class FlashMD(ModelInterface[ModelHypers]):
         self.output_shapes.pop(target_name, None)
         self.outputs.pop(target_name, None)
         self.outputs.pop(get_last_layer_features_name(target_name), None)
+        self.last_layer_feature_sizes.pop(target_name, None)
+        self.last_layer_feature_map.pop(target_name, None)
         # ``torch.nn.ModuleDict.pop`` has no ``default`` argument.
         if target_name in self.node_heads:
             del self.node_heads[target_name]

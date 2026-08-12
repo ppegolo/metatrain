@@ -304,7 +304,6 @@ class Scaler(ModelInterface[ModelHypers]):
 
     def _add_output(self, target_name: str, target_info: TargetInfo) -> None:
         self.outputs[target_name] = ModelOutput(
-            quantity=target_info.quantity,
             unit=target_info.unit,
             sample_kind="atom",
             description=target_info.description,
@@ -429,6 +428,68 @@ class Scaler(ModelInterface[ModelHypers]):
             buffer_name = target_name + suffix
             if hasattr(self, buffer_name):
                 delattr(self, buffer_name)
+
+    def inherit_scales(self, dest_target: str, source_target: str) -> None:
+        """
+        Copy the scales of ``source_target`` onto ``dest_target``, buffers included.
+
+        This is what a fine-tuning run that initializes the head of one target from
+        the trained head of another (``inherit_heads``) needs: the copied weights
+        predict the source target divided by the source target's scales, so the
+        destination has to adopt those same scales for the warm start to reproduce
+        the source model's physical predictions. Fitting the destination's scales on
+        the new data instead would multiply the inherited predictions by an
+        unaccounted gain ``scale_dest / scale_source``, which for per-atom targets
+        varies per atomic type and can therefore not be absorbed into the
+        (type-independent) readout weights.
+
+        :param dest_target: Name of the target to copy the scales into.
+        :param source_target: Name of the target to copy the scales from.
+        :raises ValueError: If either target is unknown to this scaler, or if their
+            scales have incompatible metadata (i.e. different target layouts).
+        """
+        for target_name in (source_target, dest_target):
+            if target_name not in self.model.scales:
+                raise ValueError(
+                    f"cannot inherit scales: target '{target_name}' is not known "
+                    "to the scaler."
+                )
+
+        scales_by_suffix = {
+            "_scaler_buffer": self.model.scales,
+            "_per_target_scaler_buffer": self.model.per_target_scales,
+            "_per_property_scaler_buffer": self.model.per_property_scales,
+        }
+        for suffix, all_scales in scales_by_suffix.items():
+            source = all_scales[source_target]
+            dest = all_scales[dest_target]
+            if source.keys != dest.keys:
+                raise ValueError(
+                    f"cannot inherit the scales of '{source_target}' into "
+                    f"'{dest_target}': the two targets have different blocks "
+                    f"({source.keys} vs {dest.keys})."
+                )
+            for key, dest_block in dest.items():
+                source_values = source.block(key).values
+                if source_values.shape != dest_block.values.shape:
+                    raise ValueError(
+                        f"cannot inherit the scales of '{source_target}' into "
+                        f"'{dest_target}': the scales of block {key.print()} have "
+                        f"shape {tuple(source_values.shape)} instead of "
+                        f"{tuple(dest_block.values.shape)}."
+                    )
+                dest_block.values[:] = source_values
+
+            # the serialized buffers are what gets checkpointed and reloaded, so
+            # they have to be kept in sync with the TensorMaps just updated
+            buffer_name = dest_target + suffix
+            device = self.__getattr__(buffer_name).device
+            self.register_buffer(
+                buffer_name,
+                mts.save_buffer(mts.make_contiguous(dest.to("cpu", torch.float64))).to(
+                    device
+                ),
+            )
 
     def scales_to(self, device: torch.device, dtype: torch.dtype) -> None:
         if len(self.model.scales) != 0:

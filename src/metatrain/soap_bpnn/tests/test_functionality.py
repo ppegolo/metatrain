@@ -49,7 +49,7 @@ def test_scalar_output(legacy):
     system = _make_system(model)
     output = model(
         [system],
-        {"energy": ModelOutput(quantity="energy", unit="eV", sample_kind="system")},
+        {"energy": ModelOutput(unit="eV", sample_kind="system")},
     )
     values = output["energy"].block().values
     assert values.shape == (1, 1)
@@ -147,6 +147,42 @@ def test_spherical_output(legacy, add_lambda_basis):
     assert tmap.block(0).values.shape == (1, 3, 1)
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+def test_last_layer_parameter_names_cover_direct_readout_blocks(legacy):
+    """Check only direct-readout (lambda=0) blocks are registered for LLPR
+    ensembles; lambda>0 blocks contract a geometry-dependent tensor basis."""
+    hypers = _make_hypers(legacy)
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom",
+        atomic_types=[6],
+        targets={
+            "spherical_target": get_generic_target_info(
+                "spherical_target",
+                {
+                    "quantity": "",
+                    "unit": "",
+                    "type": {
+                        "spherical": {
+                            "irreps": [
+                                {"o3_lambda": 0, "o3_sigma": 1},
+                                {"o3_lambda": 2, "o3_sigma": 1},
+                            ],
+                        }
+                    },
+                    "num_subtargets": 1,
+                    "sample_kind": "system",
+                },
+            )
+        },
+    )
+    model = SoapBpnn(hypers, dataset_info)
+
+    registered = model.last_layer_parameter_names["spherical_target"]
+    state_dict = model.state_dict()
+    assert all(name in state_dict for names in registered.values() for name in names)
+    assert list(registered.keys()) == ["spherical_target_o3_lambda_0_o3_sigma_1"]
+
+
 @pytest.mark.parametrize("add_lambda_basis", [True, False])
 def test_mlp_head(add_lambda_basis):
     """
@@ -163,7 +199,7 @@ def test_mlp_head(add_lambda_basis):
     system = _make_system(model)
     output = model(
         [system],
-        {"energy": ModelOutput(quantity="energy", unit="eV", sample_kind="system")},
+        {"energy": ModelOutput(unit="eV", sample_kind="system")},
     )
     values = output["energy"].block().values
     assert values.shape == (1, 1)
@@ -195,7 +231,7 @@ def test_multiple_targets(legacy, add_lambda_basis):
     model = SoapBpnn(hypers, dataset_info)
     system = _make_system(model)
     outputs = {
-        "energy": ModelOutput(quantity="energy", unit="eV", sample_kind="system"),
+        "energy": ModelOutput(unit="eV", sample_kind="system"),
         "non_conservative_stress": ModelOutput(sample_kind="system"),
     }
     result = model([system], outputs)
