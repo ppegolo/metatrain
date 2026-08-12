@@ -64,7 +64,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 17
+    __checkpoint_version__ = 18
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -114,6 +114,9 @@ class PET(ModelInterface[ModelHypers]):
         self.backend = PETBackend(self.hypers, self.atomic_types)
         self.num_readout_layers = self.backend.num_readout_layers
         self.system_conditioning = self.backend.system_conditioning
+        self.atomic_charge_conditioning = (
+            self.backend.atomic_charge_conditioning is not None
+        )
         self.d_head_node = self.backend.d_head_node
         self.d_head_edge = self.backend.d_head_edge
         # For LLPR: the last-layer features are the per-layer node and edge head
@@ -275,12 +278,14 @@ class PET(ModelInterface[ModelHypers]):
         return [self.requested_nl]
 
     def requested_inputs(self) -> Dict[str, ModelOutput]:
+        requested: Dict[str, ModelOutput] = {}
         if self.system_conditioning is not None:
-            return {
-                key: ModelOutput(unit="", sample_kind="system")
-                for key in self.system_conditioning.required_data_keys
-            }
-        return {}
+            for key in self.system_conditioning.required_data_keys:
+                requested[key] = ModelOutput(unit="", sample_kind="system")
+        if self.atomic_charge_conditioning:
+            # Optional: systems without it run oracle-free via the mask channel.
+            requested["mtt::oracle_charges"] = ModelOutput(unit="", sample_kind="atom")
+        return requested
 
     def forward(
         self,
@@ -476,6 +481,17 @@ class PET(ModelInterface[ModelHypers]):
                 batch_data["charge"] = charges
                 batch_data["spin_multiplicity"] = spin_multiplicities
                 batch_data["system_indices"] = system_indices
+
+            if self.atomic_charge_conditioning:
+                oracle_values, oracle_mask = _extract_oracle_charges(
+                    systems, device, systems[0].positions.dtype
+                )
+                batch_data["oracle_charges"] = oracle_values
+                batch_data["oracle_charges_mask"] = oracle_mask
+                batch_data["system_indices"] = system_indices
+                batch_data["n_systems"] = torch.tensor(
+                    len(systems), device=device, dtype=torch.long
+                )
 
             # ===== BEGIN DIAGNOSTIC-RELATED BLOCK
             # Allow direct diagnostic capture of raw featurizer input tensors (e.g.
@@ -1201,6 +1217,36 @@ def _extract_charge_spin_multiplicity(
                 )
             spin_multiplicities[i] = raw_spin_multiplicity.long().squeeze()
     return charges, spin_multiplicities
+
+
+def _extract_oracle_charges(
+    systems: List[System], device: torch.device, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Gather per-atom oracle charges and their presence mask across a batch.
+
+    Systems without attached ``"mtt::oracle_charges"`` data contribute zeros with a
+    zero mask — the "no oracle" input state of
+    :py:class:`~metatrain.pet.modules.conditioning.AtomicChargeEmbedding` —
+    so a conditioned model accepts any input and degrades gracefully.
+
+    :param systems: The batch's systems.
+    :param device: Device for the returned tensors.
+    :param dtype: Floating dtype for the returned tensors.
+    :return: ``(charges, mask)``, each of shape ``(total_atoms,)``.
+    """
+    values_list: List[torch.Tensor] = []
+    mask_list: List[torch.Tensor] = []
+    for system in systems:
+        n_atoms = len(system)
+        if "mtt::oracle_charges" in system.known_data():
+            block = system.get_data("mtt::oracle_charges").block()
+            values_list.append(block.values.reshape(-1).to(device=device, dtype=dtype))
+            mask_list.append(torch.ones(n_atoms, device=device, dtype=dtype))
+        else:
+            values_list.append(torch.zeros(n_atoms, device=device, dtype=dtype))
+            mask_list.append(torch.zeros(n_atoms, device=device, dtype=dtype))
+    return torch.cat(values_list), torch.cat(mask_list)
 
 
 def get_last_layer_features_name(target_name: str) -> str:

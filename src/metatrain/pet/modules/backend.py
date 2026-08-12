@@ -6,7 +6,7 @@ import torch
 from ...utils.hypers import resolve_per_target
 from ...utils.readout import LinearReadout, MoEReadout
 from ..documentation import ModelHypers
-from .conditioning import SystemConditioningEmbedding
+from .conditioning import AtomicChargeEmbedding, SystemConditioningEmbedding
 from .structures import compute_batch_tensors
 from .transformer import CartesianTransformer
 
@@ -148,6 +148,16 @@ class PETBackend(torch.nn.Module):
             )
         else:
             self.system_conditioning = None
+
+        if hypers["atomic_charge_conditioning"]:
+            self.atomic_charge_conditioning: Optional[AtomicChargeEmbedding] = (
+                AtomicChargeEmbedding(
+                    d_out=self.d_node,
+                    dropout=float(hypers["atomic_charge_dropout"]),
+                )
+            )
+        else:
+            self.atomic_charge_conditioning = None
 
         # Per-output heads and last layers, populated by ``PET._add_output``.
         self.node_heads = torch.nn.ModuleDict()
@@ -483,6 +493,11 @@ class PETBackend(torch.nn.Module):
             featurizer_inputs["charge"] = batch_data["charge"]
             featurizer_inputs["spin_multiplicity"] = batch_data["spin_multiplicity"]
             featurizer_inputs["system_indices"] = batch_data["system_indices"]
+        if self.atomic_charge_conditioning is not None:
+            featurizer_inputs["oracle_charges"] = batch_data["oracle_charges"]
+            featurizer_inputs["oracle_charges_mask"] = batch_data["oracle_charges_mask"]
+            featurizer_inputs["system_indices"] = batch_data["system_indices"]
+            featurizer_inputs["n_systems"] = batch_data["n_systems"]
 
         # the scaled_dot_product_attention function from torch cannot do
         # double backward, so we will use manual attention if needed
@@ -630,6 +645,18 @@ class PETBackend(torch.nn.Module):
                 inputs["spin_multiplicity"],
                 inputs["system_indices"],
             )
+        if self.atomic_charge_conditioning is not None:
+            oracle_embedding = self.atomic_charge_conditioning(
+                inputs["oracle_charges"],
+                inputs["oracle_charges_mask"],
+                inputs["system_indices"],
+                int(inputs["n_systems"].item()),
+            )
+            cond_embedding = (
+                oracle_embedding
+                if cond_embedding is None
+                else cond_embedding + oracle_embedding
+            )
 
         for (
             combination_norm,
@@ -719,6 +746,18 @@ class PETBackend(torch.nn.Module):
                 inputs["charge"],
                 inputs["spin_multiplicity"],
                 inputs["system_indices"],
+            )
+        if self.atomic_charge_conditioning is not None:
+            oracle_embedding = self.atomic_charge_conditioning(
+                inputs["oracle_charges"],
+                inputs["oracle_charges_mask"],
+                inputs["system_indices"],
+                int(inputs["n_systems"].item()),
+            )
+            cond_embedding = (
+                oracle_embedding
+                if cond_embedding is None
+                else cond_embedding + oracle_embedding
             )
         for node_embedder, gnn_layer in zip(
             self.node_embedders, self.gnn_layers, strict=True

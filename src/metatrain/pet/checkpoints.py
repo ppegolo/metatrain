@@ -397,6 +397,24 @@ def model_update_v16_v17(checkpoint: dict) -> None:
         hypers["readout_type"] = {"atom_type_gating": False, "hypers": {}}
 
 
+def model_update_v17_v18(checkpoint: dict) -> None:
+    """
+    Update a v17 checkpoint to v18.
+
+    Adds the atomic-charge (oracle) conditioning hyperparameters introduced on
+    this version, disabled — reproducing the previous behaviour exactly: the
+    conditioning module is only constructed when enabled, so the state dict is
+    unchanged.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    hypers = checkpoint["model_data"]["model_hypers"]
+    if "atomic_charge_conditioning" not in hypers:
+        hypers["atomic_charge_conditioning"] = False
+    if "atomic_charge_dropout" not in hypers:
+        hypers["atomic_charge_dropout"] = 0.0
+
+
 ###########################
 # TRAINER #################
 ###########################

@@ -326,6 +326,19 @@ class ModelHypers(TypedDict):
     charge and spin multiplicity are embedded and added to node features at each
     GNN layer, allowing different predictions for the same structure under
     different electronic states."""
+    atomic_charge_conditioning: bool = False
+    """Enable per-atom oracle-charge conditioning. When enabled, precomputed
+    GFN2-xTB partial charges (attached to each system as ``"oracle_charges"``
+    data, see :py:mod:`metatrain.utils.oracle_charges`) are embedded together
+    with a presence mask and added to node features at each GNN layer. The
+    charges carry the global charge-placement bookkeeping of charged systems;
+    structures without attached charges run oracle-free through the mask
+    channel."""
+    atomic_charge_dropout: float = 0.0
+    """Per-system probability of dropping the oracle-charge channel during
+    training (fresh Bernoulli draw per system per forward pass). Trains the
+    oracle-free operating mode alongside the conditioned one; ``0`` (default)
+    disables dropout."""
     max_charge: int = 10
     """Maximum absolute charge for the conditioning embedding table. Supports
     charges in the range ``[-max_charge, +max_charge]``."""

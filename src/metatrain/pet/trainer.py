@@ -329,6 +329,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
         conditioning_callables = (
             [get_system_data_transform(conditioning_keys)] if conditioning_keys else []
         )
+        if model.atomic_charge_conditioning:  # runs before the DDP wrap
+            # Computed in the dataloader workers (like the density metric
+            # matrices) and cached across epochs; runs after the system-data
+            # transform so the oracle sees each system's charge and spin.
+            from metatrain.utils.oracle_charges import get_oracle_charges_transform
+
+            conditioning_callables.append(get_oracle_charges_transform())
+            logging.info(
+                "Atomic-charge conditioning enabled: attaching GFN2 oracle "
+                "charges in the data loaders."
+            )
 
         target_keys = list(train_targets.keys())
 
