@@ -193,8 +193,9 @@ def _attach_precomputed(systems: List[System], packed: TensorMap) -> None:
                 f"precomputed oracle charges give {len(chunk)} values "
                 f"for a system of {len(system)} atoms."
             )
-        if torch.isnan(chunk).any():
-            continue  # NaN marks "oracle failed offline": run oracle-free
+        # NaN chunks ("oracle failed offline") are attached as-is: batches
+        # must be homogeneous in known_data() for packing, so the model's
+        # extraction step maps NaN to the oracle-free state instead.
         attach_oracle_charges(system, chunk, system.positions.dtype)
 
 
@@ -230,7 +231,12 @@ def _oracle_charges_transform(
             if key is not None:
                 cache.put(key, charges)
         if len(charges) == 1 and torch.isnan(charges).all():
-            continue  # oracle failed: no data attached, model runs oracle-free
+            # Oracle failed: attach per-atom NaN so the batch stays
+            # homogeneous in known_data(); the model maps NaN to the
+            # oracle-free state at extraction time.
+            charges = torch.full(
+                (len(system),), torch.nan, dtype=system.positions.dtype
+            )
         attach_oracle_charges(system, charges, system.positions.dtype)
     return systems, targets, extra
 

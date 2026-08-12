@@ -166,6 +166,9 @@ def test_precomputed_nan_entry_never_falls_back_to_tblite(monkeypatch):
     # A NaN chunk means "oracle failed offline": the system must run
     # oracle-free without touching the on-the-fly GFN2 path, which is
     # unavailable on platforms without tblite (regression: job 3063242).
+    # The NaN data stays attached so the batch remains homogeneous in
+    # known_data() — packing requires it (regression: job 3065343) — and
+    # extraction maps it to the zero-charge, zero-mask state.
     import builtins
 
     from metatensor.torch import Labels, TensorBlock, TensorMap
@@ -206,4 +209,20 @@ def test_precomputed_nan_entry_never_falls_back_to_tblite(monkeypatch):
     _oracle_charges_transform(systems, {}, {"mtt::oracle_charges": packed})
     q0 = systems[0].get_data("mtt::oracle_charges").block().values.reshape(-1)
     torch.testing.assert_close(q0, values[:3])
-    assert "mtt::oracle_charges" not in systems[1].known_data()
+    # The failed system keeps the field (homogeneous batch) as NaN...
+    assert "mtt::oracle_charges" in systems[1].known_data()
+    q1 = systems[1].get_data("mtt::oracle_charges").block().values.reshape(-1)
+    assert torch.isnan(q1).all()
+
+    # ...packing (worker -> main transport) accepts the mixed batch...
+    from metatrain.utils.data.dataset import _pack_systems
+
+    _pack_systems(systems)
+
+    # ...and extraction turns NaN into the oracle-free input state.
+    from metatrain.pet.model import _extract_oracle_charges
+
+    charges, mask = _extract_oracle_charges(systems, torch.device("cpu"), torch.float64)
+    torch.testing.assert_close(charges[:3], values[:3])
+    assert torch.all(charges[3:] == 0.0)
+    assert mask.tolist() == [1.0, 1.0, 1.0, 0.0, 0.0]

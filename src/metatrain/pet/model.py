@@ -1241,8 +1241,13 @@ def _extract_oracle_charges(
         n_atoms = len(system)
         if "mtt::oracle_charges" in system.known_data():
             block = system.get_data("mtt::oracle_charges").block()
-            values_list.append(block.values.reshape(-1).to(device=device, dtype=dtype))
-            mask_list.append(torch.ones(n_atoms, device=device, dtype=dtype))
+            values = block.values.reshape(-1).to(device=device, dtype=dtype)
+            # NaN values mean "oracle unavailable for this system": batches
+            # must attach the field homogeneously (packing requires it), so
+            # absence is encoded in-band and mapped to the no-oracle state.
+            missing = torch.isnan(values)
+            values_list.append(torch.where(missing, torch.zeros_like(values), values))
+            mask_list.append((~missing).to(dtype))
         else:
             values_list.append(torch.zeros(n_atoms, device=device, dtype=dtype))
             mask_list.append(torch.zeros(n_atoms, device=device, dtype=dtype))
