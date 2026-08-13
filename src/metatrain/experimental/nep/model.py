@@ -57,8 +57,8 @@ def _build_nep_parameters(
         atomic_numbers=tuple(atomic_types),
         rc_radial=tuple(float(hypers["cutoff_radial"]) for _ in range(num_types)),
         rc_angular=tuple(float(hypers["cutoff_angular"]) for _ in range(num_types)),
-        mn_radial=100,
-        mn_angular=20,
+        mn_radial=int(hypers["mn_radial"]),
+        mn_angular=int(hypers["mn_angular"]),
         n_max_radial=int(hypers["n_max_radial"]),
         n_max_angular=int(hypers["n_max_angular"]),
         basis_size_radial=int(hypers["basis_size_radial"]),
@@ -221,7 +221,7 @@ def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
 
 
 class NEP(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -271,6 +271,23 @@ class NEP(ModelInterface[ModelHypers]):
             params = dataclasses.replace(params, zbl=None)
         else:
             params = _build_nep_parameters(self.hypers, self.atomic_types)
+
+        # `mn_radial`/`mn_angular` only size the neighbor lists that GPUMD
+        # allocates for the exported nep.txt; they play no role in training.
+        # They therefore always come from the hypers, also when a pretrained
+        # potential was loaded, so that a file written with too small a
+        # capacity does not propagate into the exported potential.
+        if int(self.hypers["mn_radial"]) < 1 or int(self.hypers["mn_angular"]) < 1:
+            raise ValueError(
+                "`mn_radial` and `mn_angular` must be positive, got "
+                f"mn_radial={self.hypers['mn_radial']} and "
+                f"mn_angular={self.hypers['mn_angular']}."
+            )
+        params = dataclasses.replace(
+            params,
+            mn_radial=int(self.hypers["mn_radial"]),
+            mn_angular=int(self.hypers["mn_angular"]),
+        )
 
         self.charge_mode = int(params.charge_mode)
         if self.charge_mode != 0 and params.version != 4:

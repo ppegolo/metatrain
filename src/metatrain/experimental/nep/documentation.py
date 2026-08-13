@@ -52,6 +52,11 @@ should be chosen based on the physical system.  Increasing ``n_max_radial``,
 descriptors; ``l_max_4body`` (0 or 2) and ``l_max_5body`` (0 or 1) enable
 four- and five-body angular terms.
 
+``mn_radial`` and ``mn_angular`` do not affect training: they only size the
+neighbor lists that GPUMD allocates for the exported ``nep.txt``.  Raise them
+if GPUMD reports an illegal memory access on a dense system; the defaults are
+generous enough for typical condensed-phase structures.
+
 Fine-tuning an existing GPUMD potential
 ---------------------------------------
 
@@ -149,6 +154,18 @@ class ModelHypers(TypedDict):
     """Radial descriptor cutoff radius in length units."""
     cutoff_angular: float = 4.0
     """Angular descriptor cutoff radius in length units."""
+    mn_radial: int = 200
+    """Maximum number of radial neighbors per atom written to the exported
+    ``nep.txt``.  This value does not affect training in any way: it is only
+    the neighbor-list capacity that GPUMD allocates when running the exported
+    potential.  It must be at least as large as the largest number of
+    neighbors within ``cutoff_radial`` of any atom in the systems GPUMD will
+    simulate, otherwise GPUMD writes out of bounds and crashes with an illegal
+    memory access."""
+    mn_angular: int = 100
+    """Maximum number of angular neighbors per atom written to the exported
+    ``nep.txt``.  As for ``mn_radial``, this only sizes GPUMD's neighbor
+    lists (here within ``cutoff_angular``) and has no effect on training."""
     n_max_radial: int = 4
     """Number of radial descriptor components minus one."""
     n_max_angular: int = 4

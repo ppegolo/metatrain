@@ -203,6 +203,51 @@ def test_export_as_nep5_is_the_same_potential(tmp_path):
     assert torch.allclose(e_plain, e_promoted, rtol=1e-10, atol=1e-10)
 
 
+def test_export_nep_neighbor_capacity_from_hypers(tmp_path):
+    """`mn_radial`/`mn_angular` end up on the `cutoff` line of the nep.txt."""
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers["mn_radial"] = 173
+    hypers["mn_angular"] = 91
+    model = NEP(hypers, _dataset_info([6])).to(torch.float64)
+
+    path = tmp_path / "nep.txt"
+    model.export_nep(path)
+
+    params = load_nep(str(path))
+    assert (params.mn_radial, params.mn_angular) == (173, 91)
+
+
+def test_loaded_nep_neighbor_capacity_comes_from_hypers(tmp_path):
+    """A loaded nep.txt does not carry its own capacity into the export."""
+    source = tmp_path / "source.txt"
+    _make_model([6], 4, scale=1.0, composition={6: 0.0}).export_nep(source)
+    with open(source) as fd:
+        lines = fd.read().splitlines()
+    index = next(i for i, line in enumerate(lines) if line.startswith("cutoff "))
+    lines[index] = " ".join(lines[index].split()[:-2] + ["100", "20"])
+    with open(source, "w") as fd:
+        fd.write("\n".join(lines) + "\n")
+
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers["nep_model"] = str(source)
+    hypers["mn_radial"] = 250
+    hypers["mn_angular"] = 125
+    model = NEP(hypers, _dataset_info([6])).to(torch.float64)
+
+    exported = tmp_path / "nep.txt"
+    model.export_nep(exported)
+    params = load_nep(str(exported))
+    assert (params.mn_radial, params.mn_angular) == (250, 125)
+
+
+@pytest.mark.parametrize("key", ["mn_radial", "mn_angular"])
+def test_nonpositive_neighbor_capacity_raises(key):
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers[key] = 0
+    with pytest.raises(ValueError, match="must be positive"):
+        NEP(hypers, _dataset_info([6]))
+
+
 def test_export_unsupported_version_raises(tmp_path):
     model = _make_model([6], 4, scale=1.0, composition={6: 0.0})
     message = (
