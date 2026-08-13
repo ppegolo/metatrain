@@ -173,3 +173,23 @@ def test_worker_round_trip_is_lossless():
                 ref_targets["energy"].block().values,
                 got_targets["energy"].block().values,
             )
+
+
+def test_worker_budget_is_split_across_datasets():
+    """num_workers is a total, not a per-dataset count.
+
+    One dataloader is built per dataset and each keeps its workers alive, while
+    only one dataset is drawn from at a time, so taking the number literally
+    would multiply processes by the dataset count for no extra prefetching.
+    """
+    from metatrain.utils.data.dataloaders import _workers_per_loader
+
+    # Single dataset: unchanged, which is the common case.
+    assert _workers_per_loader(8, 1, "training") == 8
+    # Eighteen datasets: 8 workers spread over them, not 8 each.
+    assert _workers_per_loader(8, 18, "training") == 1
+    assert _workers_per_loader(36, 18, "training") == 2
+    # Never drops to zero workers, which would move loading into the main loop.
+    assert _workers_per_loader(1, 18, "training") == 1
+    # Explicitly disabled workers stay disabled.
+    assert _workers_per_loader(0, 18, "training") == 0

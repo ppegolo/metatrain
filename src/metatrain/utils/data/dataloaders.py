@@ -1,3 +1,4 @@
+import logging
 from typing import Any, List, Optional, Tuple, Union
 
 import torch.utils.data
@@ -8,6 +9,37 @@ from .samplers import MaxAtomDistributedBatchSampler
 
 
 DatasetLike = Union[Dataset, torch.utils.data.Subset]
+
+logger = logging.getLogger(__name__)
+
+
+def _workers_per_loader(num_workers: int, n_datasets: int, kind: str) -> int:
+    """Split a worker budget across the per-dataset dataloaders.
+
+    One ``DataLoader`` is built per dataset and each keeps its own worker
+    processes alive, while ``CombinedDataLoader`` draws from a single dataset at
+    a time. Taking ``num_workers`` literally therefore multiplies the process
+    count by the number of datasets while leaving all but one loader's workers
+    idle -- with a few dozen datasets that is hundreds of processes per rank,
+    oversubscribing the CPUs they share with the training step. The budget is
+    treated as a total instead, which leaves the single-dataset case (the common
+    one) exactly as it was.
+
+    :param num_workers: Requested number of workers.
+    :param n_datasets: Number of datasets, i.e. of dataloaders to be built.
+    :param kind: Either ``"training"`` or ``"validation"``, for the log message.
+    :return: Workers to give each individual dataloader.
+    """
+    if num_workers <= 0 or n_datasets <= 1:
+        return num_workers
+    per_loader = max(1, num_workers // n_datasets)
+    if per_loader * n_datasets != num_workers:
+        logger.info(
+            f"Splitting the {kind} worker budget of {num_workers} across "
+            f"{n_datasets} datasets: {per_loader} worker(s) each "
+            f"({per_loader * n_datasets} processes in total)."
+        )
+    return per_loader
 
 
 def build_train_dataloaders(
@@ -48,6 +80,7 @@ def build_train_dataloaders(
     """
     dataloaders: List[DataLoader] = []
     epoch_samplers: List[Any] = []
+    num_workers = _workers_per_loader(num_workers, len(train_datasets), "training")
     # request fork explicitly: the default start method is "forkserver" on
     # Python >= 3.14, but our datasets and collate functions rely on fork's
     # memory sharing and are not picklable
@@ -137,6 +170,7 @@ def build_val_dataloaders(
     :return: One ``DataLoader`` per dataset in ``val_datasets``.
     """
     dataloaders: List[DataLoader] = []
+    num_workers = _workers_per_loader(num_workers, len(val_datasets), "validation")
     # request fork explicitly: the default start method is "forkserver" on
     # Python >= 3.14, but our datasets and collate functions rely on fork's
     # memory sharing and are not picklable
