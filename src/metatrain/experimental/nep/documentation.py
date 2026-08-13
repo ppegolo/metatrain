@@ -90,11 +90,17 @@ To continue training from a metatrain NEP checkpoint on a new dataset, set
 The model architecture and weights are taken from the checkpoint, together with
 its composition baselines, target scales and descriptor normalisation, which
 are all kept fixed instead of being refitted on the new dataset.  The dataset
-may not introduce new atomic types, but new targets are allowed: their output
-layers, composition weights and scales are initialised and fitted as usual.
-Unlike the ``nep_model`` route, this preserves the model exactly, without going
-through the limited precision and the composition fold of the ``nep.txt``
-format.
+may not introduce new atomic types or new targets: a NEP potential has a single
+output head, and it keeps predicting the target it was trained on.  Unlike the
+``nep_model`` route, this preserves the model exactly, without going through
+the limited precision and the composition fold of the ``nep.txt`` format.
+
+Fine-tuning starts from the *best* model of the checkpoint (not its last
+epoch), with a fresh optimizer.  The first logged metrics are therefore those
+of a model that has already been trained for a full epoch at ``learning_rate``:
+on an already-converged potential, the default ``0.001`` is large enough to
+visibly degrade it before anything is logged.  Lower ``learning_rate`` (and, if
+needed, ``scheduler_patience``) when fine-tuning.
 
 Exporting to GPUMD
 ------------------

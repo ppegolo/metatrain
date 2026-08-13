@@ -14,6 +14,17 @@ def model_update_v1_v2(checkpoint: dict) -> None:
     hypers.setdefault("mn_angular", 100)
 
 
+def model_update_v2_v3(checkpoint: dict) -> None:
+    """Add the ``loaded_nep`` model data flag, which records whether the
+    potential was loaded from a ``nep.txt`` file (and therefore keeps its
+    composition baselines at zero and its target scale at one).
+
+    Checkpoints written before this flag existed lost that information when
+    they were saved, so they are restored as regular models.
+    """
+    checkpoint["model_data"].setdefault("loaded_nep", False)
+
+
 def trainer_update_v1_v2(checkpoint: dict) -> None:
     """Add the ``finetune`` training hypers introduced with checkpoint-from-
     checkpoint fine-tuning."""

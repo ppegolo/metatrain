@@ -342,14 +342,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
             if not raw_model.has_new_targets:
                 optimizer.load_state_dict(self.optimizer_state_dict)
 
-        # Create a scheduler:
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            factor=self.hypers["scheduler_factor"],
-            patience=self.hypers["scheduler_patience"],
-            threshold=0.001,
-            min_lr=1e-5,
-        )
+        # Create a scheduler.  Training is stopped once the learning rate drops
+        # below `_MIN_LEARNING_RATE`, so the scheduler itself must not clamp the
+        # learning rate to a larger `min_lr`: that would make the plateau
+        # reductions (and the early stop below) silently stop having an effect.
+        def make_lr_scheduler() -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                factor=self.hypers["scheduler_factor"],
+                patience=self.hypers["scheduler_patience"],
+                threshold=0.001,
+            )
+
+        lr_scheduler = make_lr_scheduler()
         if self.scheduler_state_dict is not None:
             # same as the optimizer, try to load the scheduler state dict
             if not raw_model.has_new_targets:
@@ -582,16 +587,25 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 else:
                     logging.info(f"Changing learning rate from {old_lr} to {new_lr}")
                     old_lr = new_lr
-                    # load best model and optimizer state dict, re-initialize scheduler
-                    raw_model.load_state_dict(self.best_model_state_dict)
-                    optimizer.load_state_dict(self.best_optimizer_state_dict)
+                    # load best model and optimizer state dict, re-initialize
+                    # scheduler.  There is no best state to go back to if no
+                    # epoch ever improved on the metric (e.g. it was NaN
+                    # throughout), in which case training simply carries on
+                    # from the current state with the new learning rate.
+                    if (
+                        self.best_model_state_dict is not None
+                        and self.best_optimizer_state_dict is not None
+                    ):
+                        raw_model.load_state_dict(self.best_model_state_dict)
+                        optimizer.load_state_dict(self.best_optimizer_state_dict)
+                    else:
+                        logging.warning(
+                            "No best model was recorded so far, continuing from "
+                            "the current model state"
+                        )
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = new_lr
-                    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        factor=self.hypers["scheduler_factor"],
-                        patience=self.hypers["scheduler_patience"],
-                    )
+                    lr_scheduler = make_lr_scheduler()
 
             val_metric = get_selected_metric(
                 finalized_val_info, self.hypers["best_model_metric"]

@@ -221,7 +221,7 @@ def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
 
 
 class NEP(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 2
+    __checkpoint_version__ = 3
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -240,6 +240,15 @@ class NEP(ModelInterface[ModelHypers]):
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
         check_no_atom_pair_targets(dataset_info.targets, self.__class__.__name__)
+        # A NEP potential has a single output head, so it can only ever predict
+        # one target.  This is checked here rather than silently ignoring the
+        # extra targets in `forward`.
+        if len(dataset_info.targets) != 1:
+            raise ValueError(
+                "The NEP architecture can only predict a single target, but "
+                f"{len(dataset_info.targets)} were requested: "
+                f"{sorted(dataset_info.targets.keys())}."
+            )
         self.atomic_types = dataset_info.atomic_types
 
         # Pretrained potential loading: if nep_model is provided, load the
@@ -405,7 +414,24 @@ class NEP(ModelInterface[ModelHypers]):
             n_atoms = len(system)
             positions_list.append(system.positions)
             cells_list.append(system.cell)
-            type_ids_list.append(self.species_to_type_id[system.types])
+            # `species_to_type_id` is -1 for every atomic number the model was
+            # not trained on (and indexing it would silently wrap around for
+            # numbers beyond its length), so both cases are rejected here.
+            types = system.types
+            if bool((types < 0).any()) or bool(
+                (types >= self.species_to_type_id.shape[0]).any()
+            ):
+                raise ValueError(
+                    "this system contains atomic types the NEP model does not "
+                    "know about"
+                )
+            type_ids = self.species_to_type_id[types]
+            if bool((type_ids < 0).any()):
+                raise ValueError(
+                    "this system contains atomic types the NEP model does not "
+                    "know about"
+                )
+            type_ids_list.append(type_ids)
             batch_index_list.append(
                 torch.full((n_atoms,), i_system, dtype=torch.long, device=device)
             )
@@ -463,6 +489,12 @@ class NEP(ModelInterface[ModelHypers]):
     ) -> Dict[str, TensorMap]:
         if len(outputs) == 0:
             return {}
+
+        if self.targets_keys not in outputs:
+            raise ValueError(
+                "the NEP model can only compute the target it was trained on, "
+                "which was not requested"
+            )
 
         device = systems[0].positions.device
 
@@ -823,7 +855,7 @@ class NEP(ModelInterface[ModelHypers]):
             for key, value in merged_info.targets.items()
             if key not in self.dataset_info.targets
         }
-        self.has_new_targets = len(new_targets) > 0
+        self.has_new_targets = False
 
         if len(new_atomic_types) > 0:
             raise ValueError(
@@ -831,9 +863,14 @@ class NEP(ModelInterface[ModelHypers]):
                 "The NEP model does not support adding new atomic types."
             )
 
-        # register new outputs as new last layers
-        for target_name, target in new_targets.items():
-            self._add_output(target_name, target)
+        # A NEP potential has a single output head: unlike other architectures,
+        # it cannot grow a new one for a new target.
+        if len(new_targets) > 0:
+            raise ValueError(
+                f"New targets found in the dataset: {sorted(new_targets.keys())}. "
+                "The NEP model can only predict the single target it was "
+                f"trained on ('{self.targets_keys}')."
+            )
 
         self.dataset_info = merged_info
 
@@ -878,6 +915,11 @@ class NEP(ModelInterface[ModelHypers]):
             hypers=model_data["model_hypers"],
             dataset_info=model_data["dataset_info"],
         )
+        # The `nep_model` path is not stored in the checkpoint (the weights live
+        # in the state dict), so whether the potential originally came from a
+        # nep.txt file has to be restored explicitly: it decides whether the
+        # composition baselines and the target scale stay fixed.
+        model.loaded_nep = model_data["loaded_nep"]
 
         dtype = model_state_dict["potential.ann"].dtype
         model.to(dtype).load_state_dict(model_state_dict)
@@ -958,6 +1000,7 @@ class NEP(ModelInterface[ModelHypers]):
             "model_data": {
                 "model_hypers": hypers,
                 "dataset_info": self.dataset_info,
+                "loaded_nep": self.loaded_nep,
             },
             "epoch": None,
             "best_epoch": None,
