@@ -365,6 +365,18 @@ class TrainerHypers(TypedDict):
     """Number of epochs."""
     warmup_fraction: float = 0.01
     """Fraction of training steps used for learning rate warmup."""
+    stable_fraction: float = 0.0
+    """Fraction of training steps held at the peak learning rate, between the
+    warmup and the cosine decay.
+
+    The default ``0`` gives a plain warmup-then-cosine schedule. A large value
+    (e.g. ``0.9``) gives a warmup-stable-decay schedule instead, which does not
+    commit to a training horizon: the run can be stopped anywhere in the stable
+    phase and annealed afterwards with a short separate run, and extending it
+    does not produce the learning-rate jump that a rescaled cosine does."""
+    min_lr_ratio: float = 0.0
+    """Learning rate at the end of the decay, as a fraction of
+    :attr:`learning_rate`."""
     learning_rate: float = 1e-4
     """Learning rate."""
     weight_decay: Optional[float] = None
