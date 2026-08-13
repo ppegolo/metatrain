@@ -594,3 +594,52 @@ def test_max_atom_sampler_cross_validation_batch_contents(tmp_path):
     ):
         torch.testing.assert_close(pos_fixed, pos_maxatom)
         torch.testing.assert_close(e_fixed, e_maxatom)
+
+
+def test_fewer_batches_than_replicas_pads_instead_of_failing():
+    """A split smaller than the world size is padded, not rejected.
+
+    Multi-dataset training builds one sampler per dataset, so a small dataset
+    would otherwise take down a run whose other datasets are large. Padding
+    repeats whole batches; every replica gets one and each batch is repeated
+    equally often, so averaged metrics stay correct.
+    """
+    atom_counts = [3] * 9  # 3 batches of 3 structures at max_atoms=9
+    ds = _FakeDataset(atom_counts)
+    world_size = 12
+
+    per_rank = []
+    with pytest.warns(UserWarning, match="batches will be repeated"):
+        for rank in range(world_size):
+            sampler = MaxAtomDistributedBatchSampler(
+                ds,
+                max_atoms=9,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+                allow_fewer_batches_than_replicas=True,
+            )
+            batches = list(sampler)
+            assert len(batches) == 1  # nobody is left idle
+            per_rank.append(batches[0])
+
+    # Every structure is covered, and each batch is used the same number of
+    # times, so an average over replicas is unbiased.
+    assert sorted(sum(per_rank, [])) == sorted(list(range(9)) * (world_size // 3))
+
+
+def test_fewer_batches_than_replicas_still_fails_when_dropping():
+    # With drop_last=True there is nothing to hand the replicas: padding is
+    # disabled by definition, so this has to stay an error.
+    ds = _FakeDataset([3] * 9)
+    with pytest.raises(ValueError, match="not possible with drop_last"):
+        MaxAtomDistributedBatchSampler(
+            ds,
+            max_atoms=9,
+            num_replicas=12,
+            rank=0,
+            shuffle=False,
+            drop_last=True,
+            allow_fewer_batches_than_replicas=True,
+        )

@@ -153,6 +153,12 @@ def build_val_dataloaders(
                 ),
                 rank=val_sampler.rank if val_sampler is not None else 0,
                 shuffle=False,
+                # A validation split smaller than the world size repeats batches
+                # rather than aborting the run: each batch is repeated equally
+                # often, so the averaged metrics are unchanged. Multi-dataset
+                # training makes this reachable, since every dataset carries its
+                # own sampler and only one of them has to be small.
+                allow_fewer_batches_than_replicas=True,
             )
             dataloaders.append(
                 DataLoader(

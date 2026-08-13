@@ -11,6 +11,7 @@ Licensed under the MIT License.
 
 import logging
 import math
+import warnings
 from typing import Iterator, List, Tuple
 
 import numpy as np
@@ -193,6 +194,13 @@ class MaxAtomDistributedBatchSampler(torch.utils.data.Sampler):
     :param min_atoms: Minimum total number of atoms required for a batch to be kept.
         Batches whose total atom count falls below this threshold are discarded during
         packing. Defaults to ``0`` (no minimum).
+    :param allow_fewer_batches_than_replicas: If ``True``, a split packing fewer
+        batches than there are replicas repeats batches instead of raising, so every
+        replica still gets one. Each batch is then repeated equally often, leaving
+        averaged metrics unbiased at the cost of redundant work. Requires
+        ``drop_last=False``. Multi-dataset training builds one sampler per dataset,
+        where a single small dataset would otherwise abort a run whose other
+        datasets are large.
     """
 
     def __init__(
@@ -204,6 +212,7 @@ class MaxAtomDistributedBatchSampler(torch.utils.data.Sampler):
         shuffle: bool = True,
         drop_last: bool = False,
         min_atoms: int = 0,
+        allow_fewer_batches_than_replicas: bool = False,
     ) -> None:
         if max_atoms <= 0:
             raise ValueError(f"max_atoms must be positive, got {max_atoms}")
@@ -251,11 +260,33 @@ class MaxAtomDistributedBatchSampler(torch.utils.data.Sampler):
         del atom_counts
 
         num_batches = self._batch_offsets.size - 1
-        if num_batches < self.num_replicas:
+        if num_batches == 0:
             raise ValueError(
+                f"No batches could be packed from {n} structures with "
+                f"max_atoms={self.max_atoms}."
+            )
+        if num_batches < self.num_replicas:
+            if self.drop_last or not allow_fewer_batches_than_replicas:
+                # Dropping the tail would leave every rank with zero batches,
+                # so padding is the only way through and it has to be asked for.
+                raise ValueError(
+                    f"Only {num_batches} batches were packed but "
+                    f"num_replicas={self.num_replicas}. Increase the dataset "
+                    "size, reduce max_atoms, or pass "
+                    "allow_fewer_batches_than_replicas=True to repeat batches "
+                    "(not possible with drop_last=True)."
+                )
+            # Padding repeats whole batches, and __iter__ wraps as many times
+            # as needed, so every replica still gets one batch and each batch
+            # is repeated equally often -- averaged metrics stay unbiased, the
+            # repeated work is simply wasted.
+            warnings.warn(
                 f"Only {num_batches} batches were packed but "
-                f"num_replicas={self.num_replicas}. Increase the dataset size or "
-                "reduce max_atoms."
+                f"num_replicas={self.num_replicas}: batches will be repeated so "
+                "that every replica gets one. Averaged metrics remain correct, "
+                "but the repeated work is wasted -- use a larger split, a "
+                "smaller max_atoms, or fewer replicas.",
+                stacklevel=2,
             )
 
         if self.drop_last and num_batches % self.num_replicas != 0:
