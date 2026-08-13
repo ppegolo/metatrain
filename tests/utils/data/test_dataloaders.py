@@ -175,21 +175,24 @@ def test_worker_round_trip_is_lossless():
             )
 
 
-def test_worker_budget_is_split_across_datasets():
-    """num_workers is a total, not a per-dataset count.
+def test_worker_count_is_capped_by_available_cpus(monkeypatch):
+    """Per-loader workers are honoured until the total would oversubscribe.
 
-    One dataloader is built per dataset and each keeps its workers alive, while
-    only one dataset is drawn from at a time, so taking the number literally
-    would multiply processes by the dataset count for no extra prefetching.
+    One dataloader is built per dataset and each keeps its workers alive, so the
+    request has to be capped somewhere; dividing it instead would starve the
+    single dataset a full sweep is reading at any moment.
     """
-    from metatrain.utils.data.dataloaders import _workers_per_loader
+    from metatrain.utils.data import dataloaders as module
 
-    # Single dataset: unchanged, which is the common case.
-    assert _workers_per_loader(8, 1, "training") == 8
-    # Eighteen datasets: 8 workers spread over them, not 8 each.
-    assert _workers_per_loader(8, 18, "training") == 1
-    assert _workers_per_loader(36, 18, "training") == 2
-    # Never drops to zero workers, which would move loading into the main loop.
-    assert _workers_per_loader(1, 18, "training") == 1
+    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _pid: set(range(72)))
+
+    # Single dataset: untouched, which is the common case.
+    assert module._workers_per_loader(8, 1, "training") == 8
+    # A request that fits stays intact.
+    assert module._workers_per_loader(4, 18, "training") == 4
+    # 8 each over 18 datasets would be 144 processes on 72 CPUs: capped to 4.
+    assert module._workers_per_loader(8, 18, "training") == 4
+    # Never drops to zero, which would move loading into the main loop.
+    assert module._workers_per_loader(8, 200, "training") == 1
     # Explicitly disabled workers stay disabled.
-    assert _workers_per_loader(0, 18, "training") == 0
+    assert module._workers_per_loader(0, 18, "training") == 0

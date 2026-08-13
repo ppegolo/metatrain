@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, List, Optional, Tuple, Union
 
 import torch.utils.data
@@ -17,13 +18,16 @@ def _workers_per_loader(num_workers: int, n_datasets: int, kind: str) -> int:
     """Split a worker budget across the per-dataset dataloaders.
 
     One ``DataLoader`` is built per dataset and each keeps its own worker
-    processes alive, while ``CombinedDataLoader`` draws from a single dataset at
-    a time. Taking ``num_workers`` literally therefore multiplies the process
-    count by the number of datasets while leaving all but one loader's workers
-    idle -- with a few dozen datasets that is hundreds of processes per rank,
-    oversubscribing the CPUs they share with the training step. The budget is
-    treated as a total instead, which leaves the single-dataset case (the common
-    one) exactly as it was.
+    processes alive, so taking ``num_workers`` literally multiplies the process
+    count by the number of datasets: a few dozen datasets means hundreds of
+    processes per rank, oversubscribing the CPUs they share with the training
+    step. Dividing the count instead would starve each loader -- a full sweep
+    (validation, composition and scaler fitting) draws from one dataset at a
+    time and wants that dataset served at the full rate.
+
+    So the request is honoured per loader and only the *total* is capped, by the
+    CPUs actually available to this process. Single-dataset training, and any
+    case that already fits, are unaffected.
 
     :param num_workers: Requested number of workers.
     :param n_datasets: Number of datasets, i.e. of dataloaders to be built.
@@ -32,12 +36,17 @@ def _workers_per_loader(num_workers: int, n_datasets: int, kind: str) -> int:
     """
     if num_workers <= 0 or n_datasets <= 1:
         return num_workers
-    per_loader = max(1, num_workers // n_datasets)
-    if per_loader * n_datasets != num_workers:
+    if hasattr(os, "sched_getaffinity"):
+        available = len(os.sched_getaffinity(0))
+    else:  # pragma: no cover - platform dependent
+        available = os.cpu_count() or 1
+    per_loader = max(1, min(num_workers, available // n_datasets))
+    if per_loader != num_workers:
         logger.info(
-            f"Splitting the {kind} worker budget of {num_workers} across "
-            f"{n_datasets} datasets: {per_loader} worker(s) each "
-            f"({per_loader * n_datasets} processes in total)."
+            f"Capping the {kind} workers at {per_loader} per dataloader across "
+            f"{n_datasets} datasets ({per_loader * n_datasets} processes in "
+            f"total, {available} CPUs available); {num_workers} each would "
+            "oversubscribe them."
         )
     return per_loader
 
