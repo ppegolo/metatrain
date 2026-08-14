@@ -17,7 +17,8 @@ only.  The configuration still comes from the target section of the yaml, via
 :meth:`GLEDriftConfig.from_options`.
 
 The integrator consumes ``L_blocks`` (and forms ``B = sqrt(2 kB T) L``
-itself) while ``A`` is provided for inspection and for losses.
+itself) while ``A = L L^T + Omega`` is provided for inspection and for
+losses; ``W_blocks`` holds the antisymmetric coupling ``Omega`` carries.
 """
 
 # Export layout (metatomic), documented not implemented
@@ -28,7 +29,7 @@ itself) while ``A`` is provided for inspection and for losses.
 #
 #   samples    = (system, atom)
 #   components = two Cartesian axes, [3, 3]
-#   properties = the flattened lower-triangular block index, n_blocks
+#   properties = the diagonal block index, n_blocks (and n_aux for W_blocks)
 #
 # and *not* a single flat 3(n+1) x 3(n+1) Cartesian object.  The channel index
 # (p, s^1, ..., s^n) is not a spatial axis: flattening it into the Cartesian
@@ -141,9 +142,10 @@ class GLEDriftModel(torch.nn.Module):
             lists already attached.
         :param bonds: Optional per-system ``[B, 2]`` tensors of bonded atom
             pairs, required when the head uses more than one neighbor class.
-        :return: ``L_blocks`` of shape ``[n_atoms, n + 1, n + 1, 3, 3]`` and
-            ``A`` of shape ``[n_atoms, 3(n+1), 3(n+1)]``, with the atoms of
-            all systems concatenated.
+        :return: ``L_blocks`` of shape ``[n_atoms, n + 1, n + 1, 3, 3]``,
+            ``W_blocks`` of shape ``[n_atoms, n, 3, 3]`` and
+            ``A = L L^T + Omega`` of shape ``[n_atoms, 3(n+1), 3(n+1)]``, with
+            the atoms of all systems concatenated.
         """
         if self.config.n_classes > 1 and bonds is None:
             raise ValueError(

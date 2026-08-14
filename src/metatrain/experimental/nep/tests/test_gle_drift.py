@@ -1,10 +1,12 @@
 """Tests for the GLE drift-matrix head.
 
-These define what "done" means for the head: the block structure and
-positive-semidefiniteness of ``A``, exact-by-construction equivariance under
-the full O(3) (improper rotations included) and under permutations,
-smoothness across the cutoff, the log-spaced initialisation of the auxiliary
-rates, and the ``markovian_block`` physics switch.
+These define what "done" means for the head: the block structure of
+``A = L L^T + Omega`` (``L`` block diagonal, ``Omega`` antisymmetric over the
+channels), positive-semidefiniteness of ``Sym(A) = L L^T`` -- *not* of ``A``,
+which is no longer symmetric -- exact-by-construction equivariance under the
+full O(3) (improper rotations included) and under permutations, smoothness
+across the cutoff, the log-spaced initialisation of the auxiliary rates, and
+the ``markovian_block`` physics switch.
 """
 
 import copy
@@ -15,7 +17,7 @@ import torch
 from metatomic.torch import System
 
 from metatrain.experimental.nep.gle_model import GLEDriftModel
-from metatrain.experimental.nep.modules.gle import GLEDriftConfig
+from metatrain.experimental.nep.modules.gle import GLEDriftConfig, omega_matrix
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
     get_system_with_neighbor_lists,
@@ -95,31 +97,50 @@ def _run(model, system):
 
 
 def test_block_structure_and_psd():
-    """Upper blocks vanish, ``A`` is symmetric and positive semidefinite."""
+    """``L`` is block diagonal, ``Sym(A) = L L^T`` is PSD, ``A - A^T = 2 Omega``."""
     model = _excite(_model())
     n = model.config.n_aux
     outputs = _run(model, _system(_positions()))
 
     blocks = outputs["L_blocks"].detach()
+    couplings = outputs["W_blocks"].detach()
     assert blocks.shape == (6, n + 1, n + 1, 3, 3)
-    upper = torch.triu_indices(n + 1, n + 1, offset=1)
-    assert torch.all(blocks[:, upper[0], upper[1]] == 0.0)
+    assert couplings.shape == (6, n, 3, 3)
+    off_diagonal = ~torch.eye(n + 1, dtype=torch.bool)
+    assert torch.all(blocks[:, off_diagonal] == 0.0)
 
-    # every block is symmetric: the basis holds no antisymmetric element
+    # every Cartesian block is symmetric: the basis holds no antisymmetric
+    # element, in `L` and in `W` alike
     assert torch.all(blocks == blocks.transpose(-1, -2))
+    assert torch.all(couplings == couplings.transpose(-1, -2))
     # and the anisotropic part is not negligible, so the checks below are
     # about a genuinely tensorial object rather than a multiple of I
     identity = torch.eye(3, dtype=blocks.dtype)
-    anisotropy = (
-        blocks - blocks.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * identity
-    )
-    assert float(anisotropy.abs().max()) > 1e-2
+    for tensor in (blocks, couplings):
+        anisotropy = (
+            tensor
+            - tensor.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * identity
+        )
+        assert float(anisotropy.abs().max()) > 1e-2
 
     a_matrix = outputs["A"].detach()
     assert a_matrix.shape == (6, 3 * (n + 1), 3 * (n + 1))
-    assert torch.allclose(a_matrix, a_matrix.transpose(-1, -2), atol=1e-12)
-    eigenvalues = torch.linalg.eigvalsh(a_matrix)
-    assert torch.all(eigenvalues >= -1e-10)
+
+    # the symmetric part is exactly L L^T, and it is positive semidefinite
+    symmetric = 0.5 * (a_matrix + a_matrix.transpose(-1, -2))
+    factor = blocks.permute(0, 1, 3, 2, 4).reshape(6, 3 * (n + 1), 3 * (n + 1))
+    assert torch.allclose(symmetric, factor @ factor.transpose(-1, -2), atol=1e-12)
+    assert torch.all(torch.linalg.eigvalsh(symmetric) >= -1e-10)
+    # ... and the drift itself is stable: Re lambda(A) >= 0
+    assert float(torch.linalg.eigvals(a_matrix).real.min()) > -1e-10
+
+    # the antisymmetric part is exactly the coupling, in the (p, s) blocks
+    antisymmetric = a_matrix - a_matrix.transpose(-1, -2)
+    omega = omega_matrix(couplings)
+    assert torch.allclose(antisymmetric, 2.0 * omega, atol=1e-12)
+    assert float(omega.abs().max()) > 1e-2
+    # Omega_ss is zero: only p couples to the auxiliaries
+    assert torch.all(omega[:, 3:, 3:] == 0.0)
 
 
 def _orthogonal(seed, improper):
@@ -136,54 +157,64 @@ def _orthogonal(seed, improper):
 
 
 @pytest.mark.parametrize("improper", [False, True], ids=["rotation", "reflection"])
-def test_equivariance(improper):
-    """``L`` blocks rotate as ``Q L Q^T``, including for improper rotations.
+@pytest.mark.parametrize("key", ["L_blocks", "W_blocks"])
+def test_equivariance(improper, key):
+    """Every block rotates as ``Q X Q^T``, including for improper rotations.
 
     Parity is covered by the ``improper`` case: the basis holds only proper
-    (parity-even) tensors, so reflections act exactly like rotations.
+    (parity-even) tensors, so reflections act exactly like rotations.  The
+    coupling blocks ``W`` obey the same law as ``L``: channel-space
+    antisymmetry says nothing about the Cartesian indices.
     """
     model = _excite(_model())
     positions = _positions()
     rotation = _orthogonal(seed=3, improper=improper)
 
-    reference = _run(model, _system(positions))["L_blocks"]
-    rotated = _run(model, _system(positions @ rotation.T))["L_blocks"]
+    reference = _run(model, _system(positions))[key]
+    rotated = _run(model, _system(positions @ rotation.T))[key]
 
     # the rotation must actually do something, or this proves nothing
     assert not torch.allclose(rotated, reference, atol=1e-3)
 
-    expected = torch.einsum("ij,nabjk,lk->nabil", rotation, reference, rotation)
+    letters = "ab" if key == "L_blocks" else "a"
+    expected = torch.einsum(
+        f"ij,n{letters}jk,lk->n{letters}il", rotation, reference, rotation
+    )
     assert torch.allclose(rotated, expected, atol=1e-6)
 
 
-def test_permutation_equivariance():
+@pytest.mark.parametrize("key", ["L_blocks", "W_blocks"])
+def test_permutation_equivariance(key):
     model = _excite(_model())
     positions = _positions()
     types = torch.tensor([8, 1, 1, 8, 1, 1], dtype=torch.int32)
     permutation = torch.tensor([3, 0, 5, 1, 4, 2])
 
-    reference = _run(model, _system(positions, types))["L_blocks"]
-    permuted = _run(model, _system(positions[permutation], types[permutation]))[
-        "L_blocks"
-    ]
+    reference = _run(model, _system(positions, types))[key]
+    permuted = _run(model, _system(positions[permutation], types[permutation]))[key]
 
     assert not torch.allclose(permuted, reference, atol=1e-3)
     assert torch.allclose(permuted, reference[permutation], atol=1e-6)
 
 
-def test_translation_invariance():
+@pytest.mark.parametrize("key", ["L_blocks", "W_blocks"])
+def test_translation_invariance(key):
     model = _excite(_model())
     positions = _positions()
     shift = torch.tensor([1.3, -2.7, 0.4], dtype=torch.float64)
 
-    reference = _run(model, _system(positions))["L_blocks"]
-    translated = _run(model, _system(positions + shift))["L_blocks"]
+    reference = _run(model, _system(positions))[key]
+    translated = _run(model, _system(positions + shift))[key]
 
     assert torch.allclose(translated, reference, atol=1e-6)
 
 
 def test_smoothness_across_cutoff():
-    """``L`` and its position gradients are continuous through ``r_cut``."""
+    """The head's blocks and their position gradients are continuous at ``r_cut``.
+
+    ``L`` and ``W`` are probed together: they share the basis and the network,
+    so a discontinuity in either is a discontinuity of the head.
+    """
     config = GLEDriftConfig(n_classes=1, r_cut=4.0)
     model = _excite(_model(config))
     r_cut = config.r_cut
@@ -193,7 +224,15 @@ def test_smoothness_across_cutoff():
             [[0.0, 0.0, 0.0], [distance, 0.0, 0.0]], dtype=torch.float64
         ).requires_grad_(True)
         system = _system(positions, types=torch.tensor([8, 1], dtype=torch.int32))
-        blocks = _run(model, system)["L_blocks"]
+        outputs = _run(model, system)
+        n_atoms = positions.shape[0]
+        blocks = torch.cat(
+            [
+                outputs["L_blocks"].reshape(n_atoms, -1),
+                outputs["W_blocks"].reshape(n_atoms, -1),
+            ],
+            dim=1,
+        )
         # a smooth probe: `abs` would kink wherever an entry crosses zero,
         # which is a property of the probe, not of the model
         total = (blocks**2).sum()
@@ -212,7 +251,7 @@ def test_smoothness_across_cutoff():
     gradients = torch.stack(gradients)
 
     step = float(distances[1] - distances[0])
-    value_jumps = (values[1:] - values[:-1]).abs().amax(dim=(1, 2, 3, 4, 5))
+    value_jumps = (values[1:] - values[:-1]).abs().amax(dim=(1, 2))
     gradient_jumps = (gradients[1:] - gradients[:-1]).abs()
     # the sweep has to move `L` by much more than the continuity threshold,
     # otherwise a discontinuity could hide under it
@@ -259,24 +298,54 @@ def test_initial_rate_spectrum():
         dtype=torch.float64,
     )
     # every auxiliary channel contributes a three-fold degenerate rate
-    expected = expected.repeat_interleave(3)
     for atom in range(eigenvalues.shape[0]):
-        ratio = eigenvalues[atom] / expected
+        ratio = eigenvalues[atom] / expected.repeat_interleave(3)
         assert torch.all(ratio > 0.5), ratio
         assert torch.all(ratio < 2.0), ratio
 
+    # the couplings start at W_c = sqrt(gamma_c) I, so no channel sits on the
+    # W = 0 saddle and the initial kernel integrates to n_aux
+    couplings = outputs["W_blocks"].detach()
+    identity = torch.eye(3, dtype=couplings.dtype)
+    target = expected.sqrt()[None, :, None, None] * identity
+    # atol covers the small tensorial part the random output weights add
+    assert torch.allclose(couplings, target, rtol=0.05, atol=5e-3)
+
 
 def test_markovian_block_disabled():
-    """``markovian_block=False`` removes the momentum-momentum dissipation."""
+    """``markovian_block=False`` is a real pure-memory bath, not a dead one.
+
+    Zeroing ``L_pp`` removes the instantaneous friction *and* the white noise
+    on ``p``, but the coupling ``W`` lives in ``Omega``, so the momentum still
+    exchanges energy with the auxiliaries.  Under the old ``A = L L^T``
+    parameterisation this was structurally impossible: a symmetric PSD matrix
+    with a vanishing diagonal block has a vanishing block row, so the momentum
+    decoupled entirely.  That impossibility is what the antisymmetric coupling
+    removes, and this test is its functional counterpart.
+    """
     config = GLEDriftConfig(markovian_block=False, n_classes=1)
     model = _excite(_model(config))
 
     outputs = _run(model, _system(_positions()))
+    a_matrix = outputs["A"].detach()
 
     assert torch.all(outputs["L_blocks"][:, 0, 0] == 0.0)
-    assert torch.all(outputs["A"][:, :3, :3] == 0.0)
-    eigenvalues = torch.linalg.eigvalsh(outputs["A"])
-    assert torch.all(eigenvalues >= -1e-10)
+    assert torch.all(a_matrix[:, :3, :3] == 0.0)
+
+    # the momentum is still coupled, and the drift is still stable
+    assert float(a_matrix[:, :3, 3:].abs().min(dim=0).values.max()) > 1e-2
+    symmetric = 0.5 * (a_matrix + a_matrix.transpose(-1, -2))
+    assert torch.all(torch.linalg.eigvalsh(symmetric) >= -1e-10)
+    assert float(torch.linalg.eigvals(a_matrix).real.min()) > 1e-6
+
+    # and the memory kernel it produces is positive semidefinite at every lag,
+    # which the old structure could never deliver
+    a_ps = a_matrix[:, :3, 3:]
+    a_ss = a_matrix[:, 3:, 3:]
+    for time in [0.0, 0.1, 1.0]:
+        kernel = -a_ps @ torch.matrix_exp(-a_ss * time) @ a_matrix[:, 3:, :3]
+        assert torch.allclose(kernel, kernel.transpose(-1, -2), atol=1e-10)
+        assert torch.all(torch.linalg.eigvalsh(kernel) >= -1e-10)
 
 
 def test_neighbor_classes_change_the_output():
@@ -331,15 +400,19 @@ def test_trains_without_nans(dtype):
         )
         n = model.config.n_aux + 1
         labels.append(
-            torch.randn(6, n, n, 3, 3, generator=generator, dtype=dtype) * 0.1
+            (
+                torch.randn(6, n, n, 3, 3, generator=generator, dtype=dtype) * 0.1,
+                torch.randn(6, n - 1, 3, 3, generator=generator, dtype=dtype) * 0.1,
+            )
         )
 
     for step in range(100):
         optimizer.zero_grad()
         loss = torch.zeros((), dtype=dtype)
-        for system, label in zip(systems, labels, strict=True):
-            predicted = model([system])["L_blocks"]
-            loss = loss + ((predicted - label) ** 2).mean()
+        for system, (label, coupling_label) in zip(systems, labels, strict=True):
+            predicted = model([system])
+            loss = loss + ((predicted["L_blocks"] - label) ** 2).mean()
+            loss = loss + ((predicted["W_blocks"] - coupling_label) ** 2).mean()
         loss.backward()
         assert torch.isfinite(loss), f"non-finite loss at step {step}"
         for name, parameter in model.named_parameters():
@@ -350,4 +423,5 @@ def test_trains_without_nans(dtype):
 
     final = model([systems[0]])
     assert torch.all(torch.isfinite(final["L_blocks"]))
+    assert torch.all(torch.isfinite(final["W_blocks"]))
     assert torch.all(torch.isfinite(final["A"]))

@@ -1,5 +1,5 @@
-"""GLE drift matrix: the Cholesky factor of a per-atom generalised-Langevin
-drift matrix, built the same way a tensorial NEP builds a polarizability.
+"""GLE drift matrix: a per-atom generalised-Langevin drift matrix, built the
+same way a tensorial NEP builds a polarizability.
 
 The atom-centred NEP descriptors are invariant, so the network only ever
 predicts scalars; every direction comes from contracting those scalars with
@@ -10,26 +10,60 @@ Cartesian tensors built from the neighborhood geometry.  Here the tensors are
 with ``g_k`` the NEP radial basis (Chebyshev windows times the NEP cutoff,
 which goes to zero with zero derivative at ``r_cut``), and the basis of a
 block is ``[I, T^(k,c)...]``.  Since every basis element is a proper,
-parity-even, symmetric tensor, so is every block of ``L``, and equivariance
-under O(3) is exact by construction rather than learned.
+parity-even, symmetric tensor, so is every block the head predicts, and
+equivariance under O(3) is exact by construction rather than learned.
 
-For each atom ``i`` the head returns the block-lower-triangular factor
+Structure of the drift matrix
+-----------------------------
 
-    L_i in R^{3(n+1) x 3(n+1)},   n = n_aux
+For each atom ``i`` the head returns the canonical GLE drift
 
-over the channels ``(p, s^1, ..., s^n)``.  Blocks above the diagonal are
-identically zero and are never parameterized.  The drift matrix is
-``A_i = L_i L_i^T`` (symmetric positive semidefinite by construction); the
-noise map ``B_i = sqrt(2 kB T) L_i`` is left to the integrator, which never
-needs a Cholesky decomposition at runtime.
+    A = L L^T + Omega,    Omega^T = -Omega
 
-The block-lower-triangular form with positive-definite diagonal blocks *is*
-the gauge fix: nothing here diagonalizes or sorts the auxiliary rates.
+over the channels ``(p, s^1, ..., s^n)``, ``n = n_aux``, with
+
+* ``L`` **block diagonal**: ``L_pp`` (instantaneous friction) and one
+  ``L_ss^(c)`` per auxiliary channel (its relaxation rate).  No ``p``-``s``
+  blocks.
+* ``Omega`` carrying *all* the ``p``-``s`` coupling: ``Omega_ps^(c) = W_c``
+  and ``Omega_sp^(c) = -W_c^T``, with ``Omega_ss = 0``.  Each ``W_c`` is a
+  ``3 x 3`` Cartesian block built from the same parity-even basis as ``L``;
+  channel-space antisymmetry is orthogonal to the Cartesian-parity rule, so
+  no ``l = 1`` basis element appears anywhere.
+
+This is not a refactor of the older ``A = L L^T`` with block-lower-triangular
+``L``: that class was provably too small.  The embedded memory kernel is
+``K(t) = 2 A_pp delta(t) - A_ps exp(-A_ss t) A_sp``, and with ``A`` symmetric
+positive semidefinite the tail ``-A_ps exp(-A_ss t) A_ps^T`` is negative
+semidefinite, so only *delta-friction minus a decaying tail* was
+representable and a plain positive memory kernel -- the object this framework
+exists to learn -- was not.  With the antisymmetric coupling,
+
+    K(t) = 2 A_pp delta(t) + sum_c W_c exp(-gamma_c t) W_c^T
+
+whose tail is symmetric positive semidefinite: positive Prony kernels are in
+the class.
+
+The fluctuation-dissipation relation is unchanged and pointwise:
+``Sym(A) = L L^T`` whatever ``Omega`` is, so ``B = sqrt(2 kB T) L`` still
+holds, ``Re lambda(A) >= 0`` still holds, and the equilibrium covariance is
+still ``kB T`` on every channel.  Because ``L`` is now block diagonal, the
+noise driving ``p`` and the noise driving the auxiliaries are *uncorrelated*:
+``B B^T = 2 kB T diag(L_pp L_pp^T, L_ss L_ss^T)``.
+
+``markovian_block=False`` zeroes ``L_pp`` only, which is now a physically
+real setting: the momentum keeps its coupling ``W_c`` to the auxiliaries and
+is thermostatted purely through memory.
+
+Gauge.  With ``L_ss`` one block per channel and ``W`` free, the ``s -> G s``
+degeneracy of the old parameterisation reduces to a per-channel sign and a
+permutation of the channels.  The log-spaced ``gamma_c`` at initialisation is
+the remaining fix; nothing here sorts or re-orders the channels at runtime.
 """
 
 import dataclasses
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torchnep.nep_descriptor import _chebyshev_basis, _cutoff
@@ -39,8 +73,9 @@ from torchnep.nep_descriptor import _chebyshev_basis, _cutoff
 class GLEDriftConfig:
     """Configuration of the GLE drift head.
 
-    :param n_aux: Number of auxiliary momentum channels ``n``.  The factor
-        ``L`` is an ``(n + 1) x (n + 1)`` grid of ``3 x 3`` blocks.
+    :param n_aux: Number of auxiliary momentum channels ``n``.  ``L`` is the
+        block diagonal of an ``(n + 1) x (n + 1)`` grid of ``3 x 3`` blocks
+        and ``Omega`` holds ``n`` coupling blocks ``W_c``.
     :param n_windows: Number of radial windows per neighbor class.
     :param r_cut: Cutoff of the tensor basis, in the length unit of the
         systems.
@@ -48,13 +83,13 @@ class GLEDriftConfig:
         time units of the drift matrix.
     :param gamma_max: Largest auxiliary rate at initialisation.
     :param eps_floor: Floor added to the softplus-constrained coefficient of
-        the identity in every diagonal block.
+        the identity in every diagonal block of ``L``.
     :param markovian_block: Whether the momentum-momentum block carries
-        dissipation.  This is a *physics* switch, not a numerical one: with
-        ``False`` the ``(p, p)`` block is identically zero, so all the
-        dissipation has to come from the auxiliary channels (a pure-memory
-        test).  The resulting ``L`` is only semidefinite, which the OU step
-        tolerates.
+        instantaneous dissipation.  This is a *physics* switch, not a
+        numerical one: with ``False`` the ``L_pp`` block is identically zero,
+        so all the dissipation has to come from the memory kernel carried by
+        ``W`` (a pure-memory bath).  The resulting ``L`` is only semidefinite,
+        which the OU step tolerates.
     :param n_classes: Number of neighbor classes.  The default of 2 splits
         neighbors into bonded and non-bonded and requires a topology; set it
         to 1 when no topology is available.
@@ -123,8 +158,13 @@ class GLEDriftConfig:
 
     @property
     def n_blocks(self) -> int:
-        """Number of lower-triangular blocks ``(a, b)``, ``a >= b``."""
-        return self.n_channels * (self.n_channels + 1) // 2
+        """Number of diagonal blocks of ``L``, one per channel."""
+        return self.n_channels
+
+    @property
+    def n_coupling(self) -> int:
+        """Number of coupling blocks ``W_c`` of ``Omega``, one per auxiliary."""
+        return self.n_aux
 
     @property
     def n_basis(self) -> int:
@@ -225,41 +265,100 @@ def build_tensor_basis(
     return torch.cat([identity_element, accumulated], dim=1)
 
 
+def contract_basis(coefficients: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """Contract scalar amplitudes with the tensor basis.
+
+    :param coefficients: ``[n_slots, n_terms, n_basis]`` scalars.
+    :param basis: ``[n_slots, n_basis, 3, 3]`` tensor basis.
+    :return: ``[n_slots, n_terms, 3, 3]`` Cartesian blocks.
+    """
+    return torch.einsum("spm,smij->spij", coefficients, basis)
+
+
 def assemble_blocks(
     coefficients: torch.Tensor, basis: torch.Tensor, config: GLEDriftConfig
 ) -> torch.Tensor:
-    """Contract the scalar coefficients with the tensor basis.
+    """Contract the diagonal-block amplitudes into the block-diagonal ``L``.
 
     :param coefficients: ``[n_slots, n_blocks, n_basis]`` scalars, already
-        constrained (see :class:`GLEDriftHead`).
+        constrained (see :func:`constrain_coefficients`).
     :param basis: ``[n_slots, n_basis, 3, 3]`` tensor basis.
     :param config: Head configuration.
-    :return: ``[n_slots, n_channels, n_channels, 3, 3]`` block-lower-
-        triangular factor; blocks above the diagonal are exactly zero.
+    :return: ``[n_slots, n_channels, n_channels, 3, 3]`` factor; every
+        off-diagonal block is exactly zero.
     """
-    blocks = torch.einsum("spm,smij->spij", coefficients, basis)
+    blocks = contract_basis(coefficients, basis)
 
     n_slots = blocks.shape[0]
     n_channels = config.n_channels
-    rows, columns = _tril_indices(n_channels, blocks.device)
+    channels = torch.arange(n_channels, device=blocks.device)
     factor = torch.zeros(
         (n_slots, n_channels, n_channels, 3, 3),
         dtype=blocks.dtype,
         device=blocks.device,
     )
-    factor[:, rows, columns] = blocks
+    factor[:, channels, channels] = blocks
     return factor
 
 
-def _tril_indices(n_channels: int, device: torch.device) -> torch.Tensor:
-    indices = torch.tril_indices(n_channels, n_channels, device=device)
-    return indices[0], indices[1]
+def assemble_coupling(coefficients: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """Contract the coupling amplitudes into the blocks ``W_c`` of ``Omega``.
+
+    These are used raw: ``W`` enters the memory kernel quadratically, so no
+    positivity constraint applies to it, and its sign is a gauge choice of the
+    auxiliary channel.
+
+    :param coefficients: ``[n_slots, n_aux, n_basis]`` raw amplitudes.
+    :param basis: ``[n_slots, n_basis, 3, 3]`` tensor basis.
+    :return: ``[n_slots, n_aux, 3, 3]`` coupling blocks.
+    """
+    return contract_basis(coefficients, basis)
+
+
+def constrain_coefficients(
+    outputs: torch.Tensor, diagonal_blocks: torch.Tensor, config: GLEDriftConfig
+) -> torch.Tensor:
+    """Apply the positivity constraint of the diagonal blocks of ``L``.
+
+    Only the coefficient of the identity in a diagonal block is constrained;
+    every other amplitude is used raw.  This is the single definition of the
+    ``softplus`` plus ``eps_floor`` construction: heads must call it rather
+    than repeat it.
+
+    :param outputs: ``[n_slots, n_terms, n_basis]`` raw amplitudes, holding
+        the diagonal blocks of ``L`` at the positions ``diagonal_blocks``.
+    :param diagonal_blocks: Flat positions of the diagonal blocks, as returned
+        by :func:`_diagonal_block_positions`.
+    :param config: Head configuration.
+    :return: ``[n_slots, n_terms, n_basis]`` constrained amplitudes.
+    """
+    constrained = (
+        torch.nn.functional.softplus(outputs[:, diagonal_blocks, 0]) + config.eps_floor
+    )
+    amplitudes = outputs.clone()
+    amplitudes[:, diagonal_blocks, 0] = constrained
+    return amplitudes
+
+
+def split_amplitudes(
+    amplitudes: torch.Tensor, config: GLEDriftConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split a flat amplitude tensor into the ``L`` and the ``W`` parts.
+
+    The layout, shared by every head, is ``n_blocks`` diagonal-``L`` slots
+    followed by ``n_aux`` coupling slots.
+
+    :param amplitudes: ``[n_slots, n_blocks + n_aux, n_basis]`` amplitudes.
+    :param config: Head configuration.
+    :return: The ``[n_slots, n_blocks, n_basis]`` and
+        ``[n_slots, n_aux, n_basis]`` parts.
+    """
+    return amplitudes[:, : config.n_blocks], amplitudes[:, config.n_blocks :]
 
 
 def _diagonal_block_positions(n_channels: int) -> List[int]:
-    """Position of each diagonal block ``(a, a)`` in the flat block list."""
-    rows, columns = torch.tril_indices(n_channels, n_channels)
-    return [index for index in range(rows.shape[0]) if rows[index] == columns[index]]
+    """Position of each diagonal block of ``L`` in the flat amplitude list."""
+    return list(range(n_channels))
 
 
 def _softplus_inverse(value: float) -> float:
@@ -267,23 +366,29 @@ def _softplus_inverse(value: float) -> float:
 
 
 class GLEDriftHead(torch.nn.Module):
-    """Scalar readout of the GLE drift factor on top of NEP descriptors.
+    """Scalar readout of the GLE drift on top of NEP descriptors.
 
-    The network is the usual per-element NEP network — one hidden layer with
-    ``tanh`` — widened to ``n_blocks * n_basis`` outputs.  Its outputs are the
-    amplitudes of the tensor basis and are used raw, except for the
-    coefficient of the identity in a diagonal block, which is passed through
-    ``softplus`` and floored so the diagonal blocks stay positive definite.
+    The network is the usual per-element NEP network -- one hidden layer with
+    ``tanh`` -- widened to ``(n_blocks + n_aux) * n_basis`` outputs: the
+    diagonal blocks of ``L`` first, the coupling blocks ``W_c`` after.  The
+    outputs are the amplitudes of the tensor basis and are used raw, except
+    for the coefficient of the identity in a diagonal block of ``L``, which is
+    passed through ``softplus`` and floored so those blocks stay positive
+    definite.  ``W`` is unconstrained.
 
-    The auxiliary rates must start log-spaced: the bias of those constrained
-    coefficients is initialised so that ``(lambda_id^(aa))^2`` is
-    ``gamma_a``, log-spaced over ``[gamma_min, gamma_max]``, and every other
-    output starts at zero.  A random initialisation would collapse all the
-    timescales into one decade and the model would train to nothing.
+    The auxiliary rates must start log-spaced: the bias of the constrained
+    coefficient of channel ``c`` is initialised so that ``(L_ss^(c))^2`` is
+    ``gamma_c``, log-spaced over ``[gamma_min, gamma_max]``.  A random
+    initialisation would collapse all the timescales into one decade and the
+    model would train to nothing.  The couplings start at
+    ``W_c = sqrt(gamma_c) I``, so the initial kernel
+    ``sum_c gamma_c exp(-gamma_c t) I`` integrates to ``n_aux`` whatever the
+    rate spectrum is, and no channel starts at the ``W = 0`` saddle where the
+    gradient of a kernel-matching loss vanishes.
 
-    ``markovian_block=False`` zeroes the whole momentum-momentum block: a
-    physics switch that forces all dissipation through the auxiliary
-    channels, not a numerical option.
+    ``markovian_block=False`` zeroes ``L_pp`` and nothing else: the momentum
+    keeps its coupling to the auxiliaries and is thermostatted by memory
+    alone.
 
     :param n_features: Width of the NEP descriptor.
     :param n_types: Number of atomic types (one network each).
@@ -300,7 +405,8 @@ class GLEDriftHead(torch.nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.n_outputs = config.n_blocks * config.n_basis
+        self.n_terms = config.n_blocks + config.n_coupling
+        self.n_outputs = self.n_terms * config.n_basis
 
         self.input_weights = torch.nn.Parameter(
             0.1 * torch.randn(n_types, n_neurons, n_features, dtype=torch.float64)
@@ -331,40 +437,42 @@ class GLEDriftHead(torch.nn.Module):
         The momentum-momentum block starts at the floor instead, at a rate of
         ``eps_floor`` rather than anywhere near ``gamma_min``.  The Markovian
         block and the fastest memory channel are near-degenerate for any
-        trajectory-based loss sampled at a finite interval — a channel with
+        trajectory-based loss sampled at a finite interval -- a channel with
         ``gamma >~ 1 / dt_dump`` cannot be told apart from delta-correlated
-        friction.  Starting ``(p, p)`` at a competitive amplitude therefore
-        lets the optimizer dump kernel weight into it while the memory
-        channels undertrain, which then looks exactly like a system with
-        little memory.  At the floor, instantaneous friction has to be earned
-        against the memory representation, and ``markovian_block=False``
-        becomes a small perturbation of the default initialisation rather
-        than a different regime.
+        friction.  Starting ``L_pp`` at a competitive amplitude therefore lets
+        the optimizer dump kernel weight into it while the memory channels
+        undertrain, which then looks exactly like a system with little memory.
+        At the floor, instantaneous friction has to be earned against the
+        memory representation, and ``markovian_block=False`` becomes a small
+        perturbation of the default initialisation rather than a different
+        regime.
         """
-        biases = torch.zeros(
-            n_types, config.n_blocks, config.n_basis, dtype=torch.float64
-        )
+        n_terms = config.n_blocks + config.n_coupling
+        biases = torch.zeros(n_types, n_terms, config.n_basis, dtype=torch.float64)
         rates = torch.logspace(
             math.log10(config.gamma_min),
             math.log10(config.gamma_max),
             config.n_aux,
             dtype=torch.float64,
         )
-        rates = torch.cat(
+        diagonal_rates = torch.cat(
             [torch.tensor([config.eps_floor], dtype=torch.float64), rates]
         )
 
         for position, block in enumerate(_diagonal_block_positions(config.n_channels)):
-            # A^(aa) = L^(aa) (L^(aa))^T ~ gamma_a * I, so the identity
+            # A^(aa) = L^(aa) (L^(aa))^T ~ gamma_a I, so the identity
             # coefficient has to come out of the softplus at sqrt(gamma_a)
-            target = math.sqrt(float(rates[position])) - config.eps_floor
+            target = math.sqrt(float(diagonal_rates[position])) - config.eps_floor
             biases[:, block, 0] = _softplus_inverse(max(target, 1.0e-12))
-        return biases.reshape(n_types, config.n_blocks * config.n_basis)
+
+        # W_c = sqrt(gamma_c) I: unconstrained, so the bias is the value
+        biases[:, config.n_blocks :, 0] = rates.sqrt().unsqueeze(0)
+        return biases.reshape(n_types, n_terms * config.n_basis)
 
     def coefficients(
         self, descriptors: torch.Tensor, type_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Constrained basis amplitudes, ``[n_atoms, n_blocks, n_basis]``."""
+        """Constrained basis amplitudes, ``[n_atoms, n_blocks + n_aux, n_basis]``."""
         dtype = descriptors.dtype
         type_ids = type_ids.to(device=descriptors.device, dtype=torch.long)
 
@@ -378,15 +486,8 @@ class GLEDriftHead(torch.nn.Module):
         outputs = torch.einsum("nho,nh->no", output_weights, hidden) + output_biases
 
         config = self.config
-        outputs = outputs.reshape(-1, config.n_blocks, config.n_basis)
-        # only the identity coefficient of the diagonal blocks is constrained
-        constrained = (
-            torch.nn.functional.softplus(outputs[:, self.diagonal_blocks, 0])
-            + config.eps_floor
-        )
-        amplitudes = outputs.clone()
-        amplitudes[:, self.diagonal_blocks, 0] = constrained
-        return amplitudes
+        outputs = outputs.reshape(-1, self.n_terms, config.n_basis)
+        return constrain_coefficients(outputs, self.diagonal_blocks, config)
 
     def forward(
         self,
@@ -394,35 +495,64 @@ class GLEDriftHead(torch.nn.Module):
         type_ids: torch.Tensor,
         basis: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Predict the drift factor and the drift matrix.
+        """Predict the drift factor, the couplings and the drift matrix.
 
         :param descriptors: ``[n_atoms, n_features]`` NEP descriptors.
         :param type_ids: ``[n_atoms]`` atomic type indices.
         :param basis: ``[n_atoms, n_basis, 3, 3]`` tensor basis.
-        :return: ``L_blocks`` of shape ``[n_atoms, n + 1, n + 1, 3, 3]`` and
-            the drift matrix ``A`` of shape ``[n_atoms, 3(n+1), 3(n+1)]``.
+        :return: ``L_blocks`` of shape ``[n_atoms, n + 1, n + 1, 3, 3]``,
+            ``W_blocks`` of shape ``[n_atoms, n, 3, 3]`` and the drift matrix
+            ``A = L L^T + Omega`` of shape ``[n_atoms, 3(n+1), 3(n+1)]``.
         """
         amplitudes = self.coefficients(descriptors, type_ids)
-        factor = assemble_blocks(amplitudes, basis, self.config)
+        l_amplitudes, w_amplitudes = split_amplitudes(amplitudes, self.config)
+        factor = assemble_blocks(l_amplitudes, basis, self.config)
+        couplings = assemble_coupling(w_amplitudes, basis)
 
         if not self.config.markovian_block:
-            # zero the (p, p) block: all dissipation goes through the
-            # auxiliary channels
+            # zero L_pp: the momentum keeps its coupling `W` and is
+            # thermostatted purely through the memory kernel
             mask = torch.ones_like(factor)
             mask[:, 0, 0] = 0.0
             factor = factor * mask
 
-        return {"L_blocks": factor, "A": drift_matrix(factor)}
+        return {
+            "L_blocks": factor,
+            "W_blocks": couplings,
+            "A": drift_matrix(factor, couplings),
+        }
 
 
-def drift_matrix(factor: torch.Tensor) -> torch.Tensor:
-    """``A = L L^T`` from the block form of ``L``.
+def omega_matrix(couplings: torch.Tensor) -> torch.Tensor:
+    """The antisymmetric drift ``Omega`` from its coupling blocks.
 
-    :param factor: ``[n_slots, n_channels, n_channels, 3, 3]`` blocks.
+    ``Omega_ps^(c) = W_c``, ``Omega_sp^(c) = -W_c^T``, ``Omega_ss = 0``, in
+    the channel-major layout ``3 a + i``.
+
+    :param couplings: ``[n_slots, n_aux, 3, 3]`` blocks ``W_c``.
+    :return: ``[n_slots, 3(n+1), 3(n+1)]`` antisymmetric matrices.
+    """
+    n_slots, n_aux = couplings.shape[0], couplings.shape[1]
+    size = 3 * (n_aux + 1)
+    omega = torch.zeros(
+        (n_slots, size, size), dtype=couplings.dtype, device=couplings.device
+    )
+    # [n_slots, 3, 3 n_aux]: the whole (p, s) row of Omega at once
+    row = couplings.permute(0, 2, 1, 3).reshape(n_slots, 3, 3 * n_aux)
+    omega[:, :3, 3:] = row
+    omega[:, 3:, :3] = -row.transpose(-1, -2)
+    return omega
+
+
+def drift_matrix(factor: torch.Tensor, couplings: torch.Tensor) -> torch.Tensor:
+    """``A = L L^T + Omega`` from the block forms of ``L`` and ``W``.
+
+    :param factor: ``[n_slots, n_channels, n_channels, 3, 3]`` blocks of ``L``.
+    :param couplings: ``[n_slots, n_aux, 3, 3]`` blocks ``W_c``.
     :return: ``[n_slots, 3 * n_channels, 3 * n_channels]`` drift matrices.
     """
     n_slots, n_channels = factor.shape[0], factor.shape[1]
     flat = factor.permute(0, 1, 3, 2, 4).reshape(
         n_slots, 3 * n_channels, 3 * n_channels
     )
-    return flat @ flat.transpose(-1, -2)
+    return flat @ flat.transpose(-1, -2) + omega_matrix(couplings)
