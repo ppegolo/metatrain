@@ -102,6 +102,46 @@ on an already-converged potential, the default ``0.001`` is large enough to
 visibly degrade it before anything is logged.  Lower ``learning_rate`` (and, if
 needed, ``scheduler_patience``) when fine-tuning.
 
+.. _nep-tensorial:
+
+Tensorial models: dipoles and polarizabilities
+----------------------------------------------
+
+Besides energies, NEP can predict dipoles (GPUMD's ``nep4_dipole``) and
+polarizabilities (``nep4_polarizability``).  Select one with ``model_type``
+and give the target the matching Cartesian layout:
+
+.. code-block:: yaml
+
+    model:
+      model_type: 1
+    training:
+      # ...
+    # in the dataset section:
+    targets:
+      mtt::dipole:
+        quantity: ""
+        type:
+          cartesian:
+            rank: 1
+        sample_kind: system   # or `atom`, for per-atom dipoles
+
+``model_type: 2`` uses ``rank: 2`` instead.  Both are trained on values
+only: unlike energies, they have no force or stress gradients.  The models
+share the descriptors and the network shape of a regular NEP, so all the
+architecture hyperparameters keep their meaning; a polarizability model
+carries a second network for the isotropic part, and therefore twice the
+network parameters.
+
+Per-atom targets (``sample_kind: atom``) correspond to GPUMD's ``atomic_v``
+training data.  The per-structure prediction is always the sum of the
+per-atom ones, so a model trained on one can be evaluated as the other.
+
+The composition model does not apply to Cartesian targets and is skipped
+automatically.  Exported ``nep.txt`` files fold the target scale into the
+output weights; for polarizabilities this requires a scale that does not
+depend on the atomic type (use ``scale_targets: false`` otherwise).
+
 Exporting to GPUMD
 ------------------
 
@@ -156,6 +196,13 @@ class ModelHypers(TypedDict):
     """NEP version. ``3``: one shared neural network for all elements;
     ``4``: one neural network per element (recommended); ``5``: as ``4``
     with an extra per-element bias."""
+    model_type: int = 0
+    """What the model predicts. ``0``: energy, a scalar target (regular NEP);
+    ``1``: dipole, a Cartesian rank-1 target; ``2``: polarizability, a
+    Cartesian rank-2 target.  The tensorial models (``1`` and ``2``) require
+    ``version: 4`` and support neither NEP-Charge nor ZBL; their targets can
+    be per structure or per atom.  See :ref:`the section on tensorial models
+    <nep-tensorial>`."""
     cutoff_radial: float = 8.0
     """Radial descriptor cutoff radius in length units."""
     cutoff_angular: float = 4.0

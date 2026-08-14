@@ -15,7 +15,7 @@ from metatomic.torch import (
     NeighborListOptions,
     System,
 )
-from torchnep import NepParameters, NepPotential, load_nep, write_nep
+from torchnep import NepParameters, NepPotential, TnepPotential, load_nep, write_nep
 from torchnep.nep_descriptor import descriptor_type_ids_batched
 from torchnep.zbl import ZBLConfig
 
@@ -52,7 +52,7 @@ def _build_nep_parameters(
     placeholder = torch.zeros(1, dtype=torch.float64)
     params = NepParameters(
         version=int(hypers["version"]),
-        model_type=0,
+        model_type=int(hypers["model_type"]),
         symbols=symbols,
         atomic_numbers=tuple(atomic_types),
         rc_radial=tuple(float(hypers["cutoff_radial"]) for _ in range(num_types)),
@@ -184,10 +184,10 @@ def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
     """
     params = load_nep(path)
 
-    if params.model_type != 0:
+    if params.model_type not in (0, 1, 2):
         raise NotImplementedError(
-            "Only regular NEP potentials can be fine-tuned "
-            "(dipole/polarizability/temperature models are not supported)."
+            "Only regular, dipole and polarizability NEP potentials can be "
+            "fine-tuned (temperature models are not supported)."
         )
     if params.zbl is not None and params.zbl.enabled and params.zbl.flexible:
         raise NotImplementedError(
@@ -221,7 +221,7 @@ def _load_nep_parameters(path: str, atomic_types: List[int]) -> NepParameters:
 
 
 class NEP(ModelInterface[ModelHypers]):
-    __checkpoint_version__ = 3
+    __checkpoint_version__ = 4
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -271,6 +271,7 @@ class NEP(ModelInterface[ModelHypers]):
             self.hypers["l_max_5body"] = params.l_max_5body
             self.hypers["neurons"] = params.num_neurons1
             self.hypers["charge_mode"] = params.charge_mode
+            self.hypers["model_type"] = params.model_type
             self.hypers["zbl_outer_cutoff"] = (
                 params.zbl.rc_outer
                 if params.zbl is not None and params.zbl.enabled
@@ -305,6 +306,27 @@ class NEP(ModelInterface[ModelHypers]):
                 f"got version {params.version}."
             )
 
+        # 0: energy (a scalar), 1: dipole (a Cartesian vector),
+        # 2: polarizability (a Cartesian rank-2 tensor).  The tensorial models
+        # read out the same descriptors and network through a different
+        # contraction; see `torchnep.tnep`.
+        self.model_type = int(params.model_type)
+        if self.model_type not in (0, 1, 2):
+            raise ValueError(
+                "The NEP `model_type` must be 0 (energy), 1 (dipole) or 2 "
+                f"(polarizability), got {self.model_type}."
+            )
+        if self.model_type != 0:
+            if params.version != 4:
+                raise ValueError(
+                    "Tensorial NEP models (`model_type` 1 and 2) require "
+                    f"`version: 4`, got version {params.version}."
+                )
+            if self.charge_mode != 0:
+                raise ValueError("Tensorial NEP models cannot use NEP-Charge.")
+            if self.hypers.get("zbl_outer_cutoff") is not None:
+                raise ValueError("Tensorial NEP models cannot use ZBL.")
+
         self.cutoff_radial = float(params.rc_radial[0])
         self.cutoff_angular = float(params.rc_angular[0])
         if self.cutoff_angular > self.cutoff_radial:
@@ -326,7 +348,10 @@ class NEP(ModelInterface[ModelHypers]):
         )
         self.targets_keys = list(dataset_info.targets.keys())[0]
 
-        self.potential = NepPotential(params, train_q_scaler=False)
+        if self.model_type == 0:
+            self.potential = NepPotential(params, train_q_scaler=False)
+        else:
+            self.potential = TnepPotential(params, train_q_scaler=False)
 
         # Lookup table from atomic numbers to NEP type indices (0..num_types-1)
         lookup = torch.full((max(self.atomic_types) + 1,), -1, dtype=torch.long)
@@ -354,9 +379,42 @@ class NEP(ModelInterface[ModelHypers]):
             additive_models.append(GPUMDZBL(float(zbl_outer), dataset_info))
         self.additive_models = torch.nn.ModuleList(additive_models)
 
+    @torch.jit.unused
+    def _check_target_layout(self, target_name: str, target: TargetInfo) -> None:
+        """Check that the target matches what this ``model_type`` predicts.
+
+        ``model_type`` 0 predicts a scalar, 1 a Cartesian vector (dipole) and
+        2 a Cartesian rank-2 tensor (polarizability), per atom or per
+        structure in every case.
+        """
+        if self.model_type == 0:
+            if not target.is_scalar:
+                raise ValueError(
+                    "A NEP model with `model_type: 0` can only predict scalars, "
+                    f"but the target '{target_name}' is not a scalar. Use "
+                    "`model_type: 1` for dipoles or `model_type: 2` for "
+                    "polarizabilities."
+                )
+            return
+
+        name = "dipole" if self.model_type == 1 else "polarizability"
+        rank = 1 if self.model_type == 1 else 2
+        n_components = len(target.layout.block().components)
+        if not target.is_cartesian or n_components != rank:
+            raise ValueError(
+                f"A NEP model with `model_type: {self.model_type}` predicts a "
+                f"{name}, so its target must be a Cartesian tensor of rank "
+                f"{rank}, but the target '{target_name}' is not."
+            )
+        if len(target.layout.block().properties) != 1:
+            raise ValueError(
+                f"A NEP {name} model can only predict a single property, but "
+                f"the target '{target_name}' has "
+                f"{len(target.layout.block().properties)}."
+            )
+
     def _add_output(self, target_name: str, target: TargetInfo) -> None:
-        if not target.is_scalar:
-            raise ValueError("The NEP architecture can only predict scalars.")
+        self._check_target_layout(target_name, target)
         self.key_labels[target_name] = target.layout.keys
         self.component_labels[target_name] = [
             block.components for block in target.layout.blocks()
@@ -541,7 +599,12 @@ class NEP(ModelInterface[ModelHypers]):
                     "found a system with a zero cell."
                 )
 
-        atom_energies = self.potential.atom_energies_batched(
+        # `[n_atoms]` for an energy model, `[n_atoms, 3]` for a dipole and
+        # `[n_atoms, 3, 3]` for a polarizability; `unsqueeze` appends the
+        # property dimension of the block in every case.  Both potentials
+        # expose this same method, because TorchScript type-checks every
+        # branch of an `if` and so cannot pick a method by model type.
+        atom_values = self.potential.atom_values_batched(
             positions,
             cells,
             type_ids,
@@ -554,7 +617,7 @@ class NEP(ModelInterface[ModelHypers]):
             filter_edges=True,
             radial_shifts=radial_shifts,
             angular_shifts=angular_shifts,
-        )
+        ).unsqueeze(-1)
 
         atomic_properties: Dict[str, TensorMap] = {}
         blocks: List[TensorBlock] = []
@@ -564,7 +627,7 @@ class NEP(ModelInterface[ModelHypers]):
 
         blocks.append(
             TensorBlock(
-                values=atom_energies.unsqueeze(-1),
+                values=atom_values,
                 samples=sample_labels,
                 components=self.component_labels[self.targets_keys][0],
                 properties=self.property_labels[self.targets_keys][0].to(device),
@@ -704,9 +767,13 @@ class NEP(ModelInterface[ModelHypers]):
         values = block.values[:, 0].to(torch.float64)
         if types == [-1]:
             return values.expand(num_types).clone()
-        type_to_scale = {int(t): float(v) for t, v in zip(types, values, strict=True)}
+        # Despite its name, the scaler's `atomic_type` sample is the position
+        # of the type in its own sorted type list, not an atomic number (see
+        # `metatrain.scaler._base_scaler.BaseScaler.add_output`).
+        scaler_types = sorted(self.atomic_types)
+        index_to_scale = {int(t): float(v) for t, v in zip(types, values, strict=True)}
         return torch.tensor(
-            [type_to_scale.get(z, 1.0) for z in self.atomic_types],
+            [index_to_scale.get(scaler_types.index(z), 1.0) for z in self.atomic_types],
             dtype=torch.float64,
         )
 
@@ -726,6 +793,50 @@ class NEP(ModelInterface[ModelHypers]):
         )
 
     @torch.jit.unused
+    def _export_tensorial_nep(
+        self, params: NepParameters, path: Union[str, Path]
+    ) -> None:
+        """Fold the target scale into a dipole or polarizability model.
+
+        There is no composition baseline to fold: the composition model does
+        not support Cartesian targets, so it contributes nothing.  The dipole
+        and the anisotropic part of the polarizability are linear in the
+        output weights of the tensor network and independent of its bias
+        (only the descriptor derivative of that network is used), so scaling
+        ``w1`` is exact.  The isotropic part of a polarizability is the plain
+        output of the second network, whose global bias also has to be
+        scaled, which is only possible when the scale does not depend on the
+        atomic type.
+        """
+        neurons = params.num_neurons1
+        dim = params.dim
+        num_types = params.num_types
+        block = neurons * dim + 2 * neurons
+        head = self.potential.num_head_parameters
+
+        s = self._energy_scales_per_type()
+        ann = params.ann.clone().to(torch.float64)
+        for t in range(num_types):
+            w1_start = t * block + neurons * dim + neurons
+            ann[w1_start : w1_start + neurons] *= s[t]
+
+        if self.model_type == 2:
+            if not torch.allclose(s, s[0].expand_as(s)):
+                raise ValueError(
+                    "The isotropic part of a NEP polarizability model has a "
+                    "single global bias, so a target scale that differs per "
+                    "atomic type cannot be folded exactly. Train with "
+                    "`scale_targets: false`."
+                )
+            for t in range(num_types):
+                w1_start = head + t * block + neurons * dim + neurons
+                ann[w1_start : w1_start + neurons] *= s[t]
+            b1_index = head + block * num_types
+            ann[b1_index] *= s[0]
+
+        write_nep(dataclasses.replace(params, ann=ann, zbl=None), path)
+
+    @torch.jit.unused
     def export_nep(self, path: Union[str, Path], version: Optional[int] = None) -> None:
         """Write a GPUMD-compatible ``nep.txt`` file for this model.
 
@@ -741,6 +852,13 @@ class NEP(ModelInterface[ModelHypers]):
             represent.
         """
         params = self.potential.to_nep_parameters()
+        if self.model_type != 0:
+            if version is not None and version != params.version:
+                raise ValueError(
+                    f"Tensorial NEP models can only be exported as NEP{params.version}."
+                )
+            self._export_tensorial_nep(params, path)
+            return
         if version is not None and version != params.version:
             if version != 5:
                 raise ValueError(

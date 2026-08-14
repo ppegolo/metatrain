@@ -25,6 +25,13 @@ def model_update_v2_v3(checkpoint: dict) -> None:
     checkpoint["model_data"].setdefault("loaded_nep", False)
 
 
+def model_update_v3_v4(checkpoint: dict) -> None:
+    """Add the ``model_type`` model hyper introduced with the tensorial
+    (dipole and polarizability) models.  Older checkpoints are all regular
+    energy models."""
+    checkpoint["model_data"]["model_hypers"].setdefault("model_type", 0)
+
+
 def trainer_update_v1_v2(checkpoint: dict) -> None:
     """Add the ``finetune`` training hypers introduced with checkpoint-from-
     checkpoint fine-tuning."""
