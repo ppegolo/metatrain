@@ -42,7 +42,7 @@ convention end to end.
 """
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +70,13 @@ VALIDATION_TOLERANCE = 1e-8
 #: prefactor and are dropped. The Coulomb kernel has no such decay and is never
 #: screened.
 OVERLAP_SCREEN = 46.0
+
+#: Shell pairs whose smallest reduced exponent gives ``theta * R^2`` beyond
+#: this are treated as point multipoles in the matrix-free Coulomb path: their
+#: charge distributions no longer interpenetrate (the neglected penetration
+#: term is ``~exp(-theta R^2) < 2e-15`` of the pair's interaction), so the
+#: contracted far-field form is exact to working precision.
+COULOMB_FAR_SCREEN = 34.0
 
 
 def _monomials(degree: int) -> torch.Tensor:
@@ -127,25 +134,46 @@ class _PrimitiveGroup:
         spherical components, shape ``(n_units, 2l + 1, n_monomials)``.
     :param offsets: Row offset of each unit's first spherical component within
         the element's block of the AO vector, shape ``(n_units,)``.
+    :param screens: Smallest exponent of each unit's parent shell, shape
+        ``(n_units,)``. The near/far split must classify a whole shell pair at
+        once — its most diffuse primitives decide when penetration is over —
+        so every unit screens with its shell's floor, not its own exponent.
     """
 
     def __init__(
-        self, alphas: torch.Tensor, weights: torch.Tensor, offsets: torch.Tensor
+        self,
+        alphas: torch.Tensor,
+        weights: torch.Tensor,
+        offsets: torch.Tensor,
+        screens: torch.Tensor,
     ) -> None:
         self.alphas = alphas
         self.weights = weights
         self.offsets = offsets
+        self.screens = screens
 
 
 class _ElementBasis:
     """The fitted auxiliary basis of one element.
 
     :param groups: Primitive groups keyed by angular momentum.
+    :param far_groups: One contracted point-multipole unit per (shell,
+        contraction), keyed by angular momentum, for the far field of the
+        matrix-free Coulomb path. A solid-harmonic Gaussian carries exactly
+        one nonvanishing multipole moment, so beyond the penetration cutoff a
+        whole contraction collapses to a single unit-exponent Gaussian whose
+        weights are moment-rescaled (``alpha^-(l + 3/2)`` per primitive).
     :param naux: Number of auxiliary functions the element carries.
     """
 
-    def __init__(self, groups: Dict[int, _PrimitiveGroup], naux: int) -> None:
+    def __init__(
+        self,
+        groups: Dict[int, _PrimitiveGroup],
+        far_groups: Dict[int, _PrimitiveGroup],
+        naux: int,
+    ) -> None:
         self.groups = groups
+        self.far_groups = far_groups
         self.naux = naux
 
 
@@ -179,7 +207,9 @@ def _fit_element(aux_basis: str, atomic_number: int) -> _ElementBasis:
     ao_loc = mol.ao_loc_nr()
     directions = _fibonacci_directions(50).numpy()
 
-    per_l: Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    _Entries = Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]
+    per_l: _Entries = {}
+    per_l_far: _Entries = {}
     for shell in range(mol.nbas):
         angular = int(mol.bas_angular(shell))
         n_sph = 2 * angular + 1
@@ -217,27 +247,58 @@ def _fit_element(aux_basis: str, atomic_number: int) -> _ElementBasis:
             # (2l + 1, n_monomials, n_primitives)
             fitted = solution.reshape(len(powers), len(exponents), n_sph)
             fitted = np.ascontiguousarray(np.moveaxis(fitted, 2, 0))
+            screen = float(exponents.min())
             per_l.setdefault(angular, []).append(
                 (
                     exponents,
                     fitted,
                     np.full(len(exponents), start, dtype=np.int64),
+                    np.full(len(exponents), screen),
+                )
+            )
+            # The far-field twin: one unit-exponent Gaussian whose weights
+            # carry the contraction's multipole moment. A primitive's moment
+            # scales as alpha^-(l + 3/2), so matching moments at alpha = 1 is
+            # a per-primitive rescale before contracting.
+            far = (fitted * exponents[None, None, :] ** -(angular + 1.5)).sum(2)
+            per_l_far.setdefault(angular, []).append(
+                (
+                    np.ones(1),
+                    np.ascontiguousarray(far[:, :, None]),
+                    np.array([start], dtype=np.int64),
+                    np.array([screen]),
                 )
             )
 
+    return _ElementBasis(
+        _stack_primitive_groups(per_l),
+        _stack_primitive_groups(per_l_far),
+        int(mol.nao),
+    )
+
+
+def _stack_primitive_groups(
+    per_l: Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]],
+) -> Dict[int, _PrimitiveGroup]:
+    """Stack per-shell unit data into one group per angular momentum.
+
+    :param per_l: Per angular momentum, one ``(exponents, weights, offsets,
+        screens)`` entry per (shell, contraction).
+    :return: The stacked groups.
+    """
     groups: Dict[int, _PrimitiveGroup] = {}
     for angular, entries in per_l.items():
-        alphas = np.concatenate([exponents for exponents, _, _ in entries])
-        weights = np.concatenate(
-            [np.moveaxis(fitted, 2, 0) for _, fitted, _ in entries]
-        )
-        offsets = np.concatenate([offset for _, _, offset in entries])
         groups[angular] = _PrimitiveGroup(
-            torch.from_numpy(alphas),
-            torch.from_numpy(np.ascontiguousarray(weights)),
-            torch.from_numpy(offsets),
+            torch.from_numpy(np.concatenate([e[0] for e in entries])),
+            torch.from_numpy(
+                np.ascontiguousarray(
+                    np.concatenate([np.moveaxis(e[1], 2, 0) for e in entries])
+                )
+            ),
+            torch.from_numpy(np.concatenate([e[2] for e in entries])),
+            torch.from_numpy(np.concatenate([e[3] for e in entries])),
         )
-    return _ElementBasis(groups, int(mol.nao))
+    return groups
 
 
 def _boys(order: int, argument: torch.Tensor) -> torch.Tensor:
@@ -277,6 +338,30 @@ def _boys(order: int, argument: torch.Tensor) -> torch.Tensor:
         columns.append((2.0 * argument * columns[-1] + decay) / (2.0 * n - 1.0))
     columns.reverse()
     return torch.stack(columns, dim=-1)
+
+
+def _boys_far(order: int, argument: torch.Tensor) -> torch.Tensor:
+    """Point-multipole Boys seeds: the ``T -> inf`` closed form of ``F_n``.
+
+    ``F_n(T) -> (2n - 1)!! sqrt(pi) / 2^(n+1) * T^-(n + 1/2)``. Fed through the
+    Hermite recursion this yields exactly the interaction of two point
+    multipoles at the pair separation — the neglected penetration term is what
+    :py:data:`COULOMB_FAR_SCREEN` bounds — with no special function at all.
+
+    :param order: Highest Boys order needed.
+    :param argument: Arguments ``T``, shape ``(n,)``.
+    :return: Tensor of shape ``(n, order + 1)``.
+    """
+    double_factorial = 1.0
+    factors = [math.sqrt(math.pi) / 2.0]
+    for n in range(1, order + 1):
+        double_factorial *= 2 * n - 1
+        factors.append(double_factorial * math.sqrt(math.pi) / 2.0 ** (n + 1))
+    scale = torch.tensor(factors, dtype=argument.dtype, device=argument.device)
+    exponents = -(
+        torch.arange(order + 1, dtype=argument.dtype, device=argument.device) + 0.5
+    )
+    return scale * argument[:, None] ** exponents
 
 
 def _e0_axis(
@@ -436,37 +521,41 @@ def _exclusive_cumsum(values: List[int]) -> List[int]:
     return sums
 
 
-def _pair_lists(
-    counts_1: List[int], counts_2: List[int], device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Within-system all-pairs indices for units concatenated across systems.
+def _pair_chunks(
+    counts_1: List[int], counts_2: List[int], device: torch.device, chunk: int
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Within-system all-pairs indices, yielded one chunk at a time.
 
-    Counts stay Python integers so the index construction never reads a device
-    tensor back — a hidden synchronisation per pair group otherwise.
+    Pairs are enumerated arithmetically from their global rank, so no index
+    tensor for the full pair set ever exists — on a few thousand atoms that
+    tensor alone would be gigabytes. Counts stay Python integers so the
+    construction never reads a device tensor back — a hidden synchronisation
+    per pair group otherwise.
 
     :param counts_1: Units per system on the first side.
     :param counts_2: The same for the second side.
     :param device: Device to build the index tensors on.
-    :return: ``(system, first, second)`` index tensors, one entry per pair.
+    :param chunk: Maximum pairs per yielded chunk.
+    :yield: ``(system, first, second)`` index tensors, one chunk of pairs at a
+        time.
+    :ytype: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     """
     pairs_per_system = [c1 * c2 for c1, c2 in zip(counts_1, counts_2, strict=True)]
     total = sum(pairs_per_system)
-    system = torch.repeat_interleave(
-        torch.arange(len(counts_1), device=device),
-        torch.tensor(pairs_per_system, device=device),
-    )
-    rank = torch.arange(total, device=device)
-    rank = (
-        rank - torch.tensor(_exclusive_cumsum(pairs_per_system), device=device)[system]
-    )
+    boundaries = torch.tensor(_exclusive_cumsum(pairs_per_system), device=device)
     starts_1 = torch.tensor(_exclusive_cumsum(counts_1), device=device)
     starts_2 = torch.tensor(_exclusive_cumsum(counts_2), device=device)
-    width = torch.tensor(counts_2, device=device)[system]
-    return (
-        system,
-        starts_1[system] + rank.div(width, rounding_mode="floor"),
-        starts_2[system] + rank.remainder(width),
-    )
+    widths = torch.tensor(counts_2, device=device)
+    for start in range(0, total, chunk):
+        rank = torch.arange(start, min(start + chunk, total), device=device)
+        system = torch.searchsorted(boundaries, rank, right=True) - 1
+        local = rank - boundaries[system]
+        width = widths[system]
+        yield (
+            system,
+            starts_1[system] + local.div(width, rounding_mode="floor"),
+            starts_2[system] + local.remainder(width),
+        )
 
 
 class TorchMetricBuilder:
@@ -522,8 +611,8 @@ class TorchMetricBuilder:
         self._primitive_cache: Dict[
             Tuple[torch.device, torch.dtype, int],
             Tuple[
-                Dict[int, Dict[str, torch.Tensor]],
-                Dict[Tuple[int, int], Tuple[int, np.ndarray]],
+                Dict[Tuple[str, int], Dict[str, torch.Tensor]],
+                Dict[Tuple[str, int, int], Tuple[int, np.ndarray]],
             ],
         ] = {}
 
@@ -542,16 +631,20 @@ class TorchMetricBuilder:
         host = self._host_element(atomic_number)
         key = (atomic_number, device, dtype)
         if key not in self._device_cache:
-            self._device_cache[key] = _ElementBasis(
-                {
+
+            def cast(groups: Dict[int, _PrimitiveGroup]) -> Dict[int, _PrimitiveGroup]:
+                return {
                     angular: _PrimitiveGroup(
                         group.alphas.to(device=device, dtype=dtype),
                         group.weights.to(device=device, dtype=dtype),
                         group.offsets.to(device),
+                        group.screens.to(device=device, dtype=dtype),
                     )
-                    for angular, group in host.groups.items()
-                },
-                host.naux,
+                    for angular, group in groups.items()
+                }
+
+            self._device_cache[key] = _ElementBasis(
+                cast(host.groups), cast(host.far_groups), host.naux
             )
         return self._device_cache[key]
 
@@ -589,7 +682,12 @@ class TorchMetricBuilder:
             omega = self.omega if kind == "lr-coulomb" else 0.0
             base = "overlap" if kind == "overlap" else "coulomb"
             ours = self._assemble(
-                [(types, positions)], torch.device("cpu"), torch.float64, base, omega
+                [(types, positions)],
+                torch.device("cpu"),
+                torch.float64,
+                base,
+                omega,
+                0.0,
             )[0]
             error = torch.linalg.norm(ours - reference) / torch.linalg.norm(reference)
             if float(error) > VALIDATION_TOLERANCE:
@@ -631,23 +729,128 @@ class TorchMetricBuilder:
         :return: One dense ``(naux, naux)`` matrix per system, in ``dtype``.
         """
         with torch.no_grad():
-            if self.omega > 0.0:
-                matrices = self._assemble(
-                    geometries, device, dtype, "coulomb", self.omega
-                )
-                if self.eps > 0.0:
-                    plain = self._assemble(geometries, device, dtype, "coulomb", 0.0)
-                    matrices = [
-                        lr + self.eps * full
-                        for lr, full in zip(matrices, plain, strict=True)
-                    ]
-            else:
-                matrices = self._assemble(geometries, device, dtype, self.base, 0.0)
+            matrices = self._assemble(
+                geometries, device, dtype, self.base, self.omega, self.eps
+            )
             if self.charge_weight > 0.0:
                 for matrix, (types, _) in zip(matrices, geometries, strict=True):
                     vector = self._charge_vector(types, device, dtype)
                     matrix.add_(self.charge_weight * torch.outer(vector, vector))
         return matrices
+
+    def apply_flat(
+        self,
+        geometries: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+        flat: torch.Tensor,
+        sizes: List[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Matrix-free ``M v`` for a batch, without materialising any matrix.
+
+        Streams the same pair blocks the dense assembly would build, but
+        contracts each chunk with the vector immediately, so memory stays at
+        one chunk instead of ``sum_i naux_i^2``. The Coulomb metric is split
+        into a penetration-screened near field (exact McMurchie–Davidson) and
+        a contracted point-multipole far field (see
+        :py:data:`COULOMB_FAR_SCREEN`); the overlap metric is short-ranged and
+        only needs its usual screening.
+
+        :param geometries: Per system, ``(types, positions)`` in Angstrom.
+        :param flat: Concatenated per-system vectors, shape ``(sum naux_i,)``.
+        :param sizes: Per-system ``naux``, matching ``flat``'s layout.
+        :param device: Device to work on.
+        :param dtype: Working dtype.
+        :return: ``M v``, concatenated like ``flat``.
+        """
+        with torch.no_grad():
+            vector = flat.to(device=device, dtype=dtype)
+            out = torch.zeros_like(vector)
+            starts = _exclusive_cumsum(sizes)
+            vbases_tensor = torch.tensor(starts, device=device)
+
+            def contract(
+                l1: int,
+                l2: int,
+                group_1: Dict[str, torch.Tensor],
+                group_2: Dict[str, torch.Tensor],
+                system: torch.Tensor,
+                first: torch.Tensor,
+                second: torch.Tensor,
+                block: torch.Tensor,
+            ) -> None:
+                self._contract(
+                    l1,
+                    l2,
+                    group_1,
+                    group_2,
+                    system,
+                    first,
+                    second,
+                    vbases_tensor,
+                    vector,
+                    out,
+                    block,
+                )
+
+            if self.base == "coulomb" and self.omega == 0.0:
+                self._sweep(
+                    geometries, device, dtype, "coulomb", 0.0, 0.0, "near", contract
+                )
+                self._sweep(
+                    geometries, device, dtype, "coulomb", 0.0, 0.0, "far", contract
+                )
+            elif self.base == "coulomb":
+                # The long-range kernel is not moment-determined — erf's width
+                # competes with the distribution's at every distance, so the
+                # contracted point-multipole collapse would be wrong for the
+                # diffuse shells. Every pair stays on the exact route; the
+                # matrix-free memory win is untouched.
+                self._sweep(
+                    geometries,
+                    device,
+                    dtype,
+                    "coulomb",
+                    self.omega,
+                    self.eps,
+                    "all",
+                    contract,
+                )
+            else:
+                self._sweep(
+                    geometries, device, dtype, "overlap", 0.0, 0.0, "all", contract
+                )
+
+            if self.charge_weight > 0.0:
+                for (types, _), start, size in zip(
+                    geometries, starts, sizes, strict=True
+                ):
+                    charge = self._charge_vector(types, device, dtype)
+                    segment = vector[start : start + size]
+                    out[start : start + size] += (
+                        self.charge_weight * torch.dot(charge, segment)
+                    ) * charge
+        return out
+
+    def quadratic_flat(
+        self,
+        geometries: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+        flat: torch.Tensor,
+        sizes: List[int],
+    ) -> torch.Tensor:
+        """Matrix-free per-system quadratic forms ``v_i^T M_i v_i``.
+
+        Differentiable in ``flat``: the forward pass computes ``g = M v`` once
+        (matrix-free) and the backward returns ``2 g`` — the metric is
+        symmetric and treated as data — so no pair block outlives its chunk.
+
+        :param geometries: Per system, ``(types, positions)`` in Angstrom.
+        :param flat: Concatenated per-system vectors, shape ``(sum naux_i,)``;
+            its device and dtype set where and how the sweep runs.
+        :param sizes: Per-system ``naux``, matching ``flat``'s layout.
+        :return: Tensor of shape ``(n_systems,)``.
+        """
+        return _MatrixFreeQuadratic.apply(flat, self, list(geometries), list(sizes))
 
     # ── assembly ──────────────────────────────────────────────────────────
 
@@ -656,17 +859,20 @@ class TorchMetricBuilder:
         geometries: Sequence[Tuple[torch.Tensor, torch.Tensor]],
         device: torch.device,
         dtype: torch.dtype,
+        kind: str = "near",
     ) -> Tuple[Dict[int, Dict[str, torch.Tensor]], Dict[int, List[int]], List[int]]:
-        """Concatenate all systems' primitive units, grouped by ``l``.
+        """Concatenate all systems' units of one kind, grouped by ``l``.
 
         :param geometries: Per system, ``(types, positions)`` in Angstrom.
         :param device: Device to build on.
         :param dtype: Working dtype.
+        :param kind: ``"near"`` for the primitive units, ``"far"`` for their
+            contracted point-multipole twins.
         :return: Per angular momentum a dict with keys ``centers`` (Bohr),
-            ``alphas``, ``weights``, ``rows`` (system-local AO row of the first
-            component); per angular momentum the units-per-system counts, as
-            Python integers so pair-list construction never synchronises; and
-            the per-system ``naux`` list.
+            ``alphas``, ``weights``, ``screens``, ``rows`` (system-local AO row
+            of the first component); per angular momentum the units-per-system
+            counts, as Python integers so pair-list construction never
+            synchronises; and the per-system ``naux`` list.
         """
         from pyscf.lib.parameters import BOHR
 
@@ -710,7 +916,7 @@ class TorchMetricBuilder:
             for angular in angulars:
                 total = 0
                 for z in elements:
-                    entry = slices.get((z, angular))
+                    entry = slices.get((kind, z, angular))
                     if entry is None:
                         continue
                     start, local_rows = entry
@@ -744,8 +950,9 @@ class TorchMetricBuilder:
             ).to(device)
             units[angular] = {
                 "centers": positions_bohr[indices[0]],
-                "alphas": tables[angular]["alphas"][indices[1]],
-                "weights": tables[angular]["weights"][indices[1]],
+                "alphas": tables[(kind, angular)]["alphas"][indices[1]],
+                "weights": tables[(kind, angular)]["weights"][indices[1]],
+                "screens": tables[(kind, angular)]["screens"][indices[1]],
                 "rows": indices[2],
             }
         return units, counts, sizes
@@ -753,43 +960,52 @@ class TorchMetricBuilder:
     def _primitive_tables(
         self, device: torch.device, dtype: torch.dtype
     ) -> Tuple[
-        Dict[int, Dict[str, torch.Tensor]],
-        Dict[Tuple[int, int], Tuple[int, np.ndarray]],
+        Dict[Tuple[str, int], Dict[str, torch.Tensor]],
+        Dict[Tuple[str, int, int], Tuple[int, np.ndarray]],
     ]:
-        """Per-angular-momentum primitive tables of every fitted element.
+        """Per-angular-momentum unit tables of every fitted element.
 
-        Concatenates the fitted elements' exponents and weights per ``l`` on
-        the device, once, so per-batch unit construction is a single gather.
-        Rebuilt when a new element is fitted.
+        Concatenates the fitted elements' exponents, weights and screening
+        floors per ``(kind, l)`` — ``kind`` being the near primitives or their
+        far-field point-multipole twins — on the device, once, so per-batch
+        unit construction is a single gather. Rebuilt when a new element is
+        fitted.
 
         :param device: Device the tables live on.
         :param dtype: Working dtype.
-        :return: ``(tables, slices)``: per ``l`` the stacked ``alphas`` and
-            ``weights``; per ``(element, l)`` the element's start in that stack
-            and its primitives' AO row offsets (host side).
+        :return: ``(tables, slices)``: per ``(kind, l)`` the stacked
+            ``alphas``, ``weights`` and ``screens``; per ``(kind, element,
+            l)`` the element's start in that stack and its units' AO row
+            offsets (host side).
         """
         key = (device, dtype, len(self._elements))
         cached = self._primitive_cache.get(key)
         if cached is not None:
             return cached
 
-        tables: Dict[int, Dict[str, torch.Tensor]] = {}
-        slices: Dict[Tuple[int, int], Tuple[int, np.ndarray]] = {}
-        per_l: Dict[int, Dict[str, list]] = {}
+        tables: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
+        slices: Dict[Tuple[str, int, int], Tuple[int, np.ndarray]] = {}
+        per_l: Dict[Tuple[str, int], Dict[str, list]] = {}
         for atomic_number in sorted(self._elements):
-            for angular, group in self._elements[atomic_number].groups.items():
-                entry = per_l.setdefault(angular, {"alphas": [], "weights": []})
-                start = sum(len(a) for a in entry["alphas"])
-                slices[(atomic_number, angular)] = (
-                    start,
-                    np.asarray(group.offsets),
-                )
-                entry["alphas"].append(group.alphas)
-                entry["weights"].append(group.weights)
-        for angular, entry in per_l.items():
-            tables[angular] = {
+            element = self._elements[atomic_number]
+            for kind, groups in (("near", element.groups), ("far", element.far_groups)):
+                for angular, group in groups.items():
+                    entry = per_l.setdefault(
+                        (kind, angular), {"alphas": [], "weights": [], "screens": []}
+                    )
+                    start = sum(len(a) for a in entry["alphas"])
+                    slices[(kind, atomic_number, angular)] = (
+                        start,
+                        np.asarray(group.offsets),
+                    )
+                    entry["alphas"].append(group.alphas)
+                    entry["weights"].append(group.weights)
+                    entry["screens"].append(group.screens)
+        for table_key, entry in per_l.items():
+            tables[table_key] = {
                 "alphas": torch.cat(entry["alphas"]).to(device=device, dtype=dtype),
                 "weights": torch.cat(entry["weights"]).to(device=device, dtype=dtype),
+                "screens": torch.cat(entry["screens"]).to(device=device, dtype=dtype),
             }
         self._primitive_cache[key] = (tables, slices)
         return tables, slices
@@ -801,24 +1017,26 @@ class TorchMetricBuilder:
         dtype: torch.dtype,
         base: str,
         omega: float,
+        eps: float,
     ) -> List[torch.Tensor]:
-        """One base metric for every system of the batch.
+        """One base metric for every system of the batch, as dense matrices.
 
-        All systems' primitive pairs of a given ``(l1, l2)`` are processed in
-        one batched sweep; results scatter-accumulate into a flat buffer that
-        concatenates the per-system matrices, so the number of kernel launches
-        is independent of both batch size and system size. Both metrics are
-        symmetric, so only ``l1 <= l2`` groups are computed and off-diagonal
-        blocks are scattered twice, once transposed.
+        Pair blocks scatter-accumulate into a flat buffer that concatenates
+        the per-system matrices. The dense path keeps every Coulomb pair on
+        the exact McMurchie–Davidson route (region ``"all"``): it exists for
+        systems small enough that the matrix fits, where a near/far split
+        would only add moving parts.
 
         :param geometries: Per system, ``(types, positions)`` in Angstrom.
         :param device: Device to assemble on.
         :param dtype: Working dtype.
         :param base: ``"overlap"`` or ``"coulomb"``.
         :param omega: Range-separation parameter; ``0`` is the plain kernel.
+        :param eps: Weight of the plain Coulomb term added to the long-range
+            one; ignored when ``omega == 0``.
         :return: One matrix per system, in ``dtype``.
         """
-        units, counts, sizes = self._units(geometries, device, dtype)
+        sizes = [self.naux(types) for types, _ in geometries]
         bases = _exclusive_cumsum([size * size for size in sizes])
         sizes_tensor = torch.tensor(sizes, device=device)
         bases_tensor = torch.tensor(bases, device=device)
@@ -826,12 +1044,77 @@ class TorchMetricBuilder:
             sum(size * size for size in sizes), dtype=dtype, device=device
         )
 
+        def scatter(
+            l1: int,
+            l2: int,
+            group_1: Dict[str, torch.Tensor],
+            group_2: Dict[str, torch.Tensor],
+            system: torch.Tensor,
+            first: torch.Tensor,
+            second: torch.Tensor,
+            block: torch.Tensor,
+        ) -> None:
+            self._scatter(
+                l1,
+                l2,
+                group_1,
+                group_2,
+                system,
+                first,
+                second,
+                sizes_tensor,
+                bases_tensor,
+                buffer,
+                block,
+            )
+
+        self._sweep(geometries, device, dtype, base, omega, eps, "all", scatter)
+
+        matrices = []
+        for start, size in zip(bases, sizes, strict=True):
+            matrices.append(buffer[start : start + size * size].view(size, size))
+        return matrices
+
+    def _sweep(
+        self,
+        geometries: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+        device: torch.device,
+        dtype: torch.dtype,
+        base: str,
+        omega: float,
+        eps: float,
+        region: str,
+        consumer: Callable[..., None],
+    ) -> None:
+        """Drive one pass over all pair blocks of the batch.
+
+        All systems' unit pairs of a given ``(l1, l2)`` are processed in one
+        batched, chunked sweep, so the number of kernel launches is
+        independent of both batch size and system size. Both metrics are
+        symmetric, so only ``l1 <= l2`` groups are enumerated and the
+        consumer handles the mirrored half.
+
+        :param geometries: Per system, ``(types, positions)`` in Angstrom.
+        :param device: Device to work on.
+        :param dtype: Working dtype.
+        :param base: ``"overlap"`` or ``"coulomb"``.
+        :param omega: Range-separation parameter; ``0`` is the plain kernel.
+        :param eps: Weight of the plain Coulomb term added to the long-range
+            one; ignored when ``omega == 0``.
+        :param region: ``"all"`` (every pair, exact), ``"near"``
+            (penetration-screened exact pairs) or ``"far"`` (their
+            point-multipole complement, on the contracted far units).
+        :param consumer: Called with ``(l1, l2, group_1, group_2, system,
+            first, second, block)`` for every surviving chunk.
+        """
+        kind = "far" if region == "far" else "near"
+        units, counts, _ = self._units(geometries, device, dtype, kind)
+
         budget = 1 << 24 if dtype == torch.float32 else 1 << 23
         for l1, group_1 in units.items():
             for l2, group_2 in units.items():
                 if l2 < l1:
                     continue
-                system, first, second = _pair_lists(counts[l1], counts[l2], device)
                 tables = self._group_tables(base, l1, l2, dtype, device)
                 n_hermite = (
                     len(_hermite_indices(l1)) * len(_hermite_indices(l2))
@@ -839,27 +1122,25 @@ class TorchMetricBuilder:
                     else (l1 + 1) * (l2 + 1)
                 )
                 chunk = max(4096, budget // max(1, n_hermite))
-                for start in range(0, len(system), chunk):
-                    self._pair_block(
+                for system, first, second in _pair_chunks(
+                    counts[l1], counts[l2], device, chunk
+                ):
+                    result = self._pair_values(
                         base,
                         omega,
+                        eps,
+                        region,
                         l1,
                         l2,
                         group_1,
                         group_2,
-                        system[start : start + chunk],
-                        first[start : start + chunk],
-                        second[start : start + chunk],
-                        sizes_tensor,
-                        bases_tensor,
-                        buffer,
+                        system,
+                        first,
+                        second,
                         tables,
                     )
-
-        matrices = []
-        for start, size in zip(bases, sizes, strict=True):
-            matrices.append(buffer[start : start + size * size].view(size, size))
-        return matrices
+                    if result is not None:
+                        consumer(l1, l2, group_1, group_2, *result)
 
     def _group_tables(
         self,
@@ -910,10 +1191,12 @@ class TorchMetricBuilder:
         self._tables_cache[key] = tables
         return tables
 
-    def _pair_block(
+    def _pair_values(
         self,
         base: str,
         omega: float,
+        eps: float,
+        region: str,
         l1: int,
         l2: int,
         group_1: Dict[str, torch.Tensor],
@@ -921,15 +1204,16 @@ class TorchMetricBuilder:
         system: torch.Tensor,
         first: torch.Tensor,
         second: torch.Tensor,
-        sizes: torch.Tensor,
-        bases: torch.Tensor,
-        buffer: torch.Tensor,
         tables: Dict[str, torch.Tensor],
-    ) -> None:
-        """Compute one chunk of primitive pairs and scatter it into the buffer.
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Compute one chunk of pair blocks, screened for the given region.
 
         :param base: ``"overlap"`` or ``"coulomb"``.
         :param omega: Range-separation parameter; ``0`` is the plain kernel.
+        :param eps: Weight of the plain Coulomb term added to the long-range
+            one; ignored when ``omega == 0``.
+        :param region: ``"all"``, ``"near"`` or ``"far"`` (see
+            :py:meth:`_sweep`).
         :param l1: Angular momentum of the first side.
         :param l2: The same for the second side.
         :param group_1: First side's unit tensors.
@@ -937,11 +1221,10 @@ class TorchMetricBuilder:
         :param system: System index of each pair.
         :param first: Unit index of each pair on the first side.
         :param second: The same for the second side.
-        :param sizes: Per-system matrix dimension.
-        :param bases: Per-system offset into ``buffer``.
-        :param buffer: Flat accumulation buffer of all matrices.
         :param tables: The group's constant index tensors
             (:py:meth:`_group_tables`).
+        :return: ``(system, first, second, block)`` for the surviving pairs,
+            or ``None`` when the whole chunk screens away.
         """
         centers_1 = group_1["centers"][first]
         centers_2 = group_2["centers"][second]
@@ -955,14 +1238,25 @@ class TorchMetricBuilder:
                 alphas_1 * alphas_2 / (alphas_1 + alphas_2) * distance_sq
                 < OVERLAP_SCREEN
             )
-            if not bool(keep.all()):
-                (indices,) = torch.where(keep)
-                system, first, second = system[indices], first[indices], second[indices]
-                centers_1, centers_2 = centers_1[indices], centers_2[indices]
-                alphas_1, alphas_2 = alphas_1[indices], alphas_2[indices]
-                separation, distance_sq = separation[indices], distance_sq[indices]
+        elif region in ("near", "far"):
+            screens_1 = group_1["screens"][first]
+            screens_2 = group_2["screens"][second]
+            penetration = screens_1 * screens_2 / (screens_1 + screens_2) * distance_sq
+            keep = (
+                penetration <= COULOMB_FAR_SCREEN
+                if region == "near"
+                else penetration > COULOMB_FAR_SCREEN
+            )
+        else:
+            keep = None
+        if keep is not None and not bool(keep.all()):
+            (indices,) = torch.where(keep)
+            system, first, second = system[indices], first[indices], second[indices]
+            centers_1, centers_2 = centers_1[indices], centers_2[indices]
+            alphas_1, alphas_2 = alphas_1[indices], alphas_2[indices]
+            separation, distance_sq = separation[indices], distance_sq[indices]
         if len(system) == 0:
-            return
+            return None
 
         weights_1 = group_1["weights"][first]
         weights_2 = group_2["weights"][second]
@@ -999,17 +1293,9 @@ class TorchMetricBuilder:
         else:
             theta = alphas_1 * alphas_2 / (alphas_1 + alphas_2)
             order = l1 + l2
-            argument = theta * distance_sq
-            if omega > 0.0:
-                sigma_sq = omega**2 / (omega**2 + theta)
-                exponents = torch.arange(
-                    order + 1, dtype=theta.dtype, device=system.device
-                )
-                boys = _boys(order, sigma_sq * argument) * sigma_sq[:, None] ** (
-                    exponents + 0.5
-                )
-            else:
-                boys = _boys(order, argument)
+            boys = self._coulomb_boys(
+                order, theta, distance_sq, omega, eps, region == "far"
+            )
             prefactor = (
                 2.0
                 * torch.pi**2.5
@@ -1022,20 +1308,7 @@ class TorchMetricBuilder:
                 block = (
                     weights_1[:, 0, 0] * weights_2[:, 0, 0] * prefactor * boys[:, 0]
                 )[:, None, None]
-                self._scatter(
-                    l1,
-                    l2,
-                    group_1,
-                    group_2,
-                    system,
-                    first,
-                    second,
-                    sizes,
-                    bases,
-                    buffer,
-                    block,
-                )
-                return
+                return system, first, second, block
             hermite = _hermite_coulomb(order, separation, theta, boys)
             gathered = hermite[:, tables["combined"]]
 
@@ -1052,19 +1325,95 @@ class TorchMetricBuilder:
                 * prefactor[:, None, None]
             )
 
-        self._scatter(
-            l1,
-            l2,
-            group_1,
-            group_2,
-            system,
-            first,
-            second,
-            sizes,
-            bases,
-            buffer,
-            block,
+        return system, first, second, block
+
+    @staticmethod
+    def _coulomb_boys(
+        order: int,
+        theta: torch.Tensor,
+        distance_sq: torch.Tensor,
+        omega: float,
+        eps: float,
+        far: bool,
+    ) -> torch.Tensor:
+        """Boys seeds for the configured Coulomb kernel, near or far.
+
+        The kernel is linear in the seeds, so ``eps * J + J_lr`` folds into a
+        single sweep. The far (point-multipole) form exists only for the plain
+        kernel: the long-range one is not moment-determined — the ``erf``
+        width competes with the distribution's at every distance — so its
+        sweeps never ask for it.
+
+        :param order: Highest Boys order needed.
+        :param theta: Reduced exponents, shape ``(n,)``.
+        :param distance_sq: Squared separations, shape ``(n,)``.
+        :param omega: Range-separation parameter; ``0`` is the plain kernel.
+        :param eps: Weight of the plain term added to the long-range one.
+        :param far: Whether the pairs are in the point-multipole region.
+        :return: Tensor of shape ``(n, order + 1)``.
+        """
+        argument = theta * distance_sq
+        if omega == 0.0:
+            return _boys_far(order, argument) if far else _boys(order, argument)
+        sigma_sq = omega**2 / (omega**2 + theta)
+        exponents = torch.arange(order + 1, dtype=theta.dtype, device=theta.device)
+        boys = _boys(order, sigma_sq * argument) * sigma_sq[:, None] ** (
+            exponents + 0.5
         )
+        if eps > 0.0:
+            boys = boys + eps * _boys(order, argument)
+        return boys
+
+    @staticmethod
+    def _contract(
+        l1: int,
+        l2: int,
+        group_1: Dict[str, torch.Tensor],
+        group_2: Dict[str, torch.Tensor],
+        system: torch.Tensor,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        vbases: torch.Tensor,
+        vector: torch.Tensor,
+        out: torch.Tensor,
+        block: torch.Tensor,
+    ) -> None:
+        """Accumulate ``block @ v`` contributions into the output vector.
+
+        The matrix-free twin of :py:meth:`_scatter`: instead of writing the
+        pair block into a matrix buffer, contract it with the vector segment
+        it would have multiplied. Only ``l1 <= l2`` groups are enumerated, so
+        off-diagonal blocks also apply transposed.
+
+        :param l1: Angular momentum of the first side.
+        :param l2: The same for the second side.
+        :param group_1: First side's unit tensors.
+        :param group_2: The same for the second side.
+        :param system: System index of each pair.
+        :param first: Unit index of each pair on the first side.
+        :param second: The same for the second side.
+        :param vbases: Per-system offset into the flat vector.
+        :param vector: The flat input vector ``v``.
+        :param out: The flat accumulator for ``M v``.
+        :param block: Pair blocks, shape ``(n, 2 l1 + 1, 2 l2 + 1)``.
+        """
+        rows = (vbases[system] + group_1["rows"][first])[:, None] + torch.arange(
+            2 * l1 + 1, device=system.device
+        )[None, :]
+        columns = (vbases[system] + group_2["rows"][second])[:, None] + torch.arange(
+            2 * l2 + 1, device=system.device
+        )[None, :]
+        out.scatter_add_(
+            0,
+            rows.reshape(-1),
+            torch.einsum("pmn,pn->pm", block, vector[columns]).reshape(-1),
+        )
+        if l1 != l2:
+            out.scatter_add_(
+                0,
+                columns.reshape(-1),
+                torch.einsum("pmn,pm->pn", block, vector[rows]).reshape(-1),
+            )
 
     @staticmethod
     def _scatter(
@@ -1170,6 +1519,48 @@ class TorchMetricBuilder:
                 vector.scatter_add_(0, row + group.offsets, values)
             row += elements[z].naux
         return vector
+
+
+class _MatrixFreeQuadratic(torch.autograd.Function):
+    """Per-system quadratic forms with a matrix-free backward.
+
+    The metric is symmetric data, so ``d(v^T M v)/dv = 2 M v`` — exactly the
+    product the forward already computes to get the value. Saving that one
+    flat vector makes the backward a rescale, with no pair block surviving
+    the forward chunk loop on either pass.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        flat: torch.Tensor,
+        builder: "TorchMetricBuilder",
+        geometries: List[Tuple[torch.Tensor, torch.Tensor]],
+        sizes: List[int],
+    ) -> torch.Tensor:
+        applied = builder.apply_flat(
+            geometries, flat.detach(), sizes, flat.device, flat.dtype
+        )
+        ctx.save_for_backward(applied)
+        ctx.sizes = sizes
+        return torch.stack(
+            [
+                torch.dot(segment, product)
+                for segment, product in zip(
+                    flat.detach().split(sizes), applied.split(sizes), strict=True
+                )
+            ]
+        )
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], None, None, None]:
+        (applied,) = ctx.saved_tensors
+        per_entry = grad_output.repeat_interleave(
+            torch.tensor(ctx.sizes, device=applied.device)
+        )
+        return 2.0 * applied * per_entry, None, None, None
 
 
 __all__ = ["TorchMetricBuilder"]

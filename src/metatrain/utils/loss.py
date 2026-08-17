@@ -637,6 +637,14 @@ class _DensityLoss(LossInterface):
         ``"pyscf"``. Matrices are assembled in the model dtype: in float32
         that matches the float64-computed-then-cast matrices of the PySCF path
         to the dtype's own resolution.
+    :param assembly: how the torch backend evaluates the quadratic form.
+        ``"dense"`` (default) materialises the per-system matrices —
+        appropriate while ``naux^2`` fits comfortably in device memory (a few
+        hundred atoms). ``"matrix_free"`` never forms a matrix: pair blocks
+        are streamed and contracted with the coefficient vector directly,
+        with overlap pairs distance-screened and the plain Coulomb metric
+        split into an exact near field and a point-multipole far field, so
+        memory stays linear in system size. Requires ``backend="torch"``.
     """
 
     #: The metric matrix depends on the geometry, and is built on the unaugmented
@@ -662,6 +670,7 @@ class _DensityLoss(LossInterface):
         group_charge_weight: float = 0.0,
         interface_esp_weight: float = 0.0,
         backend: str = "pyscf",
+        assembly: str = "dense",
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -702,7 +711,17 @@ class _DensityLoss(LossInterface):
             raise ValueError(
                 f"unknown metric backend {backend!r}; expected 'pyscf' or 'torch'."
             )
+        if assembly not in ("dense", "matrix_free"):
+            raise ValueError(
+                f"unknown assembly {assembly!r}; expected 'dense' or 'matrix_free'."
+            )
+        if assembly == "matrix_free" and backend != "torch":
+            raise ValueError(
+                "assembly='matrix_free' streams pair blocks on the training "
+                "device and therefore requires backend='torch'."
+            )
         self.backend = backend
+        self.assembly = assembly
         if backend == "torch":
             from metatrain.utils.torch_metric import TorchMetricBuilder
 
@@ -770,6 +789,62 @@ class _DensityLoss(LossInterface):
             )
         packed = self._require(extra_data, metric_matrix_name(self.target, self.metric))
         return unpack_metric_matrices(packed)
+
+    def _flat_per_system(
+        self,
+        tensor_map: TensorMap,
+        subtract: Optional[TensorMap],
+        extra_data: Optional[Any],
+        mask_from: Optional[TensorMap] = None,
+        undo_scale: bool = True,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], List[int]]:
+        """Flatten for the matrix-free path, which never sees a matrix.
+
+        The per-system sizes are validated against the auxiliary basis itself
+        (via the builder) instead of against matrix shapes, so the
+        ``aux_basis`` misconfiguration check of :py:meth:`_per_system` is
+        preserved.
+
+        :param tensor_map: the predicted coefficients.
+        :param subtract: reference coefficients to subtract, or ``None`` to
+            flatten ``tensor_map`` alone.
+        :param extra_data: the batch's extra data, holding the packed
+            unaugmented geometry.
+        :param mask_from: reference-shaped map to read the NaN padding from,
+            for values that carry none of their own (see
+            :py:func:`_flatten_to_pyscf_order`).
+        :param undo_scale: whether to restore the physical scale of the
+            flattened values; see :py:meth:`_per_system`.
+        :return: ``(flat, geometries, sizes)``: the concatenated coefficient
+            vector, the unpacked per-system geometries, and the per-system
+            coefficient counts.
+        """
+        packed = self._require(extra_data, DENSITY_GEOMETRY_NAME)
+        geometries = unpack_density_geometry(packed)
+
+        flat, counts_per_atom = _flatten_to_pyscf_order(tensor_map, subtract, mask_from)
+        if undo_scale:
+            flat = self._undo_scale(flat, counts_per_atom, extra_data)
+
+        system_of_atom = (
+            tensor_map.block(tensor_map.keys[0]).samples.values[:, 0].to(torch.int64)
+        )
+        counts = torch.zeros(
+            len(geometries),
+            dtype=counts_per_atom.dtype,
+            device=counts_per_atom.device,
+        ).scatter_add_(0, system_of_atom, counts_per_atom)
+        sizes = counts.tolist()
+
+        expected = [self._builder.naux(types) for types, _ in geometries]
+        if sizes != expected:
+            raise ValueError(
+                f"target '{self.target}' has a per-system coefficient count that "
+                f"does not match the '{self.aux_basis}' auxiliary basis "
+                f"({sizes} vs {expected}). Check that 'aux_basis' matches the basis "
+                "the dataset was fitted in."
+            )
+        return flat, geometries, sizes
 
     def _per_system(
         self,
@@ -878,6 +953,14 @@ class DensityMSELossViaC(_DensityLoss):
         targets: Dict[str, TensorMap],
         extra_data: Optional[Any] = None,
     ) -> torch.Tensor:
+        if self.assembly == "matrix_free":
+            # Factored terms cannot appear here: the torch backend rejects
+            # their specs at construction, and matrix_free implies torch.
+            flat, geometries, sizes = self._flat_per_system(
+                predictions[self.target], targets[self.target], extra_data
+            )
+            return self._reduce(self._builder.quadratic_flat(geometries, flat, sizes))
+
         deltas, matrices = self._per_system(
             predictions[self.target], targets[self.target], extra_data
         )
@@ -971,6 +1054,8 @@ class DensityMSELossViaW(_DensityLoss):
         ``<target>_projections``.
     :param backend: where the metric matrices come from; see
         :py:class:`_DensityLoss`.
+    :param assembly: dense matrices or the matrix-free streamed quadratic
+        form; see :py:class:`_DensityLoss`.
     """
 
     def __init__(
@@ -983,9 +1068,17 @@ class DensityMSELossViaW(_DensityLoss):
         aux_basis: Optional[str] = None,
         projections_key: Optional[str] = None,
         backend: str = "pyscf",
+        assembly: str = "dense",
     ):
         super().__init__(
-            name, gradient, weight, reduction, metric, aux_basis, backend=backend
+            name,
+            gradient,
+            weight,
+            reduction,
+            metric,
+            aux_basis,
+            backend=backend,
+            assembly=assembly,
         )
         self.projections_key = (
             projections_key
@@ -1008,24 +1101,44 @@ class DensityMSELossViaW(_DensityLoss):
         # -- so the prediction is flattened against the projections' padding. Read
         # from its own values it would count every padded slot as a real
         # coefficient, and no batch mixing elements of different basis sizes would
-        # match the auxiliary basis.
-        coefficients, matrices = self._per_system(
-            predictions[self.target], None, extra_data, mask_from=projections
-        )
-        # The projections come straight from the dataset, so the trainer's scale
-        # removal never touched them: they are already physical, unlike the
-        # predicted coefficients, which `_per_system` restores.
-        projected, _ = self._per_system(
-            projections, None, extra_data, matrices, undo_scale=False
-        )
+        # match the auxiliary basis. The projections themselves come straight from
+        # the dataset, so the trainer's scale removal never touched them: they are
+        # already physical, unlike the predicted coefficients, whose scale the
+        # flattening restores.
+        if self.assembly == "matrix_free":
+            flat, geometries, sizes = self._flat_per_system(
+                predictions[self.target], None, extra_data, mask_from=projections
+            )
+            flat_projected, _, _ = self._flat_per_system(
+                projections, None, extra_data, undo_scale=False
+            )
+            per_system = self._builder.quadratic_flat(
+                geometries, flat, sizes
+            ) - 2.0 * torch.stack(
+                [
+                    torch.dot(c, w.to(c.dtype))
+                    for c, w in zip(
+                        flat.split(sizes), flat_projected.split(sizes), strict=True
+                    )
+                ]
+            )
+        else:
+            coefficients, matrices = self._per_system(
+                predictions[self.target], None, extra_data, mask_from=projections
+            )
+            projected, _ = self._per_system(
+                projections, None, extra_data, matrices, undo_scale=False
+            )
 
-        per_system = torch.stack(
-            [
-                _quadratic_form(c, matrix)
-                - 2.0 * torch.dot(c.to(matrix.dtype), w.to(matrix.dtype))
-                for c, w, matrix in zip(coefficients, projected, matrices, strict=True)
-            ]
-        )
+            per_system = torch.stack(
+                [
+                    _quadratic_form(c, matrix)
+                    - 2.0 * torch.dot(c.to(matrix.dtype), w.to(matrix.dtype))
+                    for c, w, matrix in zip(
+                        coefficients, projected, matrices, strict=True
+                    )
+                ]
+            )
 
         constant_name = ri_density_fit_constant_name(self.target)
         if extra_data is not None and constant_name in extra_data:

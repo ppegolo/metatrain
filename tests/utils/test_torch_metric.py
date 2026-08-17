@@ -293,3 +293,166 @@ def test_missing_geometry_is_reported():
 def test_unknown_backend_is_rejected():
     with pytest.raises(ValueError, match="backend"):
         _via_c("numpy")
+
+
+# ── matrix-free assembly ──────────────────────────────────────────────────────
+
+
+def _spread_apart(system, shift: float):
+    """A copy of ``system`` translated by ``shift`` Angstrom along x."""
+    from metatomic.torch import System
+
+    return System(
+        types=system.types,
+        positions=system.positions + torch.tensor([shift, 0.0, 0.0]),
+        cell=system.cell,
+        pbc=system.pbc,
+    )
+
+
+def _far_pair_system():
+    """Two molecules 12 Angstrom apart: genuine far-field pairs."""
+    from metatomic.torch import System
+
+    near, far = _system(), _spread_apart(_ethane(), 12.0)
+    return System(
+        types=torch.cat([near.types, far.types]),
+        positions=torch.cat([near.positions, far.positions]),
+        cell=near.cell,
+        pbc=near.pbc,
+    )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "overlap",
+        "coulomb",
+        make_metric_spec("coulomb", omega=0.3, eps=0.01, charge_weight=2.0),
+    ],
+)
+def test_matrix_free_matvec_matches_dense(spec):
+    builder = TorchMetricBuilder(AUX_BASIS, spec)
+    systems = [_system(), _far_pair_system()]
+    dense = builder.compute_batch([_geometry(s) for s in systems], CPU)
+    sizes = [matrix.shape[0] for matrix in dense]
+    generator = torch.Generator().manual_seed(7)
+    flat = torch.randn(sum(sizes), generator=generator, dtype=torch.float64)
+    reference = torch.cat(
+        [
+            matrix @ segment
+            for matrix, segment in zip(dense, flat.split(sizes), strict=True)
+        ]
+    )
+    applied = builder.apply_flat(
+        [_geometry(s) for s in systems], flat, sizes, CPU, torch.float64
+    )
+    assert _relative_error(applied, reference) < 1e-12
+
+
+def test_matrix_free_quadratic_and_gradient_match_dense():
+    builder = TorchMetricBuilder(AUX_BASIS, "coulomb")
+    systems = [_system(), _far_pair_system()]
+    geometries = [_geometry(s) for s in systems]
+    dense = builder.compute_batch(geometries, CPU)
+    sizes = [matrix.shape[0] for matrix in dense]
+    generator = torch.Generator().manual_seed(8)
+    flat = torch.randn(sum(sizes), generator=generator, dtype=torch.float64)
+
+    values = builder.quadratic_flat(
+        geometries, flat.clone().requires_grad_(True), sizes
+    )
+    reference = torch.stack(
+        [
+            segment @ matrix @ segment
+            for matrix, segment in zip(dense, flat.split(sizes), strict=True)
+        ]
+    )
+    assert _relative_error(values.detach(), reference) < 1e-12
+
+    leaf = flat.clone().requires_grad_(True)
+    weights = torch.tensor([0.3, 1.7], dtype=torch.float64)
+    (builder.quadratic_flat(geometries, leaf, sizes) * weights).sum().backward()
+    gradient_reference = 2.0 * torch.cat(
+        [
+            weight * (matrix @ segment)
+            for weight, matrix, segment in zip(
+                weights, dense, flat.split(sizes), strict=True
+            )
+        ]
+    )
+    assert _relative_error(leaf.grad, gradient_reference) < 1e-12
+
+
+@pytest.mark.parametrize("metric", ["overlap", "coulomb"])
+def test_via_c_matrix_free_matches_dense_assembly(metric):
+    systems = [_system(), _far_pair_system()]
+    target = _batch([_random_target(s, seed=71 + i) for i, s in enumerate(systems)])
+    prediction = _batch([_random_target(s, seed=81 + i) for i, s in enumerate(systems)])
+    extra = _torch_backend_extra(systems)
+
+    dense = float(
+        _via_c("torch", metric).compute({TARGET: prediction}, {TARGET: target}, extra)
+    )
+    loss = DensityMSELossViaC(
+        TARGET,
+        None,
+        weight=1.0,
+        reduction="sum",
+        metric=metric,
+        aux_basis=AUX_BASIS,
+        backend="torch",
+        assembly="matrix_free",
+    )
+    value = float(loss.compute({TARGET: prediction}, {TARGET: target}, extra))
+    assert value == pytest.approx(dense, rel=1e-10)
+
+
+def test_via_w_matrix_free_matches_dense_assembly():
+    system = _system()
+    target = _random_target(system, seed=91)
+    prediction = _random_target(system, seed=92)
+
+    matrix = compute_metric_matrix(system, AUX_BASIS, "coulomb")
+    reference_flat, _ = _flatten_to_pyscf_order(target)
+    projections = _unflatten_like(target, matrix @ reference_flat)
+    constant = float(reference_flat @ matrix @ reference_flat)
+    shared = {
+        ri_projections_name(TARGET): projections,
+        ri_density_fit_constant_name(TARGET): _constant_map(constant),
+        **_torch_backend_extra([system]),
+    }
+
+    def build(assembly):
+        return DensityMSELossViaW(
+            TARGET,
+            None,
+            weight=1.0,
+            reduction="sum",
+            metric="coulomb",
+            aux_basis=AUX_BASIS,
+            backend="torch",
+            assembly=assembly,
+        )
+
+    dense = float(
+        build("dense").compute({TARGET: prediction}, {TARGET: target}, shared)
+    )
+    value = float(
+        build("matrix_free").compute({TARGET: prediction}, {TARGET: target}, shared)
+    )
+    assert value == pytest.approx(dense, rel=1e-10)
+
+
+def test_matrix_free_requires_torch_backend():
+    with pytest.raises(ValueError, match="matrix_free"):
+        DensityMSELossViaC(
+            TARGET,
+            None,
+            weight=1.0,
+            reduction="sum",
+            metric="coulomb",
+            aux_basis=AUX_BASIS,
+            backend="pyscf",
+            assembly="matrix_free",
+        )
