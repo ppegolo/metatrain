@@ -47,6 +47,7 @@ it lives here.
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .pyscf_loss import (
+    get_density_geometry_transform,
     get_ec_machinery_transform,
     get_metric_matrices_transform,
     make_metric_spec,
@@ -110,6 +111,11 @@ class DensityLossHooks:
     :param ec_jitter: Standard deviation in Angstrom of the random partner shift
         applied to training batches. Validation always uses the true placement,
         so a reported EC stays the real score.
+    :param geometry_trained: Whether any trained density loss uses the torch
+        metric backend, which needs the unaugmented geometry attached to
+        training batches instead of the matrices themselves.
+    :param geometry_reported: The same, for density metrics evaluated on
+        validation only.
     """
 
     def __init__(
@@ -119,12 +125,16 @@ class DensityLossHooks:
         ec_trained: Optional[Dict[str, str]] = None,
         ec_reported: Optional[Dict[str, str]] = None,
         ec_jitter: float = 0.0,
+        geometry_trained: bool = False,
+        geometry_reported: bool = False,
     ) -> None:
         self._trained = trained
         self._reported = reported
         self._ec_trained = ec_trained or {}
         self._ec_reported = ec_reported or {}
         self._ec_jitter = float(ec_jitter)
+        self._geometry_trained = bool(geometry_trained)
+        self._geometry_reported = bool(geometry_reported)
 
     def training_collate_transforms(self) -> List[Callable]:
         """
@@ -133,6 +143,8 @@ class DensityLossHooks:
         :return: Collate transforms; empty when nothing is trained on a density loss.
         """
         transforms = _metric_transforms(self._trained)
+        if self._geometry_trained:
+            transforms.append(get_density_geometry_transform())
         if self._ec_trained:
             transforms.append(
                 get_ec_machinery_transform(self._ec_trained, self._ec_jitter)
@@ -154,6 +166,8 @@ class DensityLossHooks:
         for metric, targets_map in self._reported.items():
             combined.setdefault(metric, {}).update(targets_map)
         transforms = _metric_transforms(combined)
+        if self._geometry_trained or self._geometry_reported:
+            transforms.append(get_density_geometry_transform())
         ec_combined = dict(self._ec_trained)
         ec_combined.update(self._ec_reported)
         if ec_combined:
@@ -161,8 +175,27 @@ class DensityLossHooks:
         return transforms
 
 
+def _uses_torch_backend(specs: Dict[str, Any]) -> bool:
+    """Whether any density loss among ``specs`` uses the torch metric backend.
+
+    Those losses rebuild their matrices from the geometry on the training
+    device, so the collate side ships the geometry instead of matrices.
+
+    :param specs: Loss specifications keyed by target name.
+    :return: ``True`` when at least one does.
+    """
+    return any(
+        spec.get("type") in DENSITY_LOSS_TYPES
+        and spec.get("backend", "pyscf") == "torch"
+        for _, spec in _terms(specs)
+    )
+
+
 def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     """Group the density losses among ``specs`` by the metric spec they need.
+
+    Losses on the torch metric backend are excluded: they need no matrices
+    attached to the batch (see :py:func:`_uses_torch_backend`).
 
     :param specs: Loss specifications keyed by target name.
     :return: ``{metric spec: {target: aux_basis}}``, empty when none is a density
@@ -171,6 +204,8 @@ def _aux_bases_by_metric(specs: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     grouped: Dict[str, Dict[str, str]] = {}
     for target_name, spec in _terms(specs):
         if spec.get("type") not in DENSITY_LOSS_TYPES:
+            continue
+        if spec.get("backend", "pyscf") == "torch":
             continue
         # Must be built exactly as the loss builds it: the spec is both the
         # extra_data key and the cache key, so any divergence between the two
@@ -250,4 +285,8 @@ def get_density_hooks(
         ec_trained,
         _ec_targets(metrics or {}),
         _ec_jitter(loss_hypers) if isinstance(loss_hypers, dict) else 0.0,
+        geometry_trained=(
+            _uses_torch_backend(loss_hypers) if isinstance(loss_hypers, dict) else False
+        ),
+        geometry_reported=_uses_torch_backend(metrics or {}),
     )
