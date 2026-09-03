@@ -204,6 +204,7 @@ def make_metric_spec(
     esp_shell: Optional[Union[float, Sequence[float]]] = None,
     group_charge_weight: float = 0.0,
     interface_esp_weight: float = 0.0,
+    interface_esp_clash: bool = False,
 ) -> str:
     """Build the canonical metric-spec string shared by the loss and the transform.
 
@@ -243,6 +244,9 @@ def make_metric_spec(
         area-weighted sum of ``|dV(r_g)|**2`` over the two fragments' buried
         contact patches (see :py:func:`compute_interface_esp_factor`). ``0``
         disables it. Needs the same per-atom fragment labels as the EC loss.
+    :param interface_esp_clash: Drop the contact-patch points that lie inside a
+        partner atom's van der Waals sphere (see :py:func:`_ec_interface_patch`).
+        Ignored when ``interface_esp_weight == 0``.
     :return: Canonical spec string.
     """
     if metric not in METRICS:
@@ -293,6 +297,8 @@ def make_metric_spec(
         spec += f"|gq={float(group_charge_weight):.10g}"
     if interface_esp_weight > 0.0:
         spec += f"|iesp={float(interface_esp_weight):.10g}"
+        if interface_esp_clash:
+            spec += "|iesp_clash=1"
     return spec
 
 
@@ -328,6 +334,20 @@ def parse_interface_esp_weight(spec: str) -> float:
     _, *parts = spec.split("|")
     values = dict(part.split("=") for part in parts)
     return float(values.get("iesp", 0.0))
+
+
+def parse_interface_esp_clash(spec: str) -> bool:
+    """Read the interface-ESP clash-culling flag out of a metric spec.
+
+    :param spec: Canonical spec string.
+    :return: Whether the contact patches drop points inside partner atoms;
+        ``False`` when the token is absent.
+    """
+    if "|" not in spec:
+        return False
+    _, *parts = spec.split("|")
+    values = dict(part.split("=") for part in parts)
+    return values.get("iesp_clash", "0") == "1"
 
 
 def parse_metric_spec(
@@ -862,6 +882,7 @@ def compute_interface_esp_factor(
     system: System,
     aux_basis: str,
     split: Union[int, Sequence[int], "numpy.ndarray"],
+    clash: bool = False,
 ) -> torch.Tensor:
     """
     Compute the interface-ESP factor ``F = W^(1/2) A^T`` on the contact patches.
@@ -882,6 +903,9 @@ def compute_interface_esp_factor(
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
     :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :param clash: Drop the patch points lying inside a partner atom's van der
+        Waals sphere, see :py:func:`_ec_interface_patch`. Off by default so
+        existing specs and cache entries stay unchanged.
     :return: Dense ``(n_points, n_basis)`` matrix in PySCF AO order, float64.
         Zero rows when either fragment is empty or no patch exists (monomers),
         making the structure's contribution to the penalty exactly zero.
@@ -902,7 +926,7 @@ def compute_interface_esp_factor(
     labels[partner] = 1
     pieces = []
     for orientation in (labels, 1 - labels):
-        points, areas = _ec_interface_patch(centres, charges, orientation)
+        points, areas = _ec_interface_patch(centres, charges, orientation, clash)
         if len(points):
             pieces.append((points, areas))
     if not pieces:
@@ -965,6 +989,11 @@ def compute_esp_metric(
 
 #: Probe radius of the EC interface patch: a water probe, 1.4 Angstrom in Bohr.
 EC_PROBE_RADIUS = 1.4 / 0.52917721092
+
+#: Overlap (Bohr) tolerated before a contact-patch point counts as clashing with
+#: a partner atom's van der Waals sphere: 0.1 Angstrom, the value ``presto``
+#: uses to cull the same points before scoring.
+EC_CLASH_TOLERANCE = 0.1 / 0.52917721092
 
 #: Points per atomic sphere for the EC patch. Denser than the ESP loss grid
 #: because the patch is a small cutout of the surface; matches the grid the EC
@@ -1046,6 +1075,7 @@ def _ec_interface_patch(
     centres: "numpy.ndarray",
     charges: "numpy.ndarray",
     split: Union[int, Sequence[int], "numpy.ndarray"],
+    clash: bool = False,
 ) -> Tuple["numpy.ndarray", "numpy.ndarray"]:
     """Fragment 0's solvent-excluded contact patch with a partner.
 
@@ -1055,9 +1085,19 @@ def _ec_interface_patch(
     the *probe centre* that generated it, since it is the probe, not the
     contact point on the vdW surface, that the partner blocks.
 
+    The patch sits on fragment 0's vdW surface, which the partner's atoms may
+    poke through: a hydrogen-bond donor sits ~1.8 Angstrom from the acceptor,
+    inside the acceptor's 1.5 Angstrom sphere. The points under such an atom are
+    a fraction of a Bohr from its nucleus, where the potential is that nucleus
+    and its core density (several Hartree, against tenths elsewhere) and says
+    nothing about the interface. With ``clash`` they are dropped by the rule
+    ``presto`` scores with: inside a partner sphere shrunk by
+    :py:data:`EC_CLASH_TOLERANCE`.
+
     :param centres: All atom positions in Bohr, shape ``(n_atoms, 3)``.
     :param charges: Atomic numbers of all atoms.
     :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
+    :param clash: Drop the points inside a partner atom's van der Waals sphere.
     :return: ``(points, areas)`` in Bohr and Bohr^2, possibly empty.
     """
     import numpy as np
@@ -1116,7 +1156,14 @@ def _ec_interface_patch(
         probe_centres[:, None, :] - centres[partner][None, :, :], axis=2
     )
     buried = (distances < accessible[partner][None, :]).any(axis=1)
-    return contact[buried], contact_areas[buried]
+    contact, contact_areas = contact[buried], contact_areas[buried]
+    if clash and len(contact):
+        distances = np.linalg.norm(
+            contact[:, None, :] - centres[partner][None, :, :], axis=2
+        )
+        clashing = (distances < vdw[partner][None, :] - EC_CLASH_TOLERANCE).any(1)
+        contact, contact_areas = contact[~clashing], contact_areas[~clashing]
+    return contact, contact_areas
 
 
 def _ec_displaced_system(
@@ -1637,31 +1684,39 @@ def _batch_interface_esp_factors(
     system_ids: Optional[List[int]],
     aux_basis: str,
     splits: List[Any],
+    clash: bool = False,
 ) -> List[torch.Tensor]:
     """Interface-ESP factors for one batch, through the cache when ids exist.
 
-    The factor depends on the geometry *and* the fragment split, so the split
-    goes in the cache key, exactly as for the per-group charge factors.
+    The factor depends on the geometry, the fragment split and the clash
+    culling, so the split and (when on) the culling go in the cache key,
+    exactly as for the per-group charge factors.
 
     :param systems: The batch's systems, in batch order.
     :param system_ids: Native dataset ids of those systems, or ``None``.
     :param aux_basis: Auxiliary basis name.
     :param splits: Fragment specification per system, see
         :py:func:`ec_fragment_indices`.
+    :param clash: See :py:func:`compute_interface_esp_factor`.
     :return: One ``(n_points_i, n_basis_i)`` factor per system, in batch order.
     """
     if system_ids is None:
         return [
-            compute_interface_esp_factor(system, aux_basis, split)
+            compute_interface_esp_factor(system, aux_basis, split, clash)
             for system, split in zip(systems, splits, strict=True)
         ]
     cache = _metric_matrix_cache()
     factors = []
+    tag = "|clash=1" if clash else ""
     for system, system_id, split in zip(systems, system_ids, splits, strict=True):
-        key = (aux_basis, f"interface-esp|split={_ec_split_tag(split)}", system_id)
+        key = (
+            aux_basis,
+            f"interface-esp|split={_ec_split_tag(split)}{tag}",
+            system_id,
+        )
         factor = cache.get(key)
         if factor is None:
-            factor = compute_interface_esp_factor(system, aux_basis, split)
+            factor = compute_interface_esp_factor(system, aux_basis, split, clash)
             cache.put(key, factor)
         factors.append(factor)
     return factors
@@ -1860,6 +1915,7 @@ def _metric_matrices_transform(
     base_metric, esp_weight, esp_shell = strip_esp_from_spec(metric)
     group_charge_weight = parse_group_charge_weight(metric)
     interface_esp_weight = parse_interface_esp_weight(metric)
+    interface_esp_clash = parse_interface_esp_clash(metric)
     packed_by_basis: Dict[str, TensorMap] = {}
     factors_by_basis: Dict[str, TensorMap] = {}
     for target_name, aux_basis in target_to_aux_basis.items():
@@ -1894,6 +1950,7 @@ def _metric_matrices_transform(
                         system_ids,
                         aux_basis,
                         _ec_batch_splits(target_name, systems, extra),
+                        interface_esp_clash,
                     )
                 )
             )

@@ -86,6 +86,41 @@ def test_the_interface_weight_has_its_own_token():
         make_metric_spec("coulomb", interface_esp_weight=-1.0)
 
 
+def test_the_clash_flag_rides_on_the_interface_token():
+    from metatrain.utils.density_hooks import _aux_bases_by_metric
+    from metatrain.utils.pyscf_loss import parse_interface_esp_clash
+
+    spec = make_metric_spec(
+        "coulomb", interface_esp_weight=5.0, interface_esp_clash=True
+    )
+    assert spec.endswith("|iesp=5|iesp_clash=1")
+    assert parse_interface_esp_clash(spec)
+    assert parse_interface_esp_weight(spec) == 5.0
+    assert parse_metric_spec(spec) == ("coulomb", 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 1.4)
+    # Absent, or present without the interface term, it leaves the spec alone.
+    assert not parse_interface_esp_clash(
+        make_metric_spec("coulomb", interface_esp_weight=5.0)
+    )
+    assert make_metric_spec("coulomb", interface_esp_clash=True) == "coulomb"
+
+    hooks_spec = {
+        "type": "density_mse_via_c",
+        "aux_basis": AUX_BASIS,
+        "metric": "coulomb",
+        "interface_esp_weight": 5.0,
+        "interface_esp_clash": True,
+    }
+    (built,) = _aux_bases_by_metric({TARGET: hooks_spec}).keys()
+    loss = DensityMSELossViaC(
+        TARGET,
+        None,
+        1.0,
+        "mean",
+        **{k: v for k, v in hooks_spec.items() if k != "type"},
+    )
+    assert built == loss.metric == spec
+
+
 def test_the_hooks_ask_for_the_same_spec_the_loss_reads():
     """A divergence here would lose the factor without any error."""
     from metatrain.utils.density_hooks import _aux_bases_by_metric
@@ -317,3 +352,110 @@ def test_the_transform_attaches_the_interface_factor_per_target():
     # Without fragment labels the transform fails loudly, like the EC loss.
     with pytest.raises(RuntimeError, match="fragment"):
         _metric_matrices_transform({TARGET: AUX_BASIS}, spec, [system], {}, {})
+
+
+def _hydrogen_bonded_dimer():
+    """Water accepting a hydrogen bond from HF: the H sits 1.85 A from the O.
+
+    The O's van der Waals sphere (1.52 A) swallows that H, so the water's
+    contact patch has points a third of an Angstrom from the H nucleus.
+    """
+    from metatomic.torch import System
+
+    return System(
+        types=torch.tensor([8, 1, 1, 1, 9], dtype=torch.int32),
+        positions=torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.8, -0.6],
+                [0.0, -0.8, -0.6],
+                [0.0, 0.0, 1.85],
+                [0.0, 0.0, 2.77],
+            ],
+            dtype=torch.float64,
+        ),
+        cell=torch.zeros((3, 3), dtype=torch.float64),
+        pbc=torch.tensor([False, False, False]),
+    )
+
+
+def test_clash_culling_drops_the_points_under_partner_atoms():
+    pytest.importorskip("pyscf")
+    from pyscf.data import radii
+
+    from metatrain.utils.pyscf_loss import (
+        EC_CLASH_TOLERANCE,
+        _batch_interface_esp_factors,
+        _ec_interface_patch,
+        build_auxiliary_molecule,
+        compute_interface_esp_factor,
+    )
+
+    system = _hydrogen_bonded_dimer()
+    split = np.array([0, 0, 0, 1, 1])
+    auxmol = build_auxiliary_molecule(system, AUX_BASIS)
+    centres, charges = auxmol.atom_coords(), auxmol.atom_charges()
+    partner = centres[3:]
+    inner_radii = radii.VDW[charges[3:]] - EC_CLASH_TOLERANCE
+
+    def inside_partner(points):
+        distances = np.linalg.norm(points[:, None, :] - partner[None, :, :], axis=2)
+        return (distances < inner_radii[None, :]).any(axis=1)
+
+    kept_points, kept_areas = _ec_interface_patch(centres, charges, split)
+    culled_points, culled_areas = _ec_interface_patch(centres, charges, split, True)
+    # The geometry does put patch points under the donor hydrogen ...
+    assert inside_partner(kept_points).any()
+    # ... and culling removes exactly those, area elements alongside.
+    assert not inside_partner(culled_points).any()
+    assert len(culled_points) == (~inside_partner(kept_points)).sum()
+    assert 0 < len(culled_points) < len(kept_points)
+    assert culled_areas.sum() == pytest.approx(
+        kept_areas[~inside_partner(kept_points)].sum()
+    )
+
+    # The factor follows, and the two settings never share a cache entry.
+    kept = compute_interface_esp_factor(system, AUX_BASIS, split)
+    culled = compute_interface_esp_factor(system, AUX_BASIS, split, clash=True)
+    assert culled.shape[0] < kept.shape[0]
+    (cached_kept,) = _batch_interface_esp_factors([system], [7], AUX_BASIS, [split])
+    (cached_culled,) = _batch_interface_esp_factors(
+        [system], [7], AUX_BASIS, [split], clash=True
+    )
+    assert cached_kept.shape == kept.shape
+    assert cached_culled.shape == culled.shape
+
+
+def test_the_transform_honours_the_clash_token():
+    pytest.importorskip("pyscf")
+    from metatrain.utils.pyscf_loss import (
+        _metric_matrices_transform,
+        compute_interface_esp_factor,
+        ec_fragment_name,
+    )
+
+    system = _hydrogen_bonded_dimer()
+    split = [0, 0, 0, 1, 1]
+    labels = TensorMap(
+        Labels.single(),
+        [
+            TensorBlock(
+                values=torch.tensor(split, dtype=torch.float64).reshape(-1, 1),
+                samples=Labels(
+                    ["system", "atom"],
+                    torch.tensor([[0, a] for a in range(5)], dtype=torch.int32),
+                ),
+                components=[],
+                properties=Labels("label", torch.zeros((1, 1), dtype=torch.int32)),
+            )
+        ],
+    )
+    spec = make_metric_spec(
+        "coulomb", interface_esp_weight=5.0, interface_esp_clash=True
+    )
+    extra = {ec_fragment_name(TARGET): labels}
+    _metric_matrices_transform({TARGET: AUX_BASIS}, spec, [system], {}, extra)
+
+    packed = extra[interface_esp_factor_name(TARGET, spec)]
+    expected = compute_interface_esp_factor(system, AUX_BASIS, np.array(split), True)
+    torch.testing.assert_close(packed.block(0).values, expected)

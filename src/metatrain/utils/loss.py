@@ -591,7 +591,13 @@ class _DensityLoss(LossInterface):
       decided on. It needs the same per-atom fragment labels as the EC loss
       (see :py:func:`~metatrain.utils.pyscf_loss.ec_fragment_name`). Both
       area conventions match, so this weight upweights each buried surface
-      element by ``interface_esp_weight / esp_weight``.
+      element by ``interface_esp_weight / esp_weight``. The patches lie on each
+      fragment's van der Waals surface, which the partner's atoms poke through
+      (hydrogen-bond donors, typically); the points under such an atom sit a
+      fraction of a Bohr from its nucleus and carry potentials of several
+      Hartree against tenths elsewhere, so they dominate the term while
+      measuring core density rather than the interface.
+      ``interface_esp_clash`` drops them, by the rule ``presto`` scores with.
     - ``group_charge_weight > 0`` penalises each *group's* electron-count error,
       ``sum_g (S_g . dc)**2``, with the groups read from a per-atom field (see
       :py:func:`~metatrain.utils.pyscf_loss.charge_group_name`). ``charge_weight``
@@ -626,6 +632,9 @@ class _DensityLoss(LossInterface):
         ``0`` disables it. Needs per-atom group labels in the dataset.
     :param interface_esp_weight: weight on the buried-interface ESP penalty;
         ``0`` disables it. Needs per-atom fragment labels in the dataset.
+    :param interface_esp_clash: drop the interface-patch points inside a partner
+        atom's van der Waals sphere; ``False`` (default) keeps them, as before
+        the option existed. Ignored when ``interface_esp_weight == 0``.
     :param backend: where the metric matrices come from. ``"pyscf"`` (default)
         computes them in the dataloader workers and ships them with the batch;
         ``"torch"`` assembles them on the training device inside the loss (see
@@ -669,6 +678,7 @@ class _DensityLoss(LossInterface):
         esp_shell: Optional[Union[float, Sequence[float]]] = None,
         group_charge_weight: float = 0.0,
         interface_esp_weight: float = 0.0,
+        interface_esp_clash: bool = False,
         backend: str = "pyscf",
         assembly: str = "dense",
     ):
@@ -698,6 +708,7 @@ class _DensityLoss(LossInterface):
             esp_shell,
             group_charge_weight,
             interface_esp_weight,
+            interface_esp_clash,
         )
         self.aux_basis = aux_basis
         # Applied by the loss itself: these terms travel as factors rather than
