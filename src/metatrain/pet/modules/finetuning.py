@@ -372,6 +372,11 @@ class LoRALinear(nn.Module):
         self.linear = linear_layer
         self.lora_A = nn.Linear(linear_layer.in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, linear_layer.out_features, bias=False)
+        # Standard LoRA initialisation: ``B = 0`` so the wrapped layer starts
+        # as the pretrained one and the fine-tune departs from it, rather
+        # than from a random rank-``rank`` perturbation of every wrapped
+        # linear that the first epochs must first undo.
+        nn.init.zeros_(self.lora_B.weight)
         self.scaling = alpha / rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
