@@ -419,8 +419,11 @@ class TrainerHypers(TypedDict):
       the given auxiliary basis (second field) from an atomic HF density in
       the given orbital basis (first field). The model then learns the
       deformation density, whose far-field electrostatics no longer hinges on
-      a near-total nuclear/electronic cancellation. See
-      :py:mod:`metatrain.utils.additive.free_atom`.
+      a near-total nuclear/electronic cancellation. Elements with an effective
+      core potential are solved under it and normalised to ``Z_eff``; the ECP
+      is looked up under the orbital basis name (the def2 rule), or set
+      explicitly with a trailing ``|ecp=<name>`` (``|ecp=none`` for
+      all-electron). See :py:mod:`metatrain.utils.additive.free_atom`.
 
     This atomic baseline is substracted from the targets during training, which
     avoids the main model needing to learn atomic contributions, and likely makes

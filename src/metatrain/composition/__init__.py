@@ -58,13 +58,13 @@ def train_or_load_composition_model(
 
     if is_free_atom_spec(atomic_baseline):
         assert isinstance(atomic_baseline, str)
-        basis, aux_basis = parse_free_atom_spec(atomic_baseline)
+        basis, aux_basis, ecp = parse_free_atom_spec(atomic_baseline)
         logging.info(
             f"Computing free-atom baseline (orbital basis '{basis}', "
-            f"auxiliary basis '{aux_basis}') instead of fitting composition "
-            "weights"
+            f"auxiliary basis '{aux_basis}', ECP '{ecp or 'none'}') instead of "
+            "fitting composition weights"
         )
-        set_free_atom_composition_weights(composition_model, basis, aux_basis)
+        set_free_atom_composition_weights(composition_model, basis, aux_basis, ecp)
         if checkpoint_dir and (
             not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         ):

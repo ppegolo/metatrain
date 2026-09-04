@@ -32,6 +32,7 @@ import copy
 import functools
 import importlib
 import re
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -69,6 +70,75 @@ def _import_pyscf() -> Tuple["ModuleType", "ModuleType"]:
             "matrices; install it with `pip install pyscf`."
         ) from err
     return gto, elements
+
+
+#: Lightest element the def2 family gives an effective core potential to.
+#: Built all-electron against a def2 basis, such an atom counts ``Z`` electrons
+#: where the reference density only ever held ``Z_eff``.
+FIRST_ECP_ELEMENT = 37
+
+
+def atomic_numbers_of(mol: "Mole") -> "numpy.ndarray":
+    """Element identity ``Z`` of every atom of a built molecule.
+
+    ``mol.atom_charges()`` is *not* this: with an effective core potential it
+    holds ``Z_eff``. Use the result for symbols, van der Waals radii and
+    anything else that names the element, never as a nuclear charge.
+
+    :param mol: A built PySCF molecule, orbital or auxiliary.
+    :return: Integer array, shape ``(n_atoms,)``.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+    return np.array(
+        [gto.charge(mol.atom_symbol(i)) for i in range(mol.natm)], dtype=int
+    )
+
+
+def nuclear_charges_of(mol: "Mole") -> "numpy.ndarray":
+    """Effective nuclear charge ``Z_eff = Z - n_core`` of every atom.
+
+    This is what enters the nuclear potential of an ECP calculation: the core
+    electrons are not in the density, so their screening is not there to be
+    cancelled. Equal to :py:func:`atomic_numbers_of` for a molecule built
+    without an ECP.
+
+    :param mol: A built PySCF molecule, orbital or auxiliary.
+    :return: Integer array, shape ``(n_atoms,)``.
+    """
+    import numpy as np
+
+    core = np.array([int(mol.atom_nelec_core(i)) for i in range(mol.natm)], dtype=int)
+    return atomic_numbers_of(mol) - core
+
+
+def _warn_if_ecp_is_missing(mol: "Mole", ecp: Optional[str]) -> None:
+    """Warn when a heavy element's nuclear charge is being taken as ``Z``.
+
+    :param mol: The built auxiliary molecule.
+    :param ecp: The configured effective core potential, if any.
+    """
+    if ecp:
+        return
+    heavy = sorted(
+        {
+            mol.atom_symbol(i)
+            for i, z in enumerate(atomic_numbers_of(mol))
+            if int(z) >= FIRST_ECP_ELEMENT
+        }
+    )
+    if not heavy:
+        return
+    warnings.warn(
+        f"no 'ecp' set but the structure contains {', '.join(heavy)}: def2 "
+        "bases are defined against an effective core potential for these, so "
+        "their nuclear potential is evaluated with Z rather than Z_eff. Set "
+        "'ecp' on the EC loss to the ECP of the reference data (e.g. "
+        "'def2-svp').",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _build_etb_basis(
@@ -544,12 +614,19 @@ def ri_density_fit_constant_name(target_name: str) -> str:
 # ── Molecule / integral construction ──────────────────────────────────────────
 
 
-def build_auxiliary_molecule(system: System, aux_basis: str) -> "Mole":
+def build_auxiliary_molecule(
+    system: System, aux_basis: str, ecp: Optional[str] = None
+) -> "Mole":
     """
     Build a PySCF molecule carrying the auxiliary basis, for integral evaluation.
 
     :param system: System whose positions are interpreted as Angstrom.
     :param aux_basis: Auxiliary basis name or ``"etb:<ao_basis>:<beta>"``.
+    :param ecp: Effective core potential name of the reference calculation, or
+        ``None`` for an all-electron molecule. The two-centre integrals do not
+        depend on it; the nuclear charges do (``atom_charges()`` becomes
+        ``Z_eff``, see :py:func:`nuclear_charges_of`), and so does anything
+        derived from them, such as the EC loss's nuclear potentials.
     :return: A built molecule in spherical-harmonic (not Cartesian) form, which is
         the convention the RI coefficients follow.
     """
@@ -576,6 +653,8 @@ def build_auxiliary_molecule(system: System, aux_basis: str) -> "Mole":
     )
     # ``_load_auxiliary_basis`` is cached, and ``Mole.build`` mutates its basis.
     mol.basis = copy.deepcopy(_load_auxiliary_basis(aux_basis, atomic_numbers))
+    if ecp:
+        mol.ecp = ecp
     mol.unit = "Angstrom"
     mol.verbose = 0
     mol.spin = None
@@ -809,7 +888,7 @@ def compute_surface_points(
 
     auxmol = build_auxiliary_molecule(system, aux_basis)
     centres = auxmol.atom_coords()  # Bohr
-    charges = auxmol.atom_charges()
+    charges = atomic_numbers_of(auxmol)
 
     n = ESP_POINTS_PER_ATOM
     # Fibonacci sphere: near-uniform, deterministic.
@@ -920,7 +999,7 @@ def compute_interface_esp_factor(
     if len(own) == 0 or len(partner) == 0:
         return empty
     centres = auxmol.atom_coords()
-    charges = auxmol.atom_charges()
+    charges = atomic_numbers_of(auxmol)
 
     labels = np.zeros(auxmol.natm, dtype=int)
     labels[partner] = 1
@@ -1197,6 +1276,7 @@ def ec_pointwise_pieces(
     aux_basis: str,
     split: Union[int, Sequence[int], "numpy.ndarray"],
     displacement: Optional["numpy.ndarray"] = None,
+    ecp: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """The point-space ingredients of EC for one structure, before contraction.
 
@@ -1216,6 +1296,11 @@ def ec_pointwise_pieces(
     :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
     :param displacement: Rigid shift of the partner fragment in Angstrom, shape
         ``(3,)``, or ``None`` for the true placement.
+    :param ecp: Effective core potential of the reference calculation. The
+        nuclear potentials use ``Z_eff``: the coefficients describe a density
+        without the core electrons, so a full-``Z`` nucleus would leave every
+        ECP atom bare by ``n_core / r``. ``None`` takes every atom as
+        all-electron, with a warning when a def2-ECP element is present.
     :return: ``None`` when the patch has fewer than
         :py:data:`EC_MIN_PATCH_POINTS` points; otherwise a dict with the ESP
         operator ``V[P, p]`` (naux x npoints), normalised area ``weights``,
@@ -1228,14 +1313,18 @@ def ec_pointwise_pieces(
 
     if displacement is not None:
         system = _ec_displaced_system(system, split, displacement)
-    auxmol = build_auxiliary_molecule(system, aux_basis)
+    auxmol = build_auxiliary_molecule(system, aux_basis, ecp)
     own, partner = ec_fragment_indices(split, auxmol.natm)
     if len(own) == 0 or len(partner) == 0:
         return None
+    _warn_if_ecp_is_missing(auxmol, ecp)
     centres = auxmol.atom_coords()
-    charges = auxmol.atom_charges()
+    # The patch follows the element (van der Waals radii); the potential
+    # follows the charge the nucleus actually exerts on the valence density.
+    elements = atomic_numbers_of(auxmol)
+    charges = nuclear_charges_of(auxmol)
 
-    points, areas = _ec_interface_patch(centres, charges, split)
+    points, areas = _ec_interface_patch(centres, elements, split)
     if len(points) < EC_MIN_PATCH_POINTS:
         return None
     weights = areas / areas.sum()
@@ -1275,6 +1364,7 @@ def compute_ec_machinery(
     aux_basis: str,
     split: Union[int, Sequence[int], "numpy.ndarray"],
     displacement: Optional["numpy.ndarray"] = None,
+    ecp: Optional[str] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Contract the EC patch evaluation into geometry-only per-structure tensors.
 
@@ -1288,6 +1378,8 @@ def compute_ec_machinery(
     :param split: Fragment specification, see :py:func:`ec_fragment_indices`.
     :param displacement: Rigid shift of the partner fragment in Angstrom, or
         ``None`` for the true placement.
+    :param ecp: Effective core potential of the reference calculation, see
+        :py:func:`ec_pointwise_pieces`.
     :return: ``None`` when the structure has no usable patch; otherwise
         ``(moments, vectors, constants)``: ``M = V K V^T`` of shape
         ``(naux, naux)``; the rows ``t_0, t_1, mask_0, mask_1`` of shape
@@ -1296,7 +1388,7 @@ def compute_ec_machinery(
     """
     import numpy as np
 
-    pieces = ec_pointwise_pieces(system, aux_basis, split, displacement)
+    pieces = ec_pointwise_pieces(system, aux_basis, split, displacement, ecp)
     if pieces is None:
         return None
     operator, weights = pieces["operator"], pieces["weights"]
@@ -1842,6 +1934,7 @@ def _batch_ec_machinery(
     aux_basis: str,
     splits: List[Any],
     displacements: Optional[List[Optional["numpy.ndarray"]]] = None,
+    ecp: Optional[str] = None,
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """EC machinery for one batch, through the cache when ids are available.
 
@@ -1864,6 +1957,8 @@ def _batch_ec_machinery(
         :py:func:`ec_fragment_indices`.
     :param displacements: Per-system partner shift in Angstrom, or ``None`` for
         an unaugmented batch.
+    :param ecp: Effective core potential of the reference calculation; part of
+        the cache key, since it changes the nuclear potentials.
     :return: One ``(moments, vectors, constants)`` triple per system.
     """
     if system_ids is None:
@@ -1873,6 +1968,9 @@ def _batch_ec_machinery(
     # The cache holds single tensors, so the three parts live under three keys;
     # they are written together, so either all are present or none is.
     parts = ("moments", "vectors", "constants")
+    # Appended only when set, so cache keys from before the option existed
+    # stay byte-identical.
+    ecp_tag = f"|ecp={ecp}" if ecp else ""
     cache = _metric_matrix_cache()
     machinery = []
     for system, system_id, split, shift in zip(
@@ -1880,14 +1978,18 @@ def _batch_ec_machinery(
     ):
         cacheable = system_id is not None and shift is None
         keys = [
-            (aux_basis, f"ec-machinery-{part}|split={_ec_split_tag(split)}", system_id)
+            (
+                aux_basis,
+                f"ec-machinery-{part}|split={_ec_split_tag(split)}{ecp_tag}",
+                system_id,
+            )
             for part in parts
         ]
         cached = [cache.get(key) for key in keys] if cacheable else [None]
         if all(tensor is not None for tensor in cached):
             machinery.append((cached[0], cached[1], cached[2]))
             continue
-        entry = compute_ec_machinery(system, aux_basis, split, shift)
+        entry = compute_ec_machinery(system, aux_basis, split, shift, ecp)
         if entry is None:
             entry = _EC_NO_PATCH
         if cacheable:
@@ -2097,6 +2199,7 @@ def _ec_partner_shifts(
 def _ec_machinery_transform(
     target_to_aux_basis: Mapping[str, str],
     jitter: float,
+    ecp: Optional[str],
     systems: List[System],
     targets: Dict[str, TensorMap],
     extra: Dict[str, TensorMap],
@@ -2112,7 +2215,7 @@ def _ec_machinery_transform(
         share_key = f"{aux_basis}|{[_ec_split_tag(s) for s in splits]}"
         if share_key not in packed_by_basis:
             machinery = _batch_ec_machinery(
-                systems, system_ids, aux_basis, splits, shifts
+                systems, system_ids, aux_basis, splits, shifts, ecp
             )
             packed_by_basis[share_key] = [
                 pack_metric_matrices([entry[i] for entry in machinery])
@@ -2130,6 +2233,7 @@ def _ec_machinery_transform(
 def get_ec_machinery_transform(
     target_to_aux_basis: Mapping[str, str],
     jitter: float = 0.0,
+    ecp: Optional[str] = None,
 ) -> Callable:
     """
     Build a collate transform attaching per-target EC machinery.
@@ -2156,10 +2260,13 @@ def get_ec_machinery_transform(
     :param target_to_aux_basis: Mapping from target name to auxiliary basis name.
     :param jitter: Standard deviation in Angstrom of the partner shift; 0
         disables the augmentation and restores caching.
+    :param ecp: Effective core potential of the reference calculation, see
+        :py:func:`ec_pointwise_pieces`. ``None`` treats every atom as
+        all-electron.
     :return: A collate transform.
     """
     return functools.partial(
-        _ec_machinery_transform, dict(target_to_aux_basis), float(jitter)
+        _ec_machinery_transform, dict(target_to_aux_basis), float(jitter), ecp
     )
 
 

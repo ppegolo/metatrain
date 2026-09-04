@@ -276,6 +276,41 @@ def test_validation_never_jitters():
     assert not torch.allclose(shaken_moments, direct[0], atol=1e-8)
 
 
+def test_the_ecp_reaches_both_training_and_validation_machinery():
+    """The hooks thread the EC loss's ``ecp`` into the nuclear potentials."""
+    from metatrain.utils.pyscf_loss import _ec_machinery_transform
+
+    hooks = get_density_hooks(
+        {TARGET: {"type": "ec_mse", "aux_basis": AUX_BASIS, "ecp": "def2-svp"}},
+        {TARGET: {"type": "ec_mse", "aux_basis": AUX_BASIS, "ecp": "def2-svp"}},
+    )
+    for transform in (
+        *hooks.training_collate_transforms(),
+        *hooks.validation_collate_transforms(),
+    ):
+        assert transform.func is _ec_machinery_transform
+        assert transform.args[2] == "def2-svp"
+
+    plain = get_density_hooks({TARGET: {"type": "ec_mse", "aux_basis": AUX_BASIS}})
+    (training,) = plain.training_collate_transforms()
+    assert training.args[2] is None
+
+
+def test_conflicting_ecps_are_refused():
+    with pytest.raises(ValueError, match="different 'ecp'"):
+        get_density_hooks(
+            {
+                "a": {"type": "ec_mse", "aux_basis": AUX_BASIS, "ecp": "def2-svp"},
+                "b": {"type": "ec_mse", "aux_basis": AUX_BASIS},
+            }
+        )
+    with pytest.raises(ValueError, match="different 'ecp'"):
+        get_density_hooks(
+            {"a": {"type": "ec_mse", "aux_basis": AUX_BASIS, "ecp": "def2-svp"}},
+            {"a": {"type": "ec_mse", "aux_basis": AUX_BASIS, "ecp": "def2-tzvp"}},
+        )
+
+
 def test_conflicting_jitters_are_refused():
     with pytest.raises(ValueError, match="different 'partner_jitter'"):
         get_density_hooks(

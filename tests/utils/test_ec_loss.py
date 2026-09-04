@@ -10,6 +10,8 @@ exercised by round-tripping coefficient vectors through densified TensorMaps
 built the way the collate pipeline builds them.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -18,11 +20,13 @@ from metatomic.torch import System
 
 from metatrain.utils.loss import ECMSELoss, LossType, _flatten_to_pyscf_order
 from metatrain.utils.pyscf_loss import (
+    atomic_numbers_of,
     build_auxiliary_molecule,
     compute_ec_machinery,
     ec_fragment_split_name,
     ec_pointwise_pieces,
     get_ec_machinery_transform,
+    nuclear_charges_of,
 )
 
 
@@ -44,6 +48,127 @@ def _hf_chain(n_molecules: int, spacing: float = 3.0) -> System:
         cell=torch.zeros(3, 3, dtype=torch.float64),
         pbc=torch.tensor([False, False, False]),
     )
+
+
+def _hi_hf_dimer() -> System:
+    """HI facing HF along z: one def2-ECP element (iodine, 28 core electrons)."""
+    return System(
+        types=torch.tensor([53, 1, 9, 1]),
+        positions=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.61], [0.0, 0.0, 4.5], [0.0, 0.0, 5.42]],
+            dtype=torch.float64,
+        ),
+        cell=torch.zeros(3, 3, dtype=torch.float64),
+        pbc=torch.tensor([False, False, False]),
+    )
+
+
+class TestEffectiveCorePotential:
+    """The nuclear potentials must use ``Z_eff`` when the reference density does.
+
+    PySCF keeps the ECP only in the molecule's charge column, so an auxiliary
+    molecule built without it reports ``Z`` and every nuclear term downstream
+    is off by ``n_core / r`` around the heavy atom, 28/r for iodine.
+    """
+
+    def test_the_auxiliary_molecule_splits_element_from_nuclear_charge(self):
+        plain = build_auxiliary_molecule(_hi_hf_dimer(), AUX_BASIS)
+        ecp = build_auxiliary_molecule(_hi_hf_dimer(), AUX_BASIS, "def2-svp")
+        assert list(atomic_numbers_of(plain)) == [53, 1, 9, 1]
+        assert list(atomic_numbers_of(ecp)) == [53, 1, 9, 1]
+        assert list(nuclear_charges_of(plain)) == [53, 1, 9, 1]
+        assert list(nuclear_charges_of(ecp)) == [25, 1, 9, 1]
+        assert ecp.nelectron == plain.nelectron - 28
+        # The integrals do not see the ECP: same basis, same operator.
+        assert ecp.nao == plain.nao
+        assert np.allclose(ecp.intor("int2c2e"), plain.intor("int2c2e"))
+
+    def test_the_nuclear_potential_follows_the_effective_charge(self):
+        system = _hi_hf_dimer()
+        with pytest.warns(RuntimeWarning, match="no 'ecp' set"):
+            bare = ec_pointwise_pieces(system, AUX_BASIS, split=2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with_ecp = ec_pointwise_pieces(system, AUX_BASIS, split=2, ecp="def2-svp")
+        assert bare is not None and with_ecp is not None
+
+        # Same patch (radii follow the element), same operator and masks.
+        assert np.allclose(bare["weights"], with_ecp["weights"])
+        assert np.allclose(bare["operator"], with_ecp["operator"])
+        for a, b in zip(bare["masks"], with_ecp["masks"], strict=True):
+            assert np.array_equal(a, b)
+
+        # The HF partner has no ECP atom: its potential is unchanged. The HI
+        # fragment's potential drops by exactly 28/r from the iodine nucleus.
+        assert np.allclose(bare["nuclear"][1], with_ecp["nuclear"][1])
+        auxmol = build_auxiliary_molecule(system, AUX_BASIS)
+        centres = auxmol.atom_coords()
+        points = _patch_points(system)
+        distance = np.linalg.norm(points - centres[0], axis=1)
+        assert np.allclose(
+            bare["nuclear"][0] - with_ecp["nuclear"][0], 28.0 / distance, rtol=1e-10
+        )
+
+    def test_light_elements_do_not_warn_and_are_unchanged(self):
+        system = _hf_chain(2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            bare = ec_pointwise_pieces(system, AUX_BASIS, split=2)
+            with_ecp = ec_pointwise_pieces(system, AUX_BASIS, split=2, ecp="def2-svp")
+        for a, b in zip(bare["nuclear"], with_ecp["nuclear"], strict=True):
+            assert np.allclose(a, b)
+
+    def test_the_machinery_and_its_cache_distinguish_the_ecp(self):
+        system = _hi_hf_dimer()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bare = compute_ec_machinery(system, AUX_BASIS, split=2)
+        with_ecp = compute_ec_machinery(system, AUX_BASIS, split=2, ecp="def2-svp")
+        assert torch.allclose(bare[0], with_ecp[0])  # M = V K V^T: geometry only
+        assert not torch.allclose(bare[1][0], with_ecp[1][0])  # t_0 sees iodine
+        assert torch.allclose(bare[1][1], with_ecp[1][1])  # t_1 does not
+        assert not torch.allclose(bare[2], with_ecp[2])
+
+        # Through the transform, with a system id so the cache is used: the
+        # ECP is part of the key, so the two configurations never alias.
+        extra = {
+            "mtt::aux::system_index": TensorMap(
+                Labels.single(),
+                [
+                    TensorBlock(
+                        values=torch.tensor([[7.0]], dtype=torch.float64),
+                        samples=Labels(
+                            "system", torch.zeros((1, 1), dtype=torch.int32)
+                        ),
+                        components=[],
+                        properties=Labels(
+                            "system_index", torch.zeros((1, 1), dtype=torch.int32)
+                        ),
+                    )
+                ],
+            ),
+            ec_fragment_split_name(TARGET): _split_map([2]),
+        }
+        key = f"{TARGET}_ec_machinery_constants"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            _, _, out_bare = get_ec_machinery_transform({TARGET: AUX_BASIS})(
+                [system], {}, dict(extra)
+            )
+        _, _, out_ecp = get_ec_machinery_transform(
+            {TARGET: AUX_BASIS}, 0.0, "def2-svp"
+        )([system], {}, dict(extra))
+        assert torch.allclose(out_ecp[key][0].values.reshape(2, 2), with_ecp[2])
+        assert torch.allclose(out_bare[key][0].values.reshape(2, 2), bare[2])
+
+
+def _patch_points(system: System) -> np.ndarray:
+    """The EC patch points of ``system`` for ``split=2``, in Bohr."""
+    from metatrain.utils.pyscf_loss import _ec_interface_patch
+
+    auxmol = build_auxiliary_molecule(system, AUX_BASIS)
+    points, _ = _ec_interface_patch(auxmol.atom_coords(), atomic_numbers_of(auxmol), 2)
+    return points
 
 
 def _radial_counts(mol) -> dict:
@@ -153,9 +278,9 @@ def _pointwise_ec(pieces, coefficients) -> float:
     return float(-covariance / (spreads[0] * spreads[1]))
 
 
-def _extra_via_transform(systems, splits):
-    """Attach the machinery the way the trainer does: through the transform."""
-    split_map = TensorMap(
+def _split_map(splits) -> TensorMap:
+    """Per-system fragment splits, as the dataset carries them."""
+    return TensorMap(
         Labels.single(),
         [
             TensorBlock(
@@ -171,7 +296,11 @@ def _extra_via_transform(systems, splits):
             )
         ],
     )
-    extra = {ec_fragment_split_name(TARGET): split_map}
+
+
+def _extra_via_transform(systems, splits):
+    """Attach the machinery the way the trainer does: through the transform."""
+    extra = {ec_fragment_split_name(TARGET): _split_map(splits)}
     transform = get_ec_machinery_transform({TARGET: AUX_BASIS})
     _, _, extra = transform(systems, {}, extra)
     return extra

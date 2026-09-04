@@ -1233,6 +1233,13 @@ class ECMSELoss(LossInterface):
     :param partner_jitter: standard deviation in Angstrom of the random partner
         shift applied to training batches; 0 keeps the true placement. Read by
         the trainer, for the same reason as ``aux_basis``.
+    :param ecp: effective core potential the reference densities were computed
+        with (e.g. ``"def2-svp"`` for any def2 basis). The fragment potentials
+        are ``v_f = n_f - V_f^T c``, and the coefficients describe a density
+        without the core electrons, so ``n_f`` must use ``Z_eff``; with
+        ``None`` every nucleus is taken as ``Z``, which is wrong by
+        ``n_core / r`` around every ECP atom (Rb and heavier in the def2
+        family). Read by the trainer, like ``aux_basis``.
     """
 
     #: The machinery is built on the unaugmented geometry, the frame the
@@ -1247,6 +1254,7 @@ class ECMSELoss(LossInterface):
         reduction: str,
         aux_basis: Optional[str] = None,
         partner_jitter: float = 0.0,
+        ecp: Optional[str] = None,
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -1263,10 +1271,11 @@ class ECMSELoss(LossInterface):
                 f"'partner_jitter' must not be negative; got {partner_jitter}."
             )
         self.aux_basis = aux_basis
-        # Read by the trainer's density hooks, not here: the shift changes the
-        # machinery the collate transform builds, and this class only consumes
-        # whatever machinery arrives.
+        # Read by the trainer's density hooks, not here: the shift and the ECP
+        # change the machinery the collate transform builds, and this class
+        # only consumes whatever machinery arrives.
         self.partner_jitter = float(partner_jitter)
+        self.ecp = ecp or None
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
         if extra_data is None or key not in extra_data:

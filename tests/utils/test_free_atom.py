@@ -41,17 +41,33 @@ def test_the_spec_string_is_recognized_and_parsed():
     assert not is_free_atom_spec("/path/to/model.ckpt")
     assert not is_free_atom_spec({"energy": 1.0})
 
+    # Without an option the ECP is looked up under the orbital basis name.
     assert parse_free_atom_spec(f"{FREE_ATOM_PREFIX}:def2-svp:{AUX_BASIS}") == (
         "def2-svp",
         AUX_BASIS,
+        "def2-svp",
     )
     # The auxiliary basis may itself contain colons (even-tempered form).
     assert parse_free_atom_spec("free_atom:def2-svp:etb:def2-svp:2.0") == (
         "def2-svp",
         "etb:def2-svp:2.0",
+        "def2-svp",
+    )
+    assert parse_free_atom_spec("free_atom:def2-svp:etb:def2-svp:2.0|ecp=none") == (
+        "def2-svp",
+        "etb:def2-svp:2.0",
+        None,
+    )
+    assert parse_free_atom_spec(f"free_atom:cc-pvdz:{AUX_BASIS}|ecp=def2-svp") == (
+        "cc-pvdz",
+        AUX_BASIS,
+        "def2-svp",
     )
     for bad in ("free_atom:", "free_atom:def2-svp", "free_atom::x", "other:a:b"):
         with pytest.raises(ValueError, match="free-atom baseline spec"):
+            parse_free_atom_spec(bad)
+    for bad in ("free_atom:a:b|ecp", "free_atom:a:b|ecp=", "free_atom:a:b|foo=1"):
+        with pytest.raises(ValueError, match="free-atom baseline option"):
             parse_free_atom_spec(bad)
 
 
@@ -81,6 +97,38 @@ def test_the_atomic_coefficients_are_neutral_and_l0_only():
         electrons = float(moments @ coefficients.numpy())
         assert electrons == pytest.approx(atomic_number, abs=1e-10)
         assert np.all(np.isfinite(coefficients.numpy()))
+
+
+def test_an_ecp_element_is_neutral_against_its_effective_nucleus():
+    """Iodine under the def2 ECP holds 25 electrons, not 53.
+
+    A reference density computed with the ECP integrates to ``Z_eff``, so a
+    baseline normalised to ``Z`` would carry 28 spurious electrons per iodine
+    and leave the deformation target with a -28 e monopole. The atomic solver
+    must also run under the ECP: def2-svp has no functions for the iodine
+    core, and an all-electron atom in it is not a valid calculation at all.
+    """
+    pytest.importorskip("pyscf")
+
+    from metatrain.utils.additive.free_atom import free_atom_coefficients
+    from metatrain.utils.pyscf_loss import compute_charge_vector
+
+    coefficients = free_atom_coefficients(53, BASIS, AUX_BASIS, ecp="def2-svp")
+    system = System(
+        types=torch.tensor([53], dtype=torch.int32),
+        positions=torch.zeros((1, 3), dtype=torch.float64),
+        cell=torch.zeros(3, 3, dtype=torch.float64),
+        pbc=torch.tensor([False, False, False]),
+    )
+    s_vector = compute_charge_vector(system, AUX_BASIS).numpy()
+    moments = s_vector[s_vector != 0.0]
+    assert len(moments) == len(coefficients)
+    assert float(moments @ coefficients.numpy()) == pytest.approx(25.0, abs=1e-10)
+
+    # An element the ECP does not touch is unchanged by naming it.
+    with_name = free_atom_coefficients(6, BASIS, AUX_BASIS, ecp="def2-svp")
+    without = free_atom_coefficients(6, BASIS, AUX_BASIS)
+    assert torch.allclose(with_name, without, atol=1e-12)
 
 
 def _composition_model():
