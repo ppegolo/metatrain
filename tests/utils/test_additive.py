@@ -10,6 +10,7 @@ from omegaconf import OmegaConf
 from metatrain.composition import CompositionModel
 from metatrain.utils.additive import (
     ZBL,
+    add_additive,
     remove_additive,
 )
 from metatrain.utils.data import Dataset, DatasetInfo
@@ -477,6 +478,11 @@ def test_remove_additive():
     # In QM9 the composition contribution is very large: the standard deviation
     # of the energies is reduced by a factor of over 100 upon removing the composition
     assert std_after < 100.0 * std_before
+
+    # add_additive is the exact inverse: the round trip restores the targets.
+    add_additive(systems, targets, composition_model, target_info)
+    std_round_trip = targets["mtt::U0"].block().values.std().item()
+    assert std_round_trip == pytest.approx(std_before, rel=1e-10)
 
 
 def test_remove_additive_additive_model_in_eval_mode():

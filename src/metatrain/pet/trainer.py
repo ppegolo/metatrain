@@ -20,7 +20,7 @@ from torch.utils.data import DistributedSampler
 from metatrain.composition import train_or_load_composition_model
 from metatrain.scaler import train_or_load_scaler
 from metatrain.utils.abc import ModelInterface, TrainerInterface
-from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.additive import add_additive, get_remove_additive_transform
 from metatrain.utils.augmentation import (
     O3Augmenter,
     get_augmentation_transform,
@@ -67,6 +67,7 @@ from metatrain.utils.neighbor_lists import (
 from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.reported_metrics import metrics_for
 from metatrain.utils.scaler import get_remove_scale_transform
+from metatrain.utils.scaler.remove import removed_scale_name
 from metatrain.utils.system_data import get_system_data_transform
 from metatrain.utils.transfer import batch_to
 
@@ -655,6 +656,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 # reported on the epoch the metric logger is set up from.
                 due = metrics_for(extra_metrics, "validation", epoch - start_epoch)
                 val_extra = build_reported_losses(due, train_targets)
+                removed_scale_keys = {
+                    removed_scale_name(name) for name in train_targets
+                }
                 # Accumulated on device and reduced once at the end of the epoch:
                 # summing `.item()` per batch would sync every batch, and would
                 # report only this rank's shard under DDP.
@@ -731,13 +735,43 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     # point, which would report the metric in the model's internal
                     # units instead.
                     val_extra_systems += len(systems)
-                    for name, metric_fn in val_extra.items():
-                        val_extra_totals[name] += (
-                            len(systems)
-                            * metric_fn(
-                                scaled_predictions, scaled_targets, extra_data
-                            ).detach()
-                        )
+                    if val_extra:
+                        # Reported metrics get the *absolute* quantities `mtt
+                        # eval` would see. The rescaled tensors are physical in
+                        # scale but still baseline-removed (the collate took
+                        # the additive models off the targets and the model
+                        # in train mode does not add them), and they travel
+                        # with the record of the removed scale. A metric that
+                        # is not invariant under a common shift (the EC loss)
+                        # or that undoes scales itself would otherwise score
+                        # deformation densities, or undo a removal that is no
+                        # longer there.
+                        metric_predictions = dict(scaled_predictions)
+                        metric_targets = dict(scaled_targets)
+                        for additive_model in (
+                            model.module if is_distributed else model
+                        ).additive_models:
+                            metric_predictions = add_additive(
+                                systems,
+                                metric_predictions,
+                                additive_model,
+                                train_targets,
+                            )
+                            metric_targets = add_additive(
+                                systems, metric_targets, additive_model, train_targets
+                            )
+                        metric_extra = {
+                            key: value
+                            for key, value in extra_data.items()
+                            if key not in removed_scale_keys
+                        }
+                        for name, metric_fn in val_extra.items():
+                            val_extra_totals[name] += (
+                                len(systems)
+                                * metric_fn(
+                                    metric_predictions, metric_targets, metric_extra
+                                ).detach()
+                            )
 
                     if self.hypers["log_separate_blocks"]:
                         # if any atomic basis outputs are present and metrics are to be

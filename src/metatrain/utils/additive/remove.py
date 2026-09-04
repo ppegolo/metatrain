@@ -27,6 +27,49 @@ def remove_additive(
     :param target_info_dict: Dictionary containing information about the targets.
     :return: The updated targets, with the additive contribution removed.
     """
+    return _apply_additive(systems, targets, additive_model, target_info_dict, -1.0)
+
+
+def add_additive(
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    additive_model: torch.nn.Module,
+    target_info_dict: Dict[str, TargetInfo],
+) -> Dict[str, TensorMap]:
+    """Add an additive contribution back onto baseline-removed tensors.
+
+    The exact inverse of :py:func:`remove_additive`, for the places where a
+    trainer holds baseline-removed predictions and targets but needs the
+    absolute quantity: metrics that are not invariant under a common shift of
+    prediction and target (the EC loss evaluates absolute potentials, the
+    ``via_w`` density loss compares against total-density projections).
+
+    :param systems: List of systems.
+    :param targets: Dictionary of baseline-removed tensors, keyed by target.
+    :param additive_model: The model whose contribution was removed.
+    :param target_info_dict: Dictionary containing information about the targets.
+    :return: The updated tensors, with the additive contribution added.
+    """
+    return _apply_additive(systems, targets, additive_model, target_info_dict, 1.0)
+
+
+def _apply_additive(
+    systems: List[System],
+    targets: Dict[str, TensorMap],
+    additive_model: torch.nn.Module,
+    target_info_dict: Dict[str, TargetInfo],
+    sign: float,
+) -> Dict[str, TensorMap]:
+    """Add ``sign`` times an additive model's contribution to ``targets``.
+
+    :param systems: List of systems.
+    :param targets: Dictionary of tensors, keyed by target; updated in place
+        and returned.
+    :param additive_model: The model computing the contribution.
+    :param target_info_dict: Dictionary containing information about the targets.
+    :param sign: ``-1.0`` removes the contribution, ``1.0`` adds it.
+    :return: The updated tensors.
+    """
     warnings.filterwarnings(
         "ignore",
         category=RuntimeWarning,
@@ -120,7 +163,7 @@ def remove_additive(
             ).to(device=device),
             blocks=blocks,
         )
-        # Sparse subtract the additive contribution from the appropriate target blocks
+        # Sparse add `sign` times the contribution to the matching target blocks
         new_target_blocks = []
         for key, block in targets[target_key].items():
             if key in additive_contribution[target_key].keys:
@@ -129,7 +172,7 @@ def remove_additive(
                         block,
                         _multiply_block_constant(
                             additive_contribution[target_key].block(key),
-                            -1.0,
+                            sign,
                         ),
                     )
                 )

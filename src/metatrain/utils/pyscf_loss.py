@@ -28,9 +28,11 @@ against a molecular metric.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import importlib
+import io
 import re
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -659,7 +661,11 @@ def build_auxiliary_molecule(
     mol.verbose = 0
     mol.spin = None
     mol.cart = False
-    mol.build()
+    # PySCF writes "ECP <name> not found for <element>" to stderr for every
+    # element the ECP family leaves all-electron -- the common case, not worth
+    # a line per atom type per system in a training log.
+    with contextlib.redirect_stderr(io.StringIO()):
+        mol.build()
     return mol
 
 
