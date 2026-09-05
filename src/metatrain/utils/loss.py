@@ -1240,6 +1240,19 @@ class ECMSELoss(LossInterface):
         ``None`` every nucleus is taken as ``Z``, which is wrong by
         ``n_core / r`` around every ECP atom (Rb and heavier in the def2
         family). Read by the trainer, like ``aux_basis``.
+    :param partition: how the complex density is attributed to the two
+        fragments. ``"ri"`` (default) gives every auxiliary function to the
+        atom it is centred on; the machinery is the precontracted quadratic
+        form above. ``"hirshfeld"`` divides the density in real space in
+        proportion to the fragments' promolecular densities: the fragment
+        operators then differ by a geometry-only correction
+        (:py:func:`~metatrain.utils.pyscf_loss.hirshfeld_correction_operator`)
+        and EC is evaluated pointwise from the two ``(naux, npoints)``
+        operators, which for the usual patch sizes is also the smaller
+        footprint. The RI split's attribution of the density shared at a
+        contact is decided by the Coulomb fit, not by the electrons, and no
+        model reproduces it; the Hirshfeld split is what presto scores with.
+        Read by the trainer, like ``aux_basis``.
     """
 
     #: The machinery is built on the unaugmented geometry, the frame the
@@ -1255,6 +1268,7 @@ class ECMSELoss(LossInterface):
         aux_basis: Optional[str] = None,
         partner_jitter: float = 0.0,
         ecp: Optional[str] = None,
+        partition: str = "ri",
     ):
         super().__init__(name, gradient, weight, reduction)
         if gradient is not None:
@@ -1276,6 +1290,12 @@ class ECMSELoss(LossInterface):
         # only consumes whatever machinery arrives.
         self.partner_jitter = float(partner_jitter)
         self.ecp = ecp or None
+        if partition not in ("ri", "hirshfeld"):
+            raise ValueError(
+                f"unknown 'partition' {partition!r} for the EC loss on target "
+                f"'{name}'; choose 'ri' or 'hirshfeld'."
+            )
+        self.partition = partition
 
     def _require(self, extra_data: Optional[Any], key: str) -> Any:
         if extra_data is None or key not in extra_data:
@@ -1323,6 +1343,38 @@ class ECMSELoss(LossInterface):
         if a_00 <= _EC_VARIANCE_FLOOR or a_11 <= _EC_VARIANCE_FLOOR:
             return None
         return -a_01 / torch.sqrt(a_00 * a_11)
+
+    @staticmethod
+    def _ec_pointwise(
+        coefficients: torch.Tensor,
+        operators: torch.Tensor,
+        nuclear: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """EC of one coefficient vector from the two fragment operators.
+
+        The Hirshfeld route: ``v_f = n_f - V_f^T c`` with ``V_f`` the rows
+        ``f * naux : (f + 1) * naux`` of ``operators``, then the area-weighted
+        anticorrelation of the two potentials on the patch.
+
+        :param coefficients: One system's coefficient vector.
+        :param operators: The two fragment operators stacked, ``(2 naux, npoints)``.
+        :param nuclear: The two nuclear potentials, ``(2, npoints)``.
+        :param weights: Normalised area weights, ``(1, npoints)``.
+        :return: The EC value, or ``None`` when a potential has no contrast.
+        """
+        c = coefficients.to(operators.dtype)
+        naux = len(c)
+        w = weights.reshape(-1)
+        v_0 = nuclear[0] - c @ operators[:naux]
+        v_1 = nuclear[1] - c @ operators[naux:]
+        v_0 = v_0 - torch.dot(w, v_0)
+        v_1 = v_1 - torch.dot(w, v_1)
+        a_00 = torch.dot(w, v_0 * v_0)
+        a_11 = torch.dot(w, v_1 * v_1)
+        if a_00 <= _EC_VARIANCE_FLOOR or a_11 <= _EC_VARIANCE_FLOOR:
+            return None
+        return -torch.dot(w, v_0 * v_1) / torch.sqrt(a_00 * a_11)
 
     def compute(
         self,
@@ -1388,6 +1440,7 @@ class ECMSELoss(LossInterface):
 
         per_system = []
         zero = predicted.new_zeros(())
+        pointwise = self.partition == "hirshfeld"
         for c_pred, c_ref, moment, vector, constant in zip(
             torch.split(predicted, sizes),
             torch.split(reference, sizes),
@@ -1396,7 +1449,13 @@ class ECMSELoss(LossInterface):
             constants,
             strict=True,
         ):
-            if vector.shape[1] != len(c_pred):
+            # Under "hirshfeld" the three tensors are the stacked fragment
+            # operators (2 naux, npoints), the nuclear potentials (2, npoints)
+            # and the weights (1, npoints); see compute_ec_machinery.
+            expected = 2 * len(c_pred) if pointwise else len(c_pred)
+            found = moment.shape[0] if pointwise else vector.shape[1]
+            found_naux = found // 2 if pointwise else found
+            if found != expected:
                 # The no-patch placeholder is recognised by its shape; any
                 # other width is a basis mismatch and must not pass silently.
                 if vector.shape[1] == 1 and not bool(constant.any()):
@@ -1404,12 +1463,16 @@ class ECMSELoss(LossInterface):
                     continue
                 raise ValueError(
                     f"target '{self.target}' has {len(c_pred)} coefficients for "
-                    f"a system whose EC machinery expects {vector.shape[1]}. "
+                    f"a system whose EC machinery expects {found_naux}. "
                     f"Check that 'aux_basis' ('{self.aux_basis}') matches the "
                     "basis the dataset was fitted in."
                 )
-            ec_pred = self._ec(c_pred, moment, vector, constant)
-            ec_ref = self._ec(c_ref, moment, vector, constant)
+            if pointwise:
+                ec_pred = self._ec_pointwise(c_pred, moment, vector, constant)
+                ec_ref = self._ec_pointwise(c_ref, moment, vector, constant)
+            else:
+                ec_pred = self._ec(c_pred, moment, vector, constant)
+                ec_ref = self._ec(c_ref, moment, vector, constant)
             if ec_pred is None or ec_ref is None:
                 per_system.append(zero)
                 continue

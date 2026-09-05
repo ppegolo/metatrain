@@ -114,6 +114,8 @@ class DensityLossHooks:
     :param ec_ecp: Effective core potential of the reference calculation, for
         the EC machinery's nuclear potentials; ``None`` treats every atom as
         all-electron.
+    :param ec_partition: Fragment partition of the EC losses (``"ri"`` or
+        ``"hirshfeld"``), one value for every EC loss and metric.
     :param geometry_trained: Whether any trained density loss uses the torch
         metric backend, which needs the unaugmented geometry attached to
         training batches instead of the matrices themselves.
@@ -129,6 +131,7 @@ class DensityLossHooks:
         ec_reported: Optional[Dict[str, str]] = None,
         ec_jitter: float = 0.0,
         ec_ecp: Optional[str] = None,
+        ec_partition: str = "ri",
         geometry_trained: bool = False,
         geometry_reported: bool = False,
     ) -> None:
@@ -138,6 +141,7 @@ class DensityLossHooks:
         self._ec_reported = ec_reported or {}
         self._ec_jitter = float(ec_jitter)
         self._ec_ecp = ec_ecp
+        self._ec_partition = ec_partition
         self._geometry_trained = bool(geometry_trained)
         self._geometry_reported = bool(geometry_reported)
 
@@ -153,7 +157,7 @@ class DensityLossHooks:
         if self._ec_trained:
             transforms.append(
                 get_ec_machinery_transform(
-                    self._ec_trained, self._ec_jitter, self._ec_ecp
+                    self._ec_trained, self._ec_jitter, self._ec_ecp, self._ec_partition
                 )
             )
         return transforms
@@ -180,7 +184,9 @@ class DensityLossHooks:
         if ec_combined:
             # jitter=0: validation scores the true placement
             transforms.append(
-                get_ec_machinery_transform(ec_combined, 0.0, self._ec_ecp)
+                get_ec_machinery_transform(
+                    ec_combined, 0.0, self._ec_ecp, self._ec_partition
+                )
             )
         return transforms
 
@@ -274,7 +280,7 @@ def _ec_jitter(specs: Dict[str, Any]) -> float:
 
 
 def _ec_ecp(*spec_groups: Union[str, Dict[str, Any], None]) -> Optional[str]:
-    """The effective core potential configured by the EC losses among the groups.
+    r"""The effective core potential configured by the EC losses among the groups.
 
     :param \*spec_groups: Loss and metric specifications keyed by target name;
         anything that is not a mapping configures no EC loss.
@@ -298,6 +304,29 @@ def _ec_ecp(*spec_groups: Union[str, Dict[str, Any], None]) -> Optional[str]:
             "metric must name the same effective core potential."
         )
     return values.pop() if values else None
+
+
+def _ec_partition(*spec_groups: Union[str, Dict[str, Any], None]) -> str:
+    r"""The fragment partition configured by the EC losses among the groups.
+
+    :param \*spec_groups: Loss and metric specifications keyed by target name.
+    :return: ``"ri"`` (the default) or ``"hirshfeld"``.
+    :raises ValueError: If two EC losses name different partitions: one batch
+        carries one machinery per target, built under one partition.
+    """
+    values = {
+        spec.get("partition") or "ri"
+        for specs in spec_groups
+        if isinstance(specs, dict)
+        for _, spec in _terms(specs)
+        if spec.get("type") in EC_LOSS_TYPES
+    }
+    if len(values) > 1:
+        raise ValueError(
+            f"the EC losses ask for different 'partition' values ({sorted(values)}); "
+            "every EC loss and metric must use the same fragment partition."
+        )
+    return values.pop() if values else "ri"
 
 
 def get_density_hooks(
@@ -324,6 +353,7 @@ def get_density_hooks(
         _ec_targets(metrics or {}),
         _ec_jitter(loss_hypers) if isinstance(loss_hypers, dict) else 0.0,
         ec_ecp=_ec_ecp(loss_hypers, metrics),
+        ec_partition=_ec_partition(loss_hypers, metrics),
         geometry_trained=(
             _uses_torch_backend(loss_hypers) if isinstance(loss_hypers, dict) else False
         ),

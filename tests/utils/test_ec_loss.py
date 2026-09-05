@@ -627,3 +627,101 @@ def test_flatten_size_matches_the_basis():
     assert len(flat) == sum(len(v) for v in vectors)
     assert torch.allclose(flat, torch.from_numpy(np.concatenate(vectors)))
     assert int(counts.sum()) == len(flat)
+
+
+# ── Hirshfeld partition ───────────────────────────────────────────────────────
+
+
+def _pointwise_ec_from_operators(pieces, coefficients) -> float:
+    """EC on the patch points from explicit fragment operators."""
+    weights = pieces["weights"]
+    potentials = [
+        nuclear - coefficients @ operator
+        for nuclear, operator in zip(
+            pieces["nuclear"], pieces["operators"], strict=True
+        )
+    ]
+    centred = [v - weights @ v for v in potentials]
+    covariance = weights @ (centred[0] * centred[1])
+    spreads = [np.sqrt(weights @ v**2) for v in centred]
+    return float(-covariance / (spreads[0] * spreads[1]))
+
+
+def test_hirshfeld_operators_are_additive_and_differ_from_ri():
+    """
+    The two Hirshfeld fragment operators sum exactly to the total ESP operator
+    (the correction enters with opposite signs), and differ from the RI ones
+    where the molecules share density.
+    """
+    system = _hf_chain(2)
+    pieces = ec_pointwise_pieces(system, AUX_BASIS, split=2, partition="hirshfeld")
+    total = pieces["operator"]
+    np.testing.assert_allclose(
+        pieces["operators"][0] + pieces["operators"][1], total, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        pieces["operators"][0] - pieces["operator"] * pieces["masks"][0][:, None],
+        pieces["correction"],
+    )
+    assert np.abs(pieces["correction"]).max() > 1e-4
+
+
+def test_hirshfeld_machinery_matches_pointwise_and_shifts_ec():
+    system = _hf_chain(2)
+    coefficients = _random_vectors([system], seed=0)[0]
+    pieces = ec_pointwise_pieces(system, AUX_BASIS, split=2, partition="hirshfeld")
+    machinery = compute_ec_machinery(system, AUX_BASIS, split=2, partition="hirshfeld")
+    assert machinery is not None
+    operators, nuclear, weights = machinery
+    assert operators.shape == (2 * len(coefficients), len(pieces["weights"]))
+    ec = ECMSELoss._ec_pointwise(
+        torch.from_numpy(coefficients), operators, nuclear, weights
+    )
+    assert ec is not None
+    assert abs(float(ec) - _pointwise_ec_from_operators(pieces, coefficients)) < 1e-12
+    ri = ECMSELoss._ec(
+        torch.from_numpy(coefficients),
+        *compute_ec_machinery(system, AUX_BASIS, split=2),
+    )
+    assert abs(float(ec) - float(ri)) > 1e-6
+
+
+def test_hirshfeld_loss_runs_through_the_transform():
+    systems = [_hf_chain(2), _hf_chain(3)]
+    splits = [2, 4]
+    extra = {ec_fragment_split_name(TARGET): _split_map(splits)}
+    transform = get_ec_machinery_transform({TARGET: AUX_BASIS}, 0.0, None, "hirshfeld")
+    _, _, extra = transform(systems, {}, extra)
+    reference = _random_vectors(systems, seed=1)
+    perturbed = [
+        v + 0.05 * np.random.default_rng(2).normal(size=len(v)) for v in reference
+    ]
+    targets = {TARGET: _densified_batch(systems, reference)}
+    predictions = {TARGET: _densified_batch(systems, perturbed)}
+    loss = ECMSELoss(
+        TARGET,
+        None,
+        weight=1.0,
+        reduction="none",
+        aux_basis=AUX_BASIS,
+        partition="hirshfeld",
+    )
+    values = loss.compute(predictions, targets, extra)
+    assert values.shape == (2,)
+    assert torch.all(torch.isfinite(values)) and torch.all(values > 0)
+    exact = loss.compute(targets, targets, extra)
+    assert torch.all(exact == 0)
+
+
+def test_unknown_partition_is_rejected():
+    with pytest.raises(ValueError, match="partition"):
+        ECMSELoss(
+            TARGET,
+            None,
+            weight=1.0,
+            reduction="sum",
+            aux_basis=AUX_BASIS,
+            partition="becke",
+        )
+    with pytest.raises(ValueError, match="partition"):
+        get_ec_machinery_transform({TARGET: AUX_BASIS}, 0.0, None, "becke")

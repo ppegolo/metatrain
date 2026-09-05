@@ -1277,12 +1277,343 @@ def _ec_displaced_system(
     )
 
 
+# ── Hirshfeld fragment partition ──────────────────────────────────────────────
+#
+# The RI split hands every auxiliary function to the atom it is centred on.
+# Where two fragments touch, the Coulomb fit may describe the same density with
+# either fragment's functions, so that split moves charge between fragments
+# for reasons unrelated to the electrons, and no model reproduces it. The
+# Hirshfeld partition divides the density in real space in proportion to the
+# fragments' promolecular densities. A fragment's potential is then its RI
+# potential plus that of the correction density ``w_f rho - rho_f^RI``, which
+# is nonzero only where the two bookkeepings disagree: the correction is a
+# geometry-only linear operator on the coefficients, integrated on the Becke
+# cells of the atoms near the interface (the same construction as
+# ``qpet.partition``, kept independent of it).
+
+EC_PARTITIONS = ("ri", "hirshfeld")
+_FREE_ATOM_BASIS = "def2-svp"
+_FIRST_ECP_ELEMENT = 37
+
+
+def _check_ec_partition(partition: str) -> str:
+    if partition not in EC_PARTITIONS:
+        raise ValueError(
+            f"unknown EC partition '{partition}'; choose from {EC_PARTITIONS}."
+        )
+    return partition
+
+
+@lru_cache(maxsize=None)
+def _free_atom_table(
+    z: int, ecp: Optional[str]
+) -> Tuple["numpy.ndarray", "numpy.ndarray"]:
+    """Spherically averaged free-atom HF density, tabulated once per element.
+
+    :param z: Atomic number.
+    :param ecp: Effective core potential name, or ``None`` (all-electron below
+        rubidium, ``def2-svp``'s ECP from there on).
+    :return: ``(r, rho)``: radial distances in Bohr and the density there.
+    """
+    import numpy as np
+
+    gto, _ = _import_pyscf()
+    from pyscf.scf import atom_hf
+
+    symbol = gto.mole._std_symbol(z)
+    if ecp is None and z >= _FIRST_ECP_ELEMENT:
+        ecp = _FREE_ATOM_BASIS
+    mol = gto.M(
+        atom=f"{symbol} 0 0 0", basis=_FREE_ATOM_BASIS, ecp=ecp, spin=None, verbose=0
+    )
+    with warnings.catch_warnings():
+        # PySCF's atomic solver still calls its own deprecated linear-dependence
+        # helper; nothing here to act on.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        _, _, mo_coeff, mo_occ = atom_hf.get_atm_nrhf(mol)[symbol]
+    dm = (mo_coeff * mo_occ) @ mo_coeff.T
+    radii = np.concatenate(
+        [np.linspace(0.0, 1.0, 2001)[:-1], np.linspace(1.0, 20.0, 7601)]
+    )
+    points = np.zeros((len(radii), 3))
+    points[:, 2] = radii
+    ao = mol.eval_gto("GTOval", points)
+    return radii, np.einsum("pi,ij,pj->p", ao, dm, ao)
+
+
+def _hirshfeld_own_weight(
+    points: "numpy.ndarray",
+    centres: "numpy.ndarray",
+    numbers: "numpy.ndarray",
+    in_own: "numpy.ndarray",
+    ecp: Optional[str],
+) -> "numpy.ndarray":
+    """Hirshfeld weight of the own fragment, ``rho_own^0 / rho_total^0``.
+
+    :param points: Points, shape ``(n, 3)``, Bohr.
+    :param centres: Nuclear positions, shape ``(m, 3)``, Bohr.
+    :param numbers: Atomic number of every nucleus, shape ``(m,)``.
+    :param in_own: Boolean mask, shape ``(m,)``: nucleus belongs to the own fragment.
+    :param ecp: Effective core potential of the free atoms.
+    :return: Weights in ``[0, 1]``, shape ``(n,)``; ``0.5`` where no atom has density.
+    """
+    import numpy as np
+
+    numerator = np.zeros(len(points))
+    total = np.zeros(len(points))
+    for z in np.unique(numbers):
+        of_z = numbers == z
+        radii, rho_table = _free_atom_table(int(z), ecp)
+        distances = np.linalg.norm(
+            points[:, None, :] - centres[of_z][None, :, :], axis=2
+        )
+        rho = np.interp(distances, radii, rho_table, right=0.0)
+        total += rho.sum(axis=1)
+        numerator += rho[:, in_own[of_z]].sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(total > 0, numerator / total, 0.5)
+
+
+def _becke_cell_weight(
+    points: "numpy.ndarray",
+    centres: "numpy.ndarray",
+    numbers: "numpy.ndarray",
+    cell: int,
+) -> "numpy.ndarray":
+    """Becke's fuzzy-cell weight of one atom among its neighbours.
+
+    PySCF's own kernel (three-fold smoothing with Treutler's size adjustment on
+    Bragg radii), applied to a neighbourhood instead of the whole molecule.
+
+    :param points: Points, shape ``(n, 3)``, Bohr.
+    :param centres: Nuclear positions of the neighbourhood, shape ``(m, 3)``, Bohr.
+    :param numbers: Atomic number of every nucleus, shape ``(m,)``.
+    :param cell: Index (into ``centres``) of the atom whose cell is wanted.
+    :return: Weights in ``[0, 1]``, shape ``(n,)``.
+    """
+    import ctypes
+
+    import numpy as np
+    from pyscf.dft import radi
+    from pyscf.dft.gen_grid import libdft
+
+    radii = np.sqrt(radi.BRAGG_RADII[np.asarray(numbers, dtype=int)]) + 1e-200
+    ratio = radii.reshape(-1, 1) * (1.0 / radii)
+    table = np.ascontiguousarray(np.clip(0.25 * (ratio.T - ratio), -0.5, 0.5).ravel())
+    coords = np.asarray(points, dtype=float, order="F")
+    atoms = np.ascontiguousarray(centres, dtype=float)
+    pbecke = np.empty((len(atoms), len(coords)))
+    libdft.VXCgen_grid(
+        pbecke.ctypes.data_as(ctypes.c_void_p),
+        coords.ctypes.data_as(ctypes.c_void_p),
+        atoms.ctypes.data_as(ctypes.c_void_p),
+        table.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(len(atoms)),
+        ctypes.c_int(len(coords)),
+    )
+    return pbecke[cell] / pbecke.sum(axis=0)
+
+
+def _within(a: "numpy.ndarray", b: "numpy.ndarray", radius: float) -> "numpy.ndarray":
+    """Which rows of ``a`` lie within ``radius`` of some row of ``b``.
+
+    :param a: Points, shape ``(n, 3)``.
+    :param b: Points, shape ``(m, 3)``.
+    :param radius: Distance threshold, same unit as the points.
+    :return: Boolean mask, shape ``(n,)``.
+    """
+    import numpy as np
+
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros(len(a), dtype=bool)
+    from scipy.spatial import cKDTree
+
+    distance, _ = cKDTree(b).query(a, k=1, distance_upper_bound=radius * (1 + 1e-12))
+    return np.isfinite(distance)
+
+
+def _sub_auxmol(auxmol: "Mole", atoms: Sequence[int]) -> "Mole":
+    """The auxiliary ``Mole`` restricted to a subset of its atoms.
+
+    :param auxmol: The full auxiliary molecule.
+    :param atoms: Atom indices to keep, in the order they should appear.
+    :return: A built ``Mole`` with the same basis, ECP and effective nuclear
+        charges on those atoms.
+    """
+    gto, _ = _import_pyscf()
+
+    sub = gto.Mole()
+    sub.atom = [auxmol._atom[a] for a in atoms]
+    sub.basis = auxmol.basis
+    sub.ecp = auxmol.ecp
+    sub.unit = "Bohr"
+    sub.charge = 0
+    sub.spin = int(sum(auxmol.atom_charge(a) for a in atoms)) % 2
+    sub.verbose = 0
+    sub.build()
+    sub._atm[:, gto.mole.CHARGE_OF] = auxmol._atm[list(atoms), gto.mole.CHARGE_OF]
+    sub._atm[:, gto.mole.NUC_MOD_OF] = auxmol._atm[list(atoms), gto.mole.NUC_MOD_OF]
+    return sub
+
+
+def hirshfeld_correction_operator(
+    auxmol: "Mole",
+    own: Sequence[int],
+    partner: Sequence[int],
+    points_bohr: "numpy.ndarray",
+    ecp: Optional[str] = None,
+    *,
+    grid_level: int = 1,
+    overlap_radius: float = 6.0,
+    cell_radius: float = 10.0,
+    neighbour_radius: float = 7.0,
+    function_radius: float = 7.0,
+    weight_floor: float = 1e-10,
+    softcore: float = 0.05,
+    threads: Optional[int] = None,
+) -> "numpy.ndarray":
+    """
+    Geometry-only operator ``D`` of the Hirshfeld correction to fragment 0.
+
+    ``D[i, p] = sum_g w_g (w_own(r_g) - 1_own(i)) chi_i(r_g) / |r_p - r_g|`` on
+    the Becke quadrature cells of the atoms near the interface, so that the
+    electronic potential of fragment 0 under the Hirshfeld partition is
+    ``-(V * mask_0 + D)^T c`` and that of fragment 1 ``-(V * mask_1 - D)^T c``:
+    the two fragments still sum exactly to the total. Only grid points within
+    ``overlap_radius`` (Angstrom) of an atom of *each* fragment are integrated,
+    with the Becke weights, promolecular densities and auxiliary functions of
+    the cell's neighbourhood; the cost scales with the interface.
+
+    :param auxmol: Auxiliary molecule of the whole complex (effective nuclear
+        charges as :py:func:`build_auxiliary_molecule` sets them).
+    :param own: Atom indices of fragment 0.
+    :param partner: Atom indices of fragment 1 (together with ``own`` a
+        partition of the atoms).
+    :param points_bohr: Evaluation points, shape ``(n_points, 3)``, Bohr.
+    :param ecp: Effective core potential of the free atoms behind the
+        promolecular weights (``None``: all-electron below rubidium).
+    :param grid_level: PySCF grid level of the atomic quadratures; the
+        correction density is smooth (the partner's tails), level 1 is
+        accurate to about 1e-4 Ha.
+    :param overlap_radius: See above (Angstrom).
+    :param cell_radius: Cells of atoms within this distance (Angstrom) of the
+        other fragment are visited.
+    :param neighbour_radius: Atoms within this distance (Angstrom) of a cell's
+        atom define its Becke weight and promolecular densities.
+    :param function_radius: Auxiliary functions of atoms within this distance
+        (Angstrom) of a cell's atom are evaluated on it.
+    :param weight_floor: Grid points below this quadrature weight (Bohr^3) are
+        dropped.
+    :param softcore: Regularisation length (Bohr) of ``1/r`` between a grid
+        point and an evaluation point.
+    :param threads: Cells integrated concurrently; ``None`` uses up to eight.
+    :return: ``(naux, n_points)`` float64 array.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+
+    bohr_per_angstrom = 1.0 / 0.529177210903
+    gto, _ = _import_pyscf()
+    from pyscf import dft
+
+    n_atoms = auxmol.natm
+    in_own = np.zeros(n_atoms, dtype=bool)
+    in_own[list(own)] = True
+    in_partner = np.zeros(n_atoms, dtype=bool)
+    in_partner[list(partner)] = True
+    if in_own.sum() + in_partner.sum() != n_atoms or (in_own & in_partner).any():
+        raise ValueError("'own' and 'partner' must partition the atoms of the complex.")
+    centres = auxmol.atom_coords()
+    numbers = atomic_numbers_of(auxmol)
+    aoslice = auxmol.aoslice_by_atom()
+    points = np.asarray(points_bohr, dtype=float)
+    operator = np.zeros((auxmol.nao, len(points)))
+
+    cell_bohr = cell_radius * bohr_per_angstrom
+    candidate = np.zeros(n_atoms, dtype=bool)
+    candidate[in_own] = _within(centres[in_own], centres[in_partner], cell_bohr)
+    candidate[in_partner] = _within(centres[in_partner], centres[in_own], cell_bohr)
+    if not candidate.any():
+        return operator
+
+    grids = dft.gen_grid.Grids(auxmol)
+    grids.level = grid_level
+    atom_grids = grids.gen_atomic_grids(
+        auxmol, grids.atom_grid, grids.radi_method, grids.level, grids.prune
+    )
+    overlap_bohr = overlap_radius * bohr_per_angstrom
+    neighbour_bohr = neighbour_radius * bohr_per_angstrom
+    function_bohr = function_radius * bohr_per_angstrom
+    eps2 = softcore * softcore
+
+    def integrate_cell(
+        atom: int,
+    ) -> Optional[Tuple["numpy.ndarray", "numpy.ndarray"]]:
+        centre = centres[atom]
+        cell_points, volumes = atom_grids[auxmol.atom_symbol(int(atom))]
+        cell_points = cell_points + centre
+        neighbours = np.flatnonzero(_within(centres, centre[None, :], neighbour_bohr))
+        near_own = neighbours[in_own[neighbours]]
+        near_partner = neighbours[in_partner[neighbours]]
+        selected = _within(cell_points, centres[near_own], overlap_bohr)
+        selected &= _within(cell_points, centres[near_partner], overlap_bohr)
+        if not selected.any():
+            return None
+        cell_points = cell_points[selected]
+        weights = volumes[selected] * _becke_cell_weight(
+            cell_points,
+            centres[neighbours],
+            numbers[neighbours],
+            int(np.flatnonzero(neighbours == atom)[0]),
+        )
+        heavy = weights > weight_floor
+        cell_points = cell_points[heavy]
+        weights = weights[heavy]
+        if len(cell_points) == 0:
+            return None
+        functions = np.flatnonzero(_within(centres, centre[None, :], function_bohr))
+        columns = np.concatenate(
+            [np.arange(aoslice[f, 2], aoslice[f, 3]) for f in functions]
+        )
+        own_column = np.repeat(
+            in_own[functions], aoslice[functions, 3] - aoslice[functions, 2]
+        )
+        local = _sub_auxmol(auxmol, functions.tolist())
+        ao = local.eval_gto("GTOval", cell_points)  # (n_grid, n_local)
+        w_own = _hirshfeld_own_weight(
+            cell_points,
+            centres[neighbours],
+            numbers[neighbours],
+            in_own[neighbours],
+            ecp,
+        )
+        # Correction charge of every function at every grid point, then the
+        # kernel to the evaluation points.
+        charges = (
+            weights[:, None] * (w_own[:, None] - own_column[None, :].astype(float))
+        ) * ao
+        d2 = ((cell_points[:, None, :] - points[None, :, :]) ** 2).sum(-1)
+        kernel = 1.0 / np.sqrt(d2 + eps2)  # (n_grid, n_points)
+        return columns, charges.T @ kernel
+
+    workers = threads or min(8, os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for result in pool.map(integrate_cell, np.flatnonzero(candidate).tolist()):
+            if result is not None:
+                columns, block = result
+                operator[columns] += block
+    return operator
+
+
 def ec_pointwise_pieces(
     system: System,
     aux_basis: str,
     split: Union[int, Sequence[int], "numpy.ndarray"],
     displacement: Optional["numpy.ndarray"] = None,
     ecp: Optional[str] = None,
+    partition: str = "ri",
 ) -> Optional[Dict[str, Any]]:
     """The point-space ingredients of EC for one structure, before contraction.
 
@@ -1307,11 +1638,16 @@ def ec_pointwise_pieces(
         without the core electrons, so a full-``Z`` nucleus would leave every
         ECP atom bare by ``n_core / r``. ``None`` takes every atom as
         all-electron, with a warning when a def2-ECP element is present.
+    :param partition: ``"ri"`` (auxiliary-function ownership) or
+        ``"hirshfeld"`` (real-space, see
+        :py:func:`hirshfeld_correction_operator`).
     :return: ``None`` when the patch has fewer than
         :py:data:`EC_MIN_PATCH_POINTS` points; otherwise a dict with the ESP
         operator ``V[P, p]`` (naux x npoints), normalised area ``weights``,
-        the two fragments' ``nuclear`` potentials at the points, and the two
-        aux-function ownership ``masks``, all float64 numpy arrays.
+        the two fragments' ``nuclear`` potentials at the points, the two
+        aux-function ownership ``masks`` and, under ``"hirshfeld"``, the
+        ``correction`` operator ``D`` and the two fragment ``operators``
+        ``V * mask_f -+ D``; all float64 numpy arrays.
     """
     import numpy as np
 
@@ -1357,12 +1693,20 @@ def ec_pointwise_pieces(
         np.isin(owner, partner).astype(float),
     ]
 
-    return {
+    pieces: Dict[str, Any] = {
         "operator": operator,
         "weights": weights,
         "nuclear": nuclear,
         "masks": masks,
     }
+    if _check_ec_partition(partition) == "hirshfeld":
+        correction = hirshfeld_correction_operator(auxmol, own, partner, points, ecp)
+        pieces["correction"] = correction
+        pieces["operators"] = [
+            operator * masks[0][:, None] + correction,
+            operator * masks[1][:, None] - correction,
+        ]
+    return pieces
 
 
 def compute_ec_machinery(
@@ -1371,6 +1715,7 @@ def compute_ec_machinery(
     split: Union[int, Sequence[int], "numpy.ndarray"],
     displacement: Optional["numpy.ndarray"] = None,
     ecp: Optional[str] = None,
+    partition: str = "ri",
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Contract the EC patch evaluation into geometry-only per-structure tensors.
 
@@ -1386,17 +1731,31 @@ def compute_ec_machinery(
         ``None`` for the true placement.
     :param ecp: Effective core potential of the reference calculation, see
         :py:func:`ec_pointwise_pieces`.
-    :return: ``None`` when the structure has no usable patch; otherwise
-        ``(moments, vectors, constants)``: ``M = V K V^T`` of shape
-        ``(naux, naux)``; the rows ``t_0, t_1, mask_0, mask_1`` of shape
-        ``(4, naux)``; and ``s_fg = n_f^T K n_g`` of shape ``(2, 2)``. All
-        float64.
+    :param partition: ``"ri"`` or ``"hirshfeld"``, see
+        :py:func:`ec_pointwise_pieces`.
+    :return: ``None`` when the structure has no usable patch; otherwise three
+        float64 tensors. Under ``"ri"``: ``(moments, vectors, constants)``,
+        ``M = V K V^T`` of shape ``(naux, naux)``, the rows
+        ``t_0, t_1, mask_0, mask_1`` of shape ``(4, naux)``, and
+        ``s_fg = n_f^T K n_g`` of shape ``(2, 2)``. Under ``"hirshfeld"`` the
+        fragment operators differ, so the evaluation stays pointwise:
+        ``(operators, nuclear, weights)`` -- the two fragment operators stacked
+        as ``(2 naux, npoints)``, the nuclear potentials ``(2, npoints)`` and the
+        normalised area weights ``(1, npoints)``.
     """
     import numpy as np
 
-    pieces = ec_pointwise_pieces(system, aux_basis, split, displacement, ecp)
+    pieces = ec_pointwise_pieces(system, aux_basis, split, displacement, ecp, partition)
     if pieces is None:
         return None
+    if partition == "hirshfeld":
+        return (
+            torch.from_numpy(
+                np.ascontiguousarray(np.concatenate(pieces["operators"]))
+            ).to(torch.float64),
+            torch.from_numpy(np.stack(pieces["nuclear"])).to(torch.float64),
+            torch.from_numpy(pieces["weights"].reshape(1, -1)).to(torch.float64),
+        )
     operator, weights = pieces["operator"], pieces["weights"]
     n0, n1 = pieces["nuclear"]
 
@@ -1941,6 +2300,7 @@ def _batch_ec_machinery(
     splits: List[Any],
     displacements: Optional[List[Optional["numpy.ndarray"]]] = None,
     ecp: Optional[str] = None,
+    partition: str = "ri",
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """EC machinery for one batch, through the cache when ids are available.
 
@@ -1965,7 +2325,9 @@ def _batch_ec_machinery(
         an unaugmented batch.
     :param ecp: Effective core potential of the reference calculation; part of
         the cache key, since it changes the nuclear potentials.
-    :return: One ``(moments, vectors, constants)`` triple per system.
+    :param partition: Fragment partition, part of the cache key; see
+        :py:func:`compute_ec_machinery` for what the triple holds under each.
+    :return: One triple of tensors per system.
     """
     if system_ids is None:
         system_ids = [None] * len(systems)  # type: ignore[list-item]
@@ -1977,6 +2339,8 @@ def _batch_ec_machinery(
     # Appended only when set, so cache keys from before the option existed
     # stay byte-identical.
     ecp_tag = f"|ecp={ecp}" if ecp else ""
+    if _check_ec_partition(partition) != "ri":
+        ecp_tag += f"|partition={partition}"
     cache = _metric_matrix_cache()
     machinery = []
     for system, system_id, split, shift in zip(
@@ -1995,7 +2359,7 @@ def _batch_ec_machinery(
         if all(tensor is not None for tensor in cached):
             machinery.append((cached[0], cached[1], cached[2]))
             continue
-        entry = compute_ec_machinery(system, aux_basis, split, shift, ecp)
+        entry = compute_ec_machinery(system, aux_basis, split, shift, ecp, partition)
         if entry is None:
             entry = _EC_NO_PATCH
         if cacheable:
@@ -2206,6 +2570,7 @@ def _ec_machinery_transform(
     target_to_aux_basis: Mapping[str, str],
     jitter: float,
     ecp: Optional[str],
+    partition: str,
     systems: List[System],
     targets: Dict[str, TensorMap],
     extra: Dict[str, TensorMap],
@@ -2221,7 +2586,7 @@ def _ec_machinery_transform(
         share_key = f"{aux_basis}|{[_ec_split_tag(s) for s in splits]}"
         if share_key not in packed_by_basis:
             machinery = _batch_ec_machinery(
-                systems, system_ids, aux_basis, splits, shifts, ecp
+                systems, system_ids, aux_basis, splits, shifts, ecp, partition
             )
             packed_by_basis[share_key] = [
                 pack_metric_matrices([entry[i] for entry in machinery])
@@ -2240,6 +2605,7 @@ def get_ec_machinery_transform(
     target_to_aux_basis: Mapping[str, str],
     jitter: float = 0.0,
     ecp: Optional[str] = None,
+    partition: str = "ri",
 ) -> Callable:
     """
     Build a collate transform attaching per-target EC machinery.
@@ -2269,10 +2635,16 @@ def get_ec_machinery_transform(
     :param ecp: Effective core potential of the reference calculation, see
         :py:func:`ec_pointwise_pieces`. ``None`` treats every atom as
         all-electron.
+    :param partition: Fragment partition of the EC losses, ``"ri"`` or
+        ``"hirshfeld"`` (see :py:func:`hirshfeld_correction_operator`).
     :return: A collate transform.
     """
     return functools.partial(
-        _ec_machinery_transform, dict(target_to_aux_basis), float(jitter), ecp
+        _ec_machinery_transform,
+        dict(target_to_aux_basis),
+        float(jitter),
+        ecp,
+        _check_ec_partition(partition),
     )
 
 
