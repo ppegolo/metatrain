@@ -31,15 +31,52 @@ Fixed
   ``empirical_crps_ensemble``) now work for targets with components, such as
   ``non_conservative_force``, instead of failing when the mean and variance
   blocks are built.
+- PET now symmetrizes and divides by the cell volume the predictions of
+  ``non_conservative_stress/<variant>`` targets, as it already did for
+  ``non_conservative_stress``.
+- ``MemmapDataset`` can now load generic targets with a variant (e.g.
+  ``non_conservative_stress/<variant>``), instead of failing with
+  ``'<name>/<variant>' is not a valid label name``.
+- Dataset merging and training restarts now accept equivalent unit spellings
+  such as ``A`` and ``angstrom`` or ``eV/A^3`` and
+  ``eV/angstrom^3``, avoiding false unit incompatibility errors.
+- PET attention now excludes keys with a zero cutoff factor with ``-inf`` instead of
+  penalising them with ``log(1e-15)``.
+- SPACE now creates the property labels of the ``feature`` output on the device of the
+  systems.
+- Continuing training from a SPACE checkpoint fine-tuned with ``inherit_heads`` no
+  longer copies the inherited weights again.
+- SPACE's per-block validation errors (``log_separate_blocks``) are now correct for
+  atomic-basis targets.
+- LLPR uncertainties of SPACE models trained on several targets are now correct.
+- LLPR uncertainties and ensembles of per-atom targets now include the scales of each
+  atomic type, instead of using the same scale for all of them.
+- Training with rotational augmentation no longer fails on targets split by atomic
+  type when some batches have no atomic type in common.
 
 Added
 #####
 
+- SPACE models can now be fine-tuned on targets they were not trained on, optionally
+  initializing the new heads from existing ones with ``inherit_heads``.
+- Added ``experimental.lorem`` architecture (*Learning Long-Range
+  Representations with Equivariant Messages*, https://arxiv.org/abs/2507.19382).
+- LLPR uncertainties and ensembles for targets with several blocks, such as spherical
+  targets and targets in an atomic basis, and for SPACE and MACE.
+- Ensemble losses for targets with several blocks.
+
 Changed
 #######
 
+- LLPR calibrates one factor for each property of each block of the targets.
+- The last-layer features of MACE and SPACE have the keys and components of their
+  target.
+
 Removed
 #######
+
+- SOAP-BPNN no longer exposes last-layer features for its spherical and Cartesian
+  targets, so LLPR is not available for them.
 
 Version 2026.4.1 - 2026-09-25
 -----------------------------
