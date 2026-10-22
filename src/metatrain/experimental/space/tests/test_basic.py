@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 import torch
-from metatomic.torch import System
+from metatomic.torch import ModelOutput, System
 
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import DatasetInfo
@@ -38,6 +38,7 @@ class TestInput(InputTests, SPACETests): ...
 class TestOutput(OutputTests, SPACETests):
     is_equivariant_reflections = False
     equivariance_error_tolerance = 1e-4  # due to many layers in the default hypers
+    supports_spherical_atomic_basis_outputs = False
     supports_spherical_rank2_outputs = False
 
     @pytest.fixture
@@ -79,7 +80,7 @@ class TestTorchscript(TorchscriptTests, SPACETests):
         model = torch.jit.script(model)
         model(
             [system],
-            model.outputs,
+            {name: ModelOutput(sample_kind="atom") for name in model.outputs},
         )
 
     def test_torchscript_save_load(
@@ -143,7 +144,7 @@ class TestTorchscript(TorchscriptTests, SPACETests):
         model = torch.jit.script(model)
         model(
             [system],
-            model.outputs,
+            {name: ModelOutput(sample_kind="atom") for name in model.outputs},
         )
 
     def test_torchscript_dtypechange(

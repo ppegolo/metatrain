@@ -1,5 +1,7 @@
 import torch
 
+from metatrain.utils.io import _ckpt_from_arch_ckpt
+
 
 def model_update_v1_v2(checkpoint: dict) -> None:
     """
@@ -90,6 +92,79 @@ def model_update_v3_v4(checkpoint: dict) -> None:
         else:
             new_state_dict[key] = value
     checkpoint["model_state_dict"] = new_state_dict
+
+
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update a v4 checkpoint to v5.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["wrapped_model_checkpoint"] = _ckpt_from_arch_ckpt(
+        checkpoint["wrapped_model_checkpoint"]
+    )
+
+
+def model_update_v5_v6(checkpoint: dict) -> None:
+    """
+    Update a v5 checkpoint to v6.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # added _mts_helper and _extra_state buffers
+    state_dict = checkpoint["model_state_dict"]
+    reference = next(iter(state_dict.values()))
+    empty_tensor = torch.zeros(0, dtype=reference.dtype, device=reference.device)
+    state_dict["_mts_helper"] = empty_tensor
+    state_dict["_extra_state"] = {}
+
+
+def model_update_v6_v7(checkpoint: dict) -> None:
+    """
+    Update a v6 checkpoint to v7.
+
+    The LLPR state of each target moves under ``targets.<name>``, with one covariance
+    for each block of features, one multiplier for each property of each block of the
+    target, and one ensemble layer for each block. The ensemble weights no longer
+    include the multipliers, which are applied to the deviations of the members
+    instead.
+
+    :param checkpoint: The checkpoint to update.
+    """
+
+    def uncertainty_name(name: str) -> str:
+        if name == "energy":
+            return "energy_uncertainty"
+        return f"mtt::aux::{name.replace('mtt::', '')}_uncertainty"
+
+    dataset_info = checkpoint["wrapped_model_checkpoint"]["dataset_info"]
+    targets = {uncertainty_name(name): name for name in dataset_info.targets}
+    for state_dict_name in ("model_state_dict", "best_model_state_dict"):
+        state_dict = checkpoint[state_dict_name]
+        if state_dict is None:
+            continue
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("covariance_") or key.startswith("cholesky_"):
+                kind, name = key.split("_", 1)
+                prefix = f"targets.{targets[name]}.covariances.0"
+                new_state_dict[f"{prefix}.{kind}"] = value
+            elif key.startswith("multiplier_"):
+                name = targets[key[len("multiplier_") :]]
+                layout = dataset_info.targets[name].layout
+                num_properties = sum(len(block.properties) for block in layout.blocks())
+                new_state_dict[f"targets.{name}.multipliers"] = value.expand(
+                    num_properties
+                ).clone()
+            elif key.startswith("llpr_ensemble_layers."):
+                name, parameter = key[len("llpr_ensemble_layers.") :].rsplit(".", 1)
+                multiplier = state_dict[f"multiplier_{uncertainty_name(name)}"]
+                new_state_dict[f"targets.{name}.ensemble_layers.0.{parameter}"] = (
+                    value / multiplier
+                )
+            else:
+                new_state_dict[key] = value
+        checkpoint[state_dict_name] = new_state_dict
 
 
 def trainer_update_v1_v2(checkpoint: dict) -> None:

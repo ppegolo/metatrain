@@ -34,11 +34,14 @@ class PETTests(ArchitectureTests):
 
 
 class TestInput(InputTests, PETTests):
-    def test_zbl_is_an_additive_model(self, minimal_model_hypers, dataset_info):
+    def test_zbl_is_an_additive_model(
+        self, minimal_model_hypers, dataset_info, default_hypers
+    ):
         """Asking for ZBL attaches a ZBL additive model over the dataset types."""
         hypers = copy.deepcopy(minimal_model_hypers)
         hypers["zbl"] = True
-        model = self.model_cls(hypers, dataset_info)
+        trainer = self.trainer_cls(default_hypers["training"])
+        model = trainer.setup(hypers, dataset_info)
 
         zbl_models = [m for m in model.additive_models if isinstance(m, ZBL)]
         assert len(zbl_models) == 1
@@ -48,6 +51,9 @@ class TestInput(InputTests, PETTests):
 class TestOutput(OutputTests, PETTests):
     is_equivariant_rotations = False
     is_equivariant_reflections = False
+    # the bias of the edge last layers is summed over the neighbors with the cutoff
+    # factors, so it adds a different offset to each atom
+    last_layer_features_are_affine = False
 
     @pytest.fixture
     def n_features(self, model_hypers):

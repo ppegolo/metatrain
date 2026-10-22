@@ -44,7 +44,7 @@ from metatrain.utils.data.target_info import (
     get_generic_target_info,
 )
 from metatrain.utils.external_naming import to_external_name
-from metatrain.utils.units import get_gradient_units
+from metatrain.utils.units import get_gradient_units, units_are_equivalent
 
 
 def _set(values: List[int]) -> List[int]:
@@ -164,7 +164,7 @@ class DatasetInfo:
         if not isinstance(other, DatasetInfo):
             return False
         return (
-            self.length_unit == other.length_unit
+            units_are_equivalent(unit=self.length_unit, other_unit=other.length_unit)
             and self._atomic_types == other._atomic_types
             and self.targets == other.targets
             and self.extra_data == other.extra_data
@@ -186,9 +186,9 @@ class DatasetInfo:
         """Update this instance with the union of itself and ``other``.
 
         :param other: Another :py:class:`DatasetInfo` instance to update this one with.
-        :raises ValueError: If the ``length_units`` are different.
+        :raises ValueError: If the ``length_units`` are not equivalent.
         """
-        if self.length_unit != other.length_unit:
+        if not units_are_equivalent(self.length_unit, other.length_unit):
             raise ValueError(
                 "Can't update DatasetInfo with a different `length_unit`: "
                 f"('{self.length_unit}' != '{other.length_unit}')"
@@ -244,6 +244,18 @@ class DatasetInfo:
         self._atomic_types = state["_atomic_types"]
         self.targets = state["targets"]
         self.extra_data = state.get("extra_data", {})
+
+
+# When a TorchScript model containing a ``DatasetInfo`` attribute is loaded in a fresh
+# process, converting the attribute back to a Python object requires the class to be
+# scripted in this process (PyTorch looks it up in the current process' Python
+# compilation unit, not in the unit deserialized from the model file). Scripting it
+# here at import time registers it under the same qualified name and avoids an
+# internal assert during e.g. ``model.to(device)`` on the loaded model.
+#
+# This is a temporary workaround that can go away as we remove the fallback
+# legacy code in metatensor-torch (which needs to iterate over all fields in a module)
+_ = torch.jit.script(DatasetInfo)
 
 
 def get_stats(dataset: Union[Dataset, Subset], dataset_info: DatasetInfo) -> str:
@@ -1576,7 +1588,10 @@ class MemmapDataset(TorchDataset):
                 samples=samples,
                 components=components,
                 properties=Labels.range(
-                    "energy" if is_energy else target_key.replace("mtt::", ""),
+                    # remove variant and/or mtt:: prefix, as in get_generic_target_info
+                    "energy"
+                    if is_energy
+                    else target_key.split("/")[0].replace("mtt::", ""),
                     target_array.shape[-1],
                 ),
             )
