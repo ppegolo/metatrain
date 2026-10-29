@@ -6,7 +6,19 @@ import sys
 import warnings
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -44,7 +56,13 @@ from metatrain.utils.data.target_info import (
     get_generic_target_info,
 )
 from metatrain.utils.external_naming import to_external_name
-from metatrain.utils.units import get_gradient_units
+from metatrain.utils.units import get_gradient_units, units_are_equivalent
+
+
+CollateTransform: TypeAlias = Callable[
+    [List[System], Dict[str, TensorMap], Dict[str, TensorMap]],
+    Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]],
+]
 
 
 def _set(values: List[int]) -> List[int]:
@@ -164,7 +182,7 @@ class DatasetInfo:
         if not isinstance(other, DatasetInfo):
             return False
         return (
-            self.length_unit == other.length_unit
+            units_are_equivalent(unit=self.length_unit, other_unit=other.length_unit)
             and self._atomic_types == other._atomic_types
             and self.targets == other.targets
             and self.extra_data == other.extra_data
@@ -186,9 +204,9 @@ class DatasetInfo:
         """Update this instance with the union of itself and ``other``.
 
         :param other: Another :py:class:`DatasetInfo` instance to update this one with.
-        :raises ValueError: If the ``length_units`` are different.
+        :raises ValueError: If the ``length_units`` are not equivalent.
         """
-        if self.length_unit != other.length_unit:
+        if not units_are_equivalent(self.length_unit, other.length_unit):
             raise ValueError(
                 "Can't update DatasetInfo with a different `length_unit`: "
                 f"('{self.length_unit}' != '{other.length_unit}')"
@@ -244,6 +262,18 @@ class DatasetInfo:
         self._atomic_types = state["_atomic_types"]
         self.targets = state["targets"]
         self.extra_data = state.get("extra_data", {})
+
+
+# When a TorchScript model containing a ``DatasetInfo`` attribute is loaded in a fresh
+# process, converting the attribute back to a Python object requires the class to be
+# scripted in this process (PyTorch looks it up in the current process' Python
+# compilation unit, not in the unit deserialized from the model file). Scripting it
+# here at import time registers it under the same qualified name and avoids an
+# internal assert during e.g. ``model.to(device)`` on the loaded model.
+#
+# This is a temporary workaround that can go away as we remove the fallback
+# legacy code in metatensor-torch (which needs to iterate over all fields in a module)
+_ = torch.jit.script(DatasetInfo)
 
 
 def get_stats(dataset: Union[Dataset, Subset], dataset_info: DatasetInfo) -> str:
@@ -382,11 +412,13 @@ class CollateFn:
     def __init__(
         self,
         target_keys: List[str],
-        callables: Optional[List[Callable]] = None,
+        callables: Optional[List[CollateTransform]] = None,
         join_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.target_keys: Set[str] = set(target_keys)
-        self.callables: List[Callable] = callables if callables is not None else []
+        self.callables: List[CollateTransform] = (
+            callables if callables is not None else []
+        )
         self.join_kwargs: Dict[str, Any] = join_kwargs or {"different_keys": "union"}
 
     def __call__(
@@ -554,10 +586,10 @@ def check_datasets(train_datasets: List[Dataset], val_datasets: List[Dataset]) -
 
 
 def _train_test_random_split(
-    train_dataset: Dataset,
+    train_dataset: Union[Dataset, "DiskDataset", "MemmapDataset", Subset],
     train_size: float,
     test_size: float,
-) -> List[Dataset]:
+) -> List[Subset]:
     if train_size <= 0:
         raise ValueError("Fraction of the train set is smaller or equal to 0!")
 
@@ -689,8 +721,8 @@ def _scan_members(zip_file: SmartZip, path: Union[str, Path]) -> _MemberScan:
     :return: The classification.
     """
     n_members = len(zip_file)
-    entries = np.full(n_members, -1, dtype=np.int64)
-    field_ids = np.full(n_members, -1, dtype=np.int64)
+    entries: np.ndarray = np.full(n_members, -1, dtype=np.int64)
+    field_ids: np.ndarray = np.full(n_members, -1, dtype=np.int64)
     field_id_by_name: Dict[str, int] = {}
     ignored_names: List[str] = []
     has_atom_counts = False
@@ -771,7 +803,7 @@ def _validate_format(scan: _MemberScan, path: Union[str, Path]) -> int:
     n_samples = len(entry_numbers)
 
     # Every entry must carry the same fields ("homogeneous" format).
-    present = np.zeros((n_samples, len(scan.field_id_by_name)), dtype=bool)
+    present: np.ndarray = np.zeros((n_samples, len(scan.field_id_by_name)), dtype=bool)
     for field_id in scan.field_id_by_name.values():
         # entries are the dense range 0..N-1, so they index rows directly
         mask = (scan.field_ids == field_id) & (scan.entries < n_samples)
@@ -1245,13 +1277,16 @@ class MemmapArray:
         path: Union[str, Path],
         shape: Tuple[int, ...],
         dtype: Union[str, np.dtype],
-        mode: str = "r",
+        mode: Literal[
+            "r", "c", "r+", "w+", "readonly", "copyonwrite", "readwrite", "write"
+        ] = "r",
     ) -> None:
         self.path = str(path)
         self.shape = tuple(shape)
         self.dtype = np.dtype(dtype)
         self.mode = mode
-        self._mm = None
+        # NumPy's private `_mmap` handle is not part of its annotated interface.
+        self._mm: Any = None
 
     def _ensure_open(self) -> None:
         if self._mm is None:
@@ -1261,7 +1296,7 @@ class MemmapArray:
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         self._ensure_open()
-        return self._mm[idx]  # type: ignore
+        return self._mm[idx]
 
     def close(self) -> None:
         if self._mm is not None:
@@ -1576,7 +1611,10 @@ class MemmapDataset(TorchDataset):
                 samples=samples,
                 components=components,
                 properties=Labels.range(
-                    "energy" if is_energy else target_key.replace("mtt::", ""),
+                    # remove variant and/or mtt:: prefix, as in get_generic_target_info
+                    "energy"
+                    if is_energy
+                    else target_key.split("/")[0].replace("mtt::", ""),
                     target_array.shape[-1],
                 ),
             )
