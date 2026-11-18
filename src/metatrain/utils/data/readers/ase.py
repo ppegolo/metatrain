@@ -84,6 +84,65 @@ def read_systems(filename: str) -> List[System]:
             )
             system.add_data("momenta", momenta)
 
+    if "time_lag" in ase_atoms[0].info:
+        for system, atoms in zip(systems, ase_atoms, strict=False):
+            time_lag = TensorMap(
+                keys=Labels(["_"], torch.tensor([[0]])),
+                blocks=[
+                    TensorBlock(
+                        values=torch.tensor(
+                            atoms.info["time_lag"], dtype=torch.float64
+                        ).reshape(1, 1),
+                        samples=Labels(["system"], torch.tensor([[0]])),
+                        components=[],
+                        properties=Labels("time_lag", torch.tensor([[0]])),
+                    )
+                ],
+            )
+            system.add_data("mtt::time_lag", time_lag)
+
+    # GLE-Kalman windowed data: per-atom (N, 3L) momentum/force sequences + dt.
+    # Additive and guarded -> invisible to architectures whose data lacks them.
+    for name in ("momenta_seq", "forces_seq"):
+        if name in ase_atoms[0].arrays:
+            for system, atoms in zip(systems, ase_atoms, strict=False):
+                arr = torch.tensor(atoms.arrays[name], dtype=torch.float64)  # (N, 3L) frame-major
+                n_at = arr.shape[0]
+                Lw = arr.shape[1] // 3
+                # -> (N, 3, L): xyz as a vector component (rotates correctly under
+                # RotationalAugmenter), the L window steps as properties.
+                vals = arr.reshape(n_at, Lw, 3).transpose(1, 2).contiguous()
+                seq = TensorMap(
+                    keys=Labels(["_"], torch.tensor([[0]])),
+                    blocks=[
+                        TensorBlock(
+                            values=vals,  # (N, 3, L)
+                            samples=Labels(
+                                ["system", "atom"],
+                                torch.tensor([[0, a] for a in range(n_at)]),
+                            ),
+                            components=[Labels(["xyz"], torch.arange(3).reshape(-1, 1))],
+                            properties=Labels(name, torch.arange(Lw).reshape(-1, 1)),
+                        )
+                    ],
+                )
+                system.add_data("mtt::" + name, seq)
+
+    if "dt_fs" in ase_atoms[0].info:
+        for system, atoms in zip(systems, ase_atoms, strict=False):
+            dt = TensorMap(
+                keys=Labels(["_"], torch.tensor([[0]])),
+                blocks=[
+                    TensorBlock(
+                        values=torch.tensor(atoms.info["dt_fs"], dtype=torch.float64).reshape(1, 1),
+                        samples=Labels(["system"], torch.tensor([[0]])),
+                        components=[],
+                        properties=Labels("dt_fs", torch.tensor([[0]])),
+                    )
+                ],
+            )
+            system.add_data("mtt::dt", dt)
+
     return systems
 
 
