@@ -29,7 +29,8 @@ losses; ``W_blocks`` holds the antisymmetric coupling ``Omega`` carries.
 #
 #   samples    = (system, atom)
 #   components = two Cartesian axes, [3, 3]
-#   properties = the diagonal block index, n_blocks (and n_aux for W_blocks)
+#   properties = the diagonal block index, n_blocks (and n_coupling for
+#                W_blocks)
 #
 # and *not* a single flat 3(n+1) x 3(n+1) Cartesian object.  The channel index
 # (p, s^1, ..., s^n) is not a spatial axis: flattening it into the Cartesian
@@ -142,10 +143,11 @@ class GLEDriftModel(torch.nn.Module):
             lists already attached.
         :param bonds: Optional per-system ``[B, 2]`` tensors of bonded atom
             pairs, required when the head uses more than one neighbor class.
-        :return: ``L_blocks`` of shape ``[n_atoms, n + 1, n + 1, 3, 3]``,
-            ``W_blocks`` of shape ``[n_atoms, n, 3, 3]`` and
-            ``A = L L^T + Omega`` of shape ``[n_atoms, 3(n+1), 3(n+1)]``, with
-            the atoms of all systems concatenated.
+        :return: ``L_blocks`` of shape ``[n_atoms, C, C, 3, 3]``, ``W_blocks``
+            of shape ``[n_atoms, n_coupling, 3, 3]``, ``pair_frequencies`` of
+            shape ``[n_atoms, n_pairs]`` and ``A = L L^T + Omega`` of shape
+            ``[n_atoms, 3C, 3C]`` with ``C = n_aux_total + 1``, the atoms of
+            all systems concatenated.
         """
         if self.config.n_classes > 1 and bonds is None:
             raise ValueError(

@@ -1,0 +1,79 @@
+# NEP energy model (a regular GPUMD potential): energies, forces and virials.
+#
+#   mtt train options-nep-energy.yaml
+#
+# The trained model is written to `model.ckpt` / `model.pt`; to get a
+# GPUMD-compatible potential out of it:
+#
+#   from metatrain.utils.io import load_model
+#   load_model("model.ckpt").export_nep("nep.txt")
+#
+seed: 42
+# NEP is trained in float64 in GPUMD; float32 also works and is faster.
+base_precision: 64
+
+architecture:
+  name: experimental.nep
+  model:
+    # `model_type: 0` (the default) predicts energies. The elements are taken
+    # from the dataset, not set here.
+    model_type: 0
+    # 4: one network per element (recommended), 3: one shared network,
+    # 5: as 4, with a per-element bias that makes the composition fold on
+    # export exact for multi-element models.
+    version: 4
+    cutoff_radial: 6.0
+    cutoff_angular: 4.0
+    n_max_radial: 4
+    n_max_angular: 4
+    basis_size_radial: 8
+    basis_size_angular: 8
+    l_max_3body: 4
+    l_max_4body: 2
+    l_max_5body: 0
+    neurons: 30
+    # Short-range repulsion, in angstrom. Useful when the training set has no
+    # close contacts but the simulations will (high temperature, cascades).
+    # zbl_outer_cutoff: 2.0
+  training:
+    batch_size: 8
+    num_epochs: 200
+    learning_rate: 0.001
+    log_interval: 5
+    # Reduce the learning rate when the validation loss stops improving.
+    scheduler_patience: 50
+    scheduler_factor: 0.8
+    loss:
+      energy:
+        weight: 1.0
+        gradients:
+          # GPUMD's default weights are 1.0 for energies and forces, 0.1 for
+          # virials.
+          positions:
+            weight: 1.0
+          strain:
+            weight: 0.1
+    # Uncomment to continue from an existing metatrain checkpoint. Lower the
+    # learning rate when doing so: at the default, the first epoch will
+    # noticeably degrade an already converged potential before anything is
+    # logged.
+    # finetune:
+    #   read_from: model.ckpt
+
+training_set:
+  systems:
+    read_from: nep_e2e/carbon_reduced_100.xyz
+    length_unit: angstrom
+  targets:
+    energy:
+      key: energy
+      unit: eV
+      forces:
+        key: force
+      # `virial` and `stress` are mutually exclusive; both are read from
+      # `info` and turned into the same strain gradients internally.
+      virial:
+        key: virial
+
+test_set: 0.1
+validation_set: 0.1

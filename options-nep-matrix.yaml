@@ -1,0 +1,69 @@
+# NEP tensorial model: a per-atom symmetric 3x3 matrix (polarizability).
+#
+#   mtt train options-nep-polarizability.yaml
+#
+# The dataset must carry, for every atom, the 9 components of the matrix in
+# an extxyz per-atom array (row-major, so xx xy xz yx yy yz zx zy zz):
+#
+#   Properties=species:S:1:pos:R:3:polarizability:R:9
+#
+# This is GPUMD's `atomic_v` training data. For per-structure matrices
+# instead, put the 9 components in `info` and use `sample_kind: system`.
+#
+# Export to GPUMD as usual; the file is a regular `nep4_polarizability`
+# potential, readable by GPUMD, NEP_CPU and calorine:
+#
+#   from metatrain.utils.io import load_model
+#   load_model("model.ckpt").export_nep("nep.txt")
+#
+seed: 42
+base_precision: 64
+
+architecture:
+  name: experimental.nep
+  model:
+    # 1: dipole, a Cartesian vector (`rank: 1` below);
+    # 2: polarizability, a Cartesian rank-2 matrix.
+    model_type: 2
+    # Tensorial models are always NEP4, and support neither ZBL nor
+    # NEP-Charge. A polarizability carries a second network for the
+    # isotropic part, so it has twice the network parameters of an energy
+    # model with the same hyperparameters.
+    version: 4
+    cutoff_radial: 6.0
+    cutoff_angular: 4.0
+    n_max_radial: 4
+    n_max_angular: 4
+    neurons: 30
+  training:
+    batch_size: 4
+    num_epochs: 200
+    learning_rate: 0.01
+    log_interval: 5
+    # Required here: a per-atom target is normalised with one scale per
+    # element, and the single global bias of the isotropic network cannot
+    # absorb scales that differ per element. Leaving this at its default
+    # trains fine but makes `export_nep` refuse, rather than write a
+    # potential that disagrees with the model.
+    scale_targets: false
+
+training_set:
+  systems:
+    read_from: data.xyz
+    length_unit: angstrom
+  targets:
+    # Tensorial targets are not "energy", so they need the `mtt::` prefix
+    # and an explicit `type`, `quantity` and `unit`.
+    mtt::polarizability:
+      read_from: data.xyz
+      key: polarizability
+      quantity: ""
+      unit: ""
+      type:
+        cartesian:
+          rank: 2
+      sample_kind: atom
+      num_subtargets: 1
+
+test_set: 0.2
+validation_set: 0.2

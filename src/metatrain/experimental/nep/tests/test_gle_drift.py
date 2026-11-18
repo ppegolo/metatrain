@@ -5,8 +5,9 @@ These define what "done" means for the head: the block structure of
 channels), positive-semidefiniteness of ``Sym(A) = L L^T`` -- *not* of ``A``,
 which is no longer symmetric -- exact-by-construction equivariance under the
 full O(3) (improper rotations included) and under permutations, smoothness
-across the cutoff, the log-spaced initialisation of the auxiliary rates, and
-the ``markovian_block`` physics switch.
+across the cutoff, the log-spaced initialisation of the auxiliary rates, the
+``markovian_block`` physics switch, and the oscillatory-pair channels
+(``n_pairs > 0``, ``Omega_ss != 0``).
 """
 
 import copy
@@ -425,3 +426,145 @@ def test_trains_without_nans(dtype):
     assert torch.all(torch.isfinite(final["L_blocks"]))
     assert torch.all(torch.isfinite(final["W_blocks"]))
     assert torch.all(torch.isfinite(final["A"]))
+
+
+# --------------------------------------------------------------------------
+# oscillatory auxiliary pairs
+#
+# `glecg.tests.test_gle` holds the statements about the *kernel* the pairs
+# produce; these are the statements about the head that emits them.
+# --------------------------------------------------------------------------
+
+
+def _pair_config(n_aux=2, n_pairs=1, **overrides):
+    return GLEDriftConfig(n_aux=n_aux, n_pairs=n_pairs, n_classes=1, **overrides)
+
+
+def test_pair_layout_and_structure():
+    """Pairs widen the channel space and add ``Omega_ss``, and nothing else.
+
+    ``L`` stays block diagonal over the wider channel space, ``Sym(A)`` stays
+    exactly ``L L^T`` -- the pointwise FDT is untouched by an antisymmetric
+    addition -- and the only new entries of ``Omega`` are the intra-pair
+    rotations, which sit strictly inside the auxiliary block and pair the two
+    members of each pair with nothing else.
+    """
+    config = _pair_config(n_aux=2, n_pairs=2)
+    model = _excite(_model(config=config))
+    outputs = _run(model, _system(_positions()))
+
+    channels = config.n_channels
+    assert config.n_aux_total == 6 and channels == 7
+    assert outputs["L_blocks"].shape == (6, channels, channels, 3, 3)
+    assert outputs["W_blocks"].shape == (6, config.n_coupling, 3, 3)
+    assert outputs["pair_frequencies"].shape == (6, config.n_pairs)
+    assert outputs["A"].shape == (6, 3 * channels, 3 * channels)
+
+    blocks = outputs["L_blocks"].detach()
+    off_diagonal = ~torch.eye(channels, dtype=torch.bool)
+    assert torch.all(blocks[:, off_diagonal] == 0.0)
+
+    a_matrix = outputs["A"].detach()
+    symmetric = 0.5 * (a_matrix + a_matrix.transpose(-1, -2))
+    factor = blocks.permute(0, 1, 3, 2, 4).reshape(6, 3 * channels, 3 * channels)
+    assert torch.allclose(symmetric, factor @ factor.transpose(-1, -2), atol=1e-12)
+    assert torch.all(torch.linalg.eigvalsh(symmetric) >= -1e-10)
+    assert float(torch.linalg.eigvals(a_matrix).real.min()) > -1e-10
+
+    omega = omega_matrix(
+        outputs["W_blocks"].detach(), outputs["pair_frequencies"].detach()
+    )
+    assert torch.allclose(
+        a_matrix - a_matrix.transpose(-1, -2), 2.0 * omega, atol=1e-12
+    )
+    assert torch.allclose(omega, -omega.transpose(-1, -2), atol=1e-14)
+
+    # Omega_ss holds exactly the intra-pair rotations: one 3x3 multiple of the
+    # identity per pair, and zero everywhere else in the auxiliary block
+    aux = omega[:, 3:, 3:]
+    identity = torch.eye(3, dtype=aux.dtype)
+    expected = torch.zeros_like(aux)
+    for index in range(config.n_pairs):
+        first, second = config.pair_channels(index)
+        rows = slice(3 * first, 3 * first + 3)
+        columns = slice(3 * second, 3 * second + 3)
+        rotation = outputs["pair_frequencies"].detach()[:, index].reshape(-1, 1, 1)
+        expected[:, rows, columns] = rotation * identity
+        expected[:, columns, rows] = -rotation * identity
+    assert torch.allclose(aux, expected, atol=1e-14)
+    assert float(aux.abs().max()) > 1e-2
+
+
+def test_pair_couplings_reach_only_the_plus_member():
+    """``W^- = 0``, structurally: the ``-`` member has no coupling slot at all.
+
+    This is what makes ``K(t) = K(t)^T`` hold at every lag rather than at the
+    parameter values where a penalty happens to be satisfied; see
+    ``glecg/docs/oscillatory_channels.md`` §3.
+    """
+    config = _pair_config(n_aux=1, n_pairs=2)
+    model = _excite(_model(config=config))
+    outputs = _run(model, _system(_positions()))
+
+    row = outputs["A"].detach()[:, :3, 3:].reshape(6, 3, config.n_aux_total, 3)
+    for index in range(config.n_pairs):
+        _, minus = config.pair_channels(index)
+        assert torch.all(row[:, :, minus] == 0.0)
+    # ... while the coupled members are not silently zero too
+    assert float(row.abs().max()) > 1e-2
+
+
+def test_pair_frequencies_are_invariant_scalars():
+    """``omega_c`` multiplies the Cartesian identity, so it is an O(3) scalar."""
+    model = _excite(_model(config=_pair_config()))
+    positions = _positions()
+    reference = _run(model, _system(positions))["pair_frequencies"].detach()
+    for improper in (False, True):
+        rotation = _orthogonal(seed=5, improper=improper)
+        rotated = _run(model, _system(positions @ rotation.T))
+        assert torch.allclose(
+            rotated["pair_frequencies"].detach(), reference, atol=1e-12
+        )
+
+
+def test_initial_frequencies_are_nonzero_and_log_spaced():
+    """``omega = 0`` is a stationary point, so no pair may be initialised there.
+
+    ``K`` depends on ``omega`` only through ``omega^2``
+    (``docs/oscillatory_channels.md`` §4), so a pair started at zero frequency
+    receives no gradient in it and stays monotone for the whole fit.  The bias
+    initialisation therefore places the frequencies log-spaced over
+    ``[omega_min, omega_max]``, and a single pair lands at the geometric mean
+    rather than at the left endpoint.
+    """
+    config = _pair_config(n_aux=0, n_pairs=3, omega_min=0.5, omega_max=50.0)
+    model = _model(config=config)
+    outputs = _run(model, _system(_positions()))
+    frequencies = outputs["pair_frequencies"].detach()[0]
+    # `rtol`, not exact: the output biases carry the initialisation, but the
+    # small random output weights perturb it at the 1e-3 level
+    assert torch.allclose(
+        frequencies, torch.tensor([0.5, 5.0, 50.0], dtype=frequencies.dtype), rtol=1e-2
+    )
+
+    single = _model(
+        config=_pair_config(n_aux=0, n_pairs=1, omega_min=1.0, omega_max=100.0)
+    )
+    value = _run(single, _system(_positions()))["pair_frequencies"].detach()[0, 0]
+    assert math.isclose(float(value), 10.0, rel_tol=1e-2)
+
+
+def test_pair_config_rejects_a_zero_frequency_range():
+    with pytest.raises(ValueError, match="omega_min"):
+        GLEDriftConfig(n_pairs=1, omega_min=0.0)
+    with pytest.raises(ValueError, match="at least one auxiliary channel"):
+        GLEDriftConfig(n_aux=0, n_pairs=0)
+
+
+def test_pair_config_from_yaml_options():
+    config = GLEDriftConfig.from_options(
+        {"n_aux": 1, "n_pairs": 2, "omega_min": 2.0, "omega_max": 20.0}
+    )
+    assert (config.n_aux, config.n_pairs) == (1, 2)
+    assert config.n_aux_total == 5 and config.n_coupling == 3
+    assert config.n_terms == config.n_blocks + config.n_coupling + config.n_pairs
