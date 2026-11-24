@@ -5,7 +5,11 @@ from metatomic.torch import System
 
 from metatrain.utils.data import DatasetInfo
 from metatrain.utils.data.atomic_basis_helpers import densify_atomic_basis_dataset_info
-from metatrain.utils.data.match_tmaps import match_layout
+from metatrain.utils.data.match_tmaps import (
+    cached_sparse_properties,
+    match_layout,
+    sparse_properties_of,
+)
 from metatrain.utils.data.target_info import get_generic_target_info
 
 
@@ -45,6 +49,11 @@ _dense_layout = _dense_target_info.layout
 
 def test_jit_script():
     torch.jit.script(match_layout)
+    torch.jit.script(cached_sparse_properties)
+
+
+def test_no_sparse_properties_for_a_dense_layout():
+    assert sparse_properties_of(_dense_layout) is None
 
 
 @pytest.mark.parametrize("target_info_layout", ["sparse", "dense", None])
@@ -66,7 +75,8 @@ def test_sparse_to_dense(target_info_layout):
     )
 
 
-def test_dense_to_sparse():
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_dense_to_sparse(precomputed):
 
     systems = [
         System(
@@ -103,11 +113,17 @@ def test_dense_to_sparse():
         ],
     )
 
+    sparse_properties = None
+    if precomputed:
+        cache = {"target": sparse_properties_of(_sparse_layout)}
+        sparse_properties = cached_sparse_properties(cache, "target", device)
+
     sparsified = match_layout(
         dense_target,
         _sparse_layout,
         _sparse_layout,
         systems=systems,  # We don't need actual systems for this test
+        sparse_properties=sparse_properties,
     )
 
     assert sparsified.keys.names == _sparse_layout.keys.names

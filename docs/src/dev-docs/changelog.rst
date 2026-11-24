@@ -140,6 +140,9 @@ Changed
   with its layout, instead of a ``ModelOutput`` (#1317).
 - ``mtt::aux::mace_features`` has one block for each irrep, with repeated irreps
   along the ``i_irrep`` property (#1317).
+- Models with atomic-basis targets evaluate faster: the conversion of their outputs
+  to the sparse layout no longer recomputes the properties to select from the layout
+  on every call, and selects the atoms of each type with a single sort.
 
 Removed
 #######

@@ -18,7 +18,11 @@ from metatomic.torch import (
 from metatrain.utils.abc import ModelInterface, common_upgrade_checkpoint
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
-from metatrain.utils.data.match_tmaps import match_layout
+from metatrain.utils.data.match_tmaps import (
+    cached_sparse_properties,
+    match_layout,
+    sparse_properties_of,
+)
 from metatrain.utils.hypers import raise_if_hypers_mismatch
 from metatrain.utils.io import model_from_checkpoint
 from metatrain.utils.metadata import merge_metadata
@@ -49,6 +53,8 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
 
     ensemble_gradient_outputs: List[str]
     llpr_outputs: List[str]
+    # properties to select when sparsifying, see `_to_target_units`
+    _sparse_properties: Dict[str, TensorMap]
 
     # all torch devices and dtypes are supported, if they are supported by the wrapped
     # the check is performed in the trainer
@@ -71,6 +77,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
 
         self.hypers = hypers
         self.dataset_info = dataset_info
+        self._sparse_properties = {}
 
     def set_wrapped_model(
         self, model: MetatrainModel, covariances: bool = True
@@ -145,6 +152,7 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
             )
 
         self.targets = torch.nn.ModuleDict()
+        self._sparse_properties = {}
         self.llpr_outputs = []
         self.ensemble_gradient_outputs = []
         outputs = {name: old_capabilities.outputs[name] for name in backbone_outputs}
@@ -164,6 +172,16 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
                 covariances,
             )
             self.targets[name] = target
+            layouts = {"model": self.model.dataset_info.targets[name].layout}
+            if self.model.scaler is not None:
+                if name in self.model.scaler.dataset_info.targets:
+                    layouts["scaler"] = self.model.scaler.dataset_info.targets[
+                        name
+                    ].layout
+            for step, layout in layouts.items():
+                properties = sparse_properties_of(layout)
+                if properties is not None:
+                    self._sparse_properties[f"{step}:{name}"] = properties
 
             if covariances:
                 outputs[target.uncertainty_name] = ModelOutput(
@@ -352,13 +370,27 @@ class LLPRUncertaintyModel(ModelInterface[ModelHypers]):
         if scaler is not None and name in scaler.dataset_info.targets:
             layout = scaler.dataset_info.targets[name].layout
             tensor = match_layout(
-                tensor, layout, target_info_layout=layout, systems=systems
+                tensor,
+                layout,
+                target_info_layout=layout,
+                systems=systems,
+                sparse_properties=cached_sparse_properties(
+                    self._sparse_properties, f"scaler:{name}", tensor.device
+                ),
             )
             tensor = scaler.apply_scales(
                 systems, {name: tensor}, selected_atoms=selected_atoms
             )[name]
         layout = self.model.dataset_info.targets[name].layout
-        return match_layout(tensor, layout, target_info_layout=layout, systems=systems)
+        return match_layout(
+            tensor,
+            layout,
+            target_info_layout=layout,
+            systems=systems,
+            sparse_properties=cached_sparse_properties(
+                self._sparse_properties, f"model:{name}", tensor.device
+            ),
+        )
 
     def _ensemble(
         self,

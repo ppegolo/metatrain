@@ -1,13 +1,49 @@
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
 from .atomic_basis_helpers import (
+    _compute_sparse_properties,
     densify_atomic_basis_target,
     sparsify_atomic_basis_target,
 )
+
+
+def sparse_properties_of(layout: TensorMap) -> Optional[TensorMap]:
+    """The properties to select when sparsifying a dense tensor map to ``layout``.
+
+    They depend only on the layout, and computing them takes longer than the
+    sparsification itself for targets with many atomic types, so models compute them
+    once and pass them to :func:`match_layout`.
+
+    :param layout: The layout of a target.
+    :return: The properties, or ``None`` if the layout is not sparse in atom types.
+    """
+    if any(name.endswith("atom_type") for name in layout.keys.names):
+        return _compute_sparse_properties(layout)
+    return None
+
+
+def cached_sparse_properties(
+    cache: Dict[str, TensorMap], key: str, device: torch.device
+) -> Optional[TensorMap]:
+    """Get properties computed by :func:`sparse_properties_of` on ``device``, moving
+    them there and updating ``cache`` if needed.
+
+    :param cache: The properties, by key.
+    :param key: The key of the properties to get.
+    :param device: The device of the tensor map to sparsify.
+    :return: The properties, or ``None`` if ``key`` is not in ``cache``.
+    """
+    if key not in cache:
+        return None
+    properties = cache[key]
+    if properties.device != device:
+        properties = properties.to(device=device)
+        cache[key] = properties
+    return properties
 
 
 def match_layout(
@@ -15,6 +51,7 @@ def match_layout(
     tmap2: TensorMap,
     target_info_layout: Optional[TensorMap] = None,
     systems: Optional[list[System]] = None,
+    sparse_properties: Optional[TensorMap] = None,
 ) -> TensorMap:
     """Makes sure the layout of the two tensormaps is the same.
 
@@ -29,6 +66,9 @@ def match_layout(
       to match tmap2.
     :param systems: List of systems. It will only be used in case tmap1 needs
       to be sparsified (in atom types) to match tmap2.
+    :param sparse_properties: The properties to select when sparsifying, computed
+      from ``target_info_layout`` if not given (see
+      :func:`~metatrain.utils.data.atomic_basis_helpers.sparsify_atomic_basis_target`).
     :return: The first tensormap, with its layout modified to match
       the second.
     """
@@ -82,6 +122,7 @@ def match_layout(
             systems,
             tmap1,
             target_info_layout,
+            sparse_properties=sparse_properties,
         )
 
     return tmap1

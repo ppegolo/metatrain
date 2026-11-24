@@ -18,7 +18,11 @@ from typing_extensions import TypeVar
 # from metatrain.scaler import Scaler
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.data import DatasetInfo, TargetInfo
-from metatrain.utils.data.match_tmaps import match_layout
+from metatrain.utils.data.match_tmaps import (
+    cached_sparse_properties,
+    match_layout,
+    sparse_properties_of,
+)
 from metatrain.utils.data.target_info import DEPRECATED_METATOMIC_OUTPUT_NAMES
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.extenders.abc import ExtenderInterface
@@ -34,6 +38,8 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
 
     # Dictionary storing the targets that need to be transformed at evaluation
     _eval_transforms: dict[str, list[str]]
+    # Properties to select when sparsifying an output, see `_get_sparse_properties`
+    _sparse_properties: dict[str, TensorMap]
 
     def __init__(
         self,
@@ -54,6 +60,7 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
 
         # Compute transformations needed at evaluation time.
         self._eval_transforms = self._get_eval_transforms()
+        self._sparse_properties = self._get_sparse_properties()
         self._extenders_was_None = extenders is None
 
     def _get_eval_transforms(self) -> dict[str, list[str]]:
@@ -108,6 +115,28 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
                 eval_transforms["pre_return"].append(name)
 
         return eval_transforms
+
+    def _get_sparse_properties(self) -> Dict[str, TensorMap]:
+        """The properties to select when an atomic-basis output is sparsified at
+        evaluation time, for each step of the evaluation and target.
+
+        :return: The properties, keyed by ``"<step>:<target>"``.
+        """
+        dataset_infos = {"pre_return": self.dataset_info}
+        if self.scaler is not None:
+            dataset_infos["pre_scaler"] = self.scaler.dataset_info
+        for i, additive_model in enumerate(self.additive_models):
+            dataset_infos[f"pre_additive_{i}"] = additive_model.dataset_info
+
+        sparse_properties: Dict[str, TensorMap] = {}
+        for step, names in self._eval_transforms.items():
+            for name in names:
+                properties = sparse_properties_of(
+                    dataset_infos[step].targets[name].layout
+                )
+                if properties is not None:
+                    sparse_properties[f"{step}:{name}"] = properties
+        return sparse_properties
 
     def forward(
         self,
@@ -184,6 +213,11 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
                                     k
                                 ].layout,
                                 systems=systems,
+                                sparse_properties=cached_sparse_properties(
+                                    self._sparse_properties,
+                                    f"pre_scaler:{k}",
+                                    return_dict[k].device,
+                                ),
                             )
 
                     return_dict = self.scaler.apply_scales(
@@ -206,6 +240,11 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
                                     k
                                 ].layout,
                                 systems=systems,
+                                sparse_properties=cached_sparse_properties(
+                                    self._sparse_properties,
+                                    f"pre_additive_{i}:{k}",
+                                    return_dict[k].device,
+                                ),
                             )
 
                     additive_supported_outputs = additive_model.supported_outputs()
@@ -263,6 +302,11 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
                             self.dataset_info.targets[k].layout,
                             target_info_layout=self.dataset_info.targets[k].layout,
                             systems=systems,
+                            sparse_properties=cached_sparse_properties(
+                                self._sparse_properties,
+                                f"pre_return:{k}",
+                                return_dict[k].device,
+                            ),
                         )
 
         return return_dict
@@ -631,6 +675,7 @@ class MetatrainModel(torch.nn.Module, Generic[CoreModelClass, ScalerClass]):
 
         # Compute transformations needed at evaluation time.
         self._eval_transforms = self._get_eval_transforms()
+        self._sparse_properties = self._get_sparse_properties()
 
     def remove_output(self, target_name: str) -> None:
         """
