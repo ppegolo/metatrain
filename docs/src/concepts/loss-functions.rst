@@ -296,3 +296,44 @@ In practice, all three scoring rules encourage calibrated uncertainty estimates,
 The Gaussian NLL is quadratic in the residual and therefore more sensitive to large deviations.
 The analytical Gaussian CRPS grows linearly with the residual and often yields smoother behaviour when the residual distribution departs from strict Gaussianity.
 The empirical CRPS is fully non-parametric and can in principle capture skewness, multimodality, or other non-Gaussian features present in the ensemble predictions.
+
+
+.. _density-loss:
+
+Density loss
+------------
+
+The ``density_mse`` loss is for targets that are the coefficients :math:`c_i` of a scalar field, such as the electron density, expanded on atom-centred Gaussian functions, :math:`\rho(r) = \sum_i c_i \phi_i(r)`.
+These functions are neither orthogonal nor normalised, so the same error on two coefficients can mean very different errors on the field.
+The loss of a system is the quadratic form
+
+.. math::
+
+    \mathcal{L} = \Delta c^T M \, \Delta c ,
+
+where :math:`\Delta c` is the difference between predicted and reference coefficients and :math:`M` is a two-centre matrix of the basis:
+
+- with ``metric: overlap``, :math:`M_{ij} = \int \phi_i \phi_j \, dr` and the loss is :math:`\int |\rho_\mathrm{pred} - \rho_\mathrm{ref}|^2 \, dr`;
+- with ``metric: coulomb``, :math:`M_{ij} = \iint \phi_i(r) \phi_j(r') / |r - r'| \, dr \, dr'` and the loss is the electrostatic self-energy of the error of the density.
+
+The loss is implemented in :py:mod:`metatrain.utils.density` and the PET trainer supports it.
+
+.. code-block:: yaml
+
+    loss:
+      mtt::density:
+        type: density_mse
+        metric: coulomb
+        aux_basis: def2-universal-jfit.json
+
+The target must be a spherical target in an atomic basis (``irreps`` given for each atomic type) with one sample for each atom, for non-periodic systems with positions in Angstrom. The loss takes the following parameters:
+
+:param metric: ``overlap`` (the default) or ``coulomb``.
+:param aux_basis: the basis set the coefficients refer to. It is either a file in the `JSON format of the Basis Set Exchange <https://molssi-bse.github.io/basis_set_exchange/>`_, or the name of a basis set there, which requires the ``basis_set_exchange`` package.
+:param mask_zero_targets: for spin densities, give a zero loss to the systems whose reference coefficients are all exactly zero. Default: ``false``.
+:param sign_invariant_singlets: for spin densities, compare the systems whose reference integrates to less than 0.5 in absolute value with both signs of the reference, and keep the smaller error. Default: ``false``.
+
+The two spin options compare the predictions with the reference as stored in the dataset, so the ``atomic_baseline`` of the target must be fixed to zero.
+
+The coefficients must follow the conventions of PySCF for the order and the normalisation of the functions, described in :py:mod:`metatrain.utils.density.basis`.
+Shells of the same angular momentum are taken in the order of the basis set file. This order can differ between the Basis Set Exchange and the file distributed with a quantum chemistry code, in which case the file of the code that computed the coefficients should be converted and used (``bse convert-basis``).

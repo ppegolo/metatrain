@@ -3,8 +3,9 @@
 # with default values is not allowed by mypy.
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Type
+from typing import Any, Dict, List, Literal, Optional
 
 import metatensor.torch as mts
 import torch
@@ -1176,6 +1177,13 @@ class LossAggregator(LossInterface):
         return total_loss
 
 
+def _density_mse_loss(**kwargs: Any) -> LossInterface:
+    # imported here, since metatrain.utils.density.loss imports this module
+    from .density.loss import DensityMSELoss
+
+    return DensityMSELoss(**kwargs)
+
+
 class LossType(Enum):
     """
     Enumeration of available loss types and their implementing classes.
@@ -1196,8 +1204,9 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    DENSITY_MSE = ("density_mse", _density_mse_loss)
 
-    def __init__(self, key: str, cls: Type[LossInterface]) -> None:
+    def __init__(self, key: str, cls: Callable[..., LossInterface]) -> None:
         self._key = key
         self._cls = cls
 
@@ -1207,8 +1216,8 @@ class LossType(Enum):
         return self._key
 
     @property
-    def cls(self) -> Type[LossInterface]:
-        """Class implementing this loss type."""
+    def cls(self) -> Callable[..., LossInterface]:
+        """Class (or function) creating this loss type."""
         return self._cls
 
     @classmethod

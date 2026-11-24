@@ -30,6 +30,7 @@ from metatrain.utils.data.atomic_basis_helpers import (
     get_prepare_atomic_basis_targets_transform,
 )
 from metatrain.utils.data.dataset import CollateTransform
+from metatrain.utils.density.loss import get_density_transforms
 from metatrain.utils.distributed.distributed_data_parallel import (
     DistributedDataParallel,
 )
@@ -463,11 +464,13 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
         target_keys = list(train_targets.keys())
         # Shared callables that run after `atomic_basis_transform` (and after
         # rotational augmentation in training).
+        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
         base_callables: List[CollateTransform] = [
             get_system_with_neighbor_lists_transform(requested_neighbor_lists),
             *conditioning_callables,
             get_remove_additive_transform(additive_models, train_targets),
             get_remove_scale_transform(scaler),
+            *get_density_transforms(loss_hypers, scaler),
         ]
         collate_fn_train = CollateFn(
             target_keys=target_keys,
@@ -532,7 +535,6 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                 outputs_list.append(f"{target_name}_{gradient_name}_gradients")
 
         # Create a loss function:
-        loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
         loss_fn = LossAggregator(targets=train_targets, config=loss_hypers)
         logging.info("Using the following loss functions:")
         for name, info in loss_fn.metadata.items():

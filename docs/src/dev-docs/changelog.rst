@@ -123,6 +123,9 @@ Added
   ``LLPRUncertaintyModel.remove_covariances()`` (#1308).
 - ``tox -e lint`` checks that all dependencies, including extras, have licenses
   compatible with BSD-3-Clause (#1362).
+- A ``density_mse`` loss for densities expanded on an atom-centred Gaussian basis,
+  weighting the error of the coefficients with the overlap or Coulomb matrix of the
+  basis. It is supported by the PET trainer.
 - PET's learning rate can stay at its base value for a ``hold_fraction`` of the steps
   after the warmup.
 
