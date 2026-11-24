@@ -666,3 +666,12 @@ def trainer_update_v15_v16(checkpoint: dict) -> None:
     """
     train_hypers = checkpoint["train_hypers"]
     train_hypers["extenders"] = {}
+
+
+def trainer_update_v16_v17(checkpoint: dict) -> None:
+    """
+    Adds the ``hold_fraction`` hyperparameter to the trainer hypers.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["train_hypers"]["hold_fraction"] = 0.0
